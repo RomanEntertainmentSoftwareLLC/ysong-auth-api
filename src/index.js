@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
@@ -303,5 +304,5 @@ app.get("/auth/me", async (req, res) => {
 });
 
 /* -------------------- Start -------------------- */
-const port = process.env.PORT || 8080;
+const port = process.env.PORT || 8081;
 app.listen(port, () => console.log(`YSong API listening on ${port}`));

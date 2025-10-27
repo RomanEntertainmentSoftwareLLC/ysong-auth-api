@@ -1,0 +1,42 @@
+name: Deploy ysong-auth-api to VM
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (for completeness)
+        uses: actions/checkout@v4
+
+      - name: Prepare SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.VM_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Rsync code to VM
+        run: |
+          rsync -avz --delete \
+            --exclude '.env' \
+            --exclude 'node_modules' \
+            --exclude '.git' \
+            --exclude '*.log' \
+            -e "ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no" \
+            ./ ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/opt/ysong-auth/
+
+      - name: Install & restart on VM
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no \
+            ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} <<'EOF'
+              set -e
+              cd /opt/ysong-auth
+              npm ci
+              sudo systemctl restart ysong-auth
+              sudo systemctl status ysong-auth --no-pager -l | tail -n 30
+            EOF

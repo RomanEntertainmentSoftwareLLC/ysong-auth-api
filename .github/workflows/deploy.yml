@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout (for completeness)
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Prepare SSH
@@ -20,6 +20,15 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H ${{ secrets.VM_HOST }} >> ~/.ssh/known_hosts
 
+      # Quick connectivity check (prints remote whoami/hostname if OK)
+      - name: Test SSH connectivity
+        run: |
+          ssh -i ~/.ssh/id_ed25519 \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} "echo OK on \$(hostname); whoami"
+
       - name: Rsync code to VM
         run: |
           rsync -avz --delete \
@@ -27,16 +36,20 @@ jobs:
             --exclude 'node_modules' \
             --exclude '.git' \
             --exclude '*.log' \
-            -e "ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no" \
+            -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no" \
             ./ ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/opt/ysong-auth/
 
       - name: Install & restart on VM
         run: |
-          ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no \
-            ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} <<'EOF'
-              set -e
-              cd /opt/ysong-auth
-              npm ci
-              sudo systemctl restart ysong-auth
-              sudo systemctl status ysong-auth --no-pager -l | tail -n 30
-            EOF
+          ssh -i ~/.ssh/id_ed25519 \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} <<'EOF'
+            set -e
+            cd /opt/ysong-auth
+            npm ci
+            sudo systemctl restart ysong-auth
+            sudo systemctl status ysong-auth --no-pager -l | tail -n 30
+          EOF
+

@@ -58,6 +58,26 @@ jobs:
           ssh -i "$KEY_FILE" $SSH_OPTS "$VM_USER@$VM_HOST" \
             "sudo mkdir -p /opt/ysong-auth && sudo chown -R \$(whoami):\$(whoami) /opt/ysong-auth"
 
+      # 1) Install rsync on the runner (Ubuntu)
+      - name: Install rsync on runner
+        run: sudo apt-get update && sudo apt-get install -y rsync
+      
+      # 2) Ensure dir, perms, and rsync on the Debian VM
+      - name: Ensure remote dir & ownership
+        shell: bash
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
+        run: |
+          set -euo pipefail
+          KEY_FILE="$HOME/.ssh/ysong_ci"
+          SSH_OPTS="-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o HostbasedAuthentication=no -o PubkeyAuthentication=yes -o PubkeyAcceptedKeyTypes=+ssh-ed25519"
+          ssh -i "$KEY_FILE" $SSH_OPTS "$VM_USER@$VM_HOST" \
+            "sudo apt-get update &&
+             sudo apt-get install -y rsync &&
+             sudo mkdir -p /opt/ysong-auth &&
+             sudo chown -R \$(whoami):\$(whoami) /opt/ysong-auth"
+
       - name: Rsync code to VM
         shell: bash
         env:

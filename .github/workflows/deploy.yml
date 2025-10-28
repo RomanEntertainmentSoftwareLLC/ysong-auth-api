@@ -8,50 +8,86 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    env:
-      SSH_HOST: ${{ secrets.VM_HOST }}
-      SSH_USER: ${{ secrets.VM_USER }}
-      SSH_KEY:  ~/.ssh/ysong_ci
-      SSH_OPTS: -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ---- Prepare SSH (robust) ----
       - name: Prepare SSH
+        shell: bash
+        env:
+          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}   # raw OpenSSH private key (NOT base64)
+          VM_HOST:    ${{ secrets.VM_HOST }}      # 34.48.117.202
         run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.VM_SSH_KEY }}" > "$SSH_KEY"
-          chmod 600 "$SSH_KEY"
-          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+          set -euo pipefail
+          mkdir -p "$HOME/.ssh"
+          KEY_FILE="$HOME/.ssh/ysong_ci"
+
+          # write the private key (strip CR just in case)
+          printf '%s\n' "$VM_SSH_KEY" | tr -d '\r' > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+
+          # known_hosts
+          ssh-keyscan -H "$VM_HOST" >> "$HOME/.ssh/known_hosts"
+
+          # quick sanity print (does NOT leak key)
+          ls -l "$HOME/.ssh"
+          ssh -V
 
       - name: Test SSH connectivity
+        shell: bash
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
         run: |
-          ssh -vvv -i "$SSH_KEY" $SSH_OPTS \
-            "$SSH_USER@$SSH_HOST" "echo OK on \$(hostname); whoami"
+          set -euo pipefail
+          KEY_FILE="$HOME/.ssh/ysong_ci"
+          SSH_OPTS="-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          ssh -vvv -i "$KEY_FILE" $SSH_OPTS "$VM_USER@$VM_HOST" "echo OK on \$(hostname); whoami"
 
       - name: Ensure remote dir & ownership
+        shell: bash
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
         run: |
-          ssh -i "$SSH_KEY" $SSH_OPTS \
-            "$SSH_USER@$SSH_HOST" \
+          set -euo pipefail
+          KEY_FILE="$HOME/.ssh/ysong_ci"
+          SSH_OPTS="-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          ssh -i "$KEY_FILE" $SSH_OPTS "$VM_USER@$VM_HOST" \
             "sudo mkdir -p /opt/ysong-auth && sudo chown -R \$(whoami):\$(whoami) /opt/ysong-auth"
 
       - name: Rsync code to VM
+        shell: bash
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
         run: |
+          set -euo pipefail
+          KEY_FILE="$HOME/.ssh/ysong_ci"
+          SSH_OPTS="-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
           rsync -avz --delete \
             --exclude '.env' \
             --exclude 'node_modules' \
             --exclude '.git' \
             --exclude '*.log' \
-            -e "ssh -i $SSH_KEY $SSH_OPTS" \
-            ./ "$SSH_USER@$SSH_HOST:/opt/ysong-auth/"
+            -e "ssh -i $KEY_FILE $SSH_OPTS" \
+            ./ "$VM_USER@$VM_HOST:/opt/ysong-auth/"
 
       - name: Install & restart on VM
+        shell: bash
+        env:
+          VM_HOST: ${{ secrets.VM_HOST }}
+          VM_USER: ${{ secrets.VM_USER }}
         run: |
-          ssh -i "$SSH_KEY" $SSH_OPTS "$SSH_USER@$SSH_HOST" << 'EOF'
-          set -e
-          cd /opt/ysong-auth
-          npm ci
-          sudo systemctl restart ysong-auth
-          sudo systemctl status ysong-auth --no-pager -l | tail -n 30
-          EOF
+          set -euo pipefail
+          KEY_FILE="$HOME/.ssh/ysong_ci"
+          SSH_OPTS="-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          ssh -i "$KEY_FILE" $SSH_OPTS "$VM_USER@$VM_HOST" '
+            set -e
+            cd /opt/ysong-auth
+            npm ci
+            sudo systemctl restart ysong-auth
+            sudo systemctl status ysong-auth --no-pager -l | tail -n 30
+          '

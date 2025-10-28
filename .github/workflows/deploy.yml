@@ -8,26 +8,34 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Prepare SSH
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          cat > ~/.ssh/ysong_ci <<'KEY'
+          ${{ secrets.VM_SSH_KEY }}
+          KEY
+          chmod 600 ~/.ssh/ysong_ci
           ssh-keyscan -H ${{ secrets.VM_HOST }} >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
 
-      # Quick connectivity check (prints remote whoami/hostname if OK)
-      - name: Test SSH connectivity
+      - name: Test SSH connectivity (verbose first run)
         run: |
-          ssh -i ~/.ssh/id_ed25519 \
-              -o BatchMode=yes \
-              -o IdentitiesOnly=yes \
-              -o StrictHostKeyChecking=no \
-              ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} "echo OK on \$(hostname); whoami"
+          ssh -vvv \
+            -i ~/.ssh/ysong_ci \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} "echo OK on \$(hostname); whoami"
+
+      - name: Ensure remote dir & ownership
+        run: |
+          ssh -i ~/.ssh/ysong_ci -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} \
+            "sudo mkdir -p /opt/ysong-auth && sudo chown -R $USER:$USER /opt/ysong-auth"
 
       - name: Rsync code to VM
         run: |
@@ -36,16 +44,14 @@ jobs:
             --exclude 'node_modules' \
             --exclude '.git' \
             --exclude '*.log' \
-            -e "ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no" \
+            -e "ssh -i ~/.ssh/ysong_ci -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" \
             ./ ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/opt/ysong-auth/
 
       - name: Install & restart on VM
         run: |
-          ssh -i ~/.ssh/id_ed25519 \
-              -o BatchMode=yes \
-              -o IdentitiesOnly=yes \
-              -o StrictHostKeyChecking=no \
-              ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} <<'EOF'
+          ssh -i ~/.ssh/ysong_ci \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} <<'EOF'
             set -e
             cd /opt/ysong-auth
             npm ci

@@ -8,6 +8,12 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      SSH_HOST: ${{ secrets.VM_HOST }}
+      SSH_USER: ${{ secrets.VM_USER }}
+      SSH_KEY:  ~/.ssh/ysong_ci
+      SSH_OPTS: -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -15,27 +21,20 @@ jobs:
       - name: Prepare SSH
         run: |
           mkdir -p ~/.ssh
-          # write your GitHub secret into this file:
-          echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/ysong_ci
-          chmod 600 ~/.ssh/ysong_ci
-          ssh-keyscan -H ${{ secrets.VM_HOST }} >> ~/.ssh/known_hosts
+          printf '%s\n' "${{ secrets.VM_SSH_KEY }}" > "$SSH_KEY"
+          chmod 600 "$SSH_KEY"
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
 
       - name: Test SSH connectivity
         run: |
-          ssh -vvv \
-            -i ~/.ssh/ysong_ci \
-            -o BatchMode=yes \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=no \
-            -o PubkeyAuthentication=yes \
-            -o PubkeyAuthOptions=none \
-            ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} "echo OK on \$(hostname); whoami"
+          ssh -vvv -i "$SSH_KEY" $SSH_OPTS \
+            "$SSH_USER@$SSH_HOST" "echo OK on \$(hostname); whoami"
 
       - name: Ensure remote dir & ownership
         run: |
-          ssh -i ~/.ssh/ysong_ci -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
-            ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} \
-            "sudo mkdir -p /opt/ysong-auth && sudo chown -R $USER:$USER /opt/ysong-auth"
+          ssh -i "$SSH_KEY" $SSH_OPTS \
+            "$SSH_USER@$SSH_HOST" \
+            "sudo mkdir -p /opt/ysong-auth && sudo chown -R \$(whoami):\$(whoami) /opt/ysong-auth"
 
       - name: Rsync code to VM
         run: |
@@ -44,18 +43,15 @@ jobs:
             --exclude 'node_modules' \
             --exclude '.git' \
             --exclude '*.log' \
-            -e "ssh -i ~/.ssh/ysong_ci -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" \
-            ./ ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/opt/ysong-auth/
+            -e "ssh -i $SSH_KEY $SSH_OPTS" \
+            ./ "$SSH_USER@$SSH_HOST:/opt/ysong-auth/"
 
       - name: Install & restart on VM
         run: |
-          ssh -i ~/.ssh/ysong_ci \
-            -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
-            ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} <<'EOF'
+          ssh -i "$SSH_KEY" $SSH_OPTS "$SSH_USER@$SSH_HOST" <<'EOF'
             set -e
             cd /opt/ysong-auth
             npm ci
             sudo systemctl restart ysong-auth
             sudo systemctl status ysong-auth --no-pager -l | tail -n 30
-          EOF
-
+EOF

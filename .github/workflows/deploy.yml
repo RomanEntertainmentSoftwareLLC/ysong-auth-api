@@ -43,7 +43,7 @@ jobs:
         run: |
           set -euo pipefail
           KEY_FILE="$HOME/.ssh/ysong_ci"
-          SSH_OPTS="-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          SSH_OPTS="-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o HostbasedAuthentication=no -o PubkeyAuthentication=yes -o PubkeyAcceptedKeyTypes=+ssh-ed25519"
           ssh -vvv -i "$KEY_FILE" $SSH_OPTS "$VM_USER@$VM_HOST" "echo OK on \$(hostname); whoami"
 
       - name: Ensure remote dir & ownership
@@ -54,7 +54,7 @@ jobs:
         run: |
           set -euo pipefail
           KEY_FILE="$HOME/.ssh/ysong_ci"
-          SSH_OPTS="-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          SSH_OPTS="-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o HostbasedAuthentication=no -o PubkeyAuthentication=yes -o PubkeyAcceptedKeyTypes=+ssh-ed25519"
           ssh -i "$KEY_FILE" $SSH_OPTS "$VM_USER@$VM_HOST" \
             "sudo mkdir -p /opt/ysong-auth && sudo chown -R \$(whoami):\$(whoami) /opt/ysong-auth"
 
@@ -66,7 +66,7 @@ jobs:
         run: |
           set -euo pipefail
           KEY_FILE="$HOME/.ssh/ysong_ci"
-          SSH_OPTS="-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          SSH_OPTS="-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o HostbasedAuthentication=no -o PubkeyAuthentication=yes -o PubkeyAcceptedKeyTypes=+ssh-ed25519"
           rsync -avz --delete \
             --exclude '.env' \
             --exclude 'node_modules' \
@@ -83,7 +83,7 @@ jobs:
         run: |
           set -euo pipefail
           KEY_FILE="$HOME/.ssh/ysong_ci"
-          SSH_OPTS="-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          SSH_OPTS="-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o HostbasedAuthentication=no -o PubkeyAuthentication=yes -o PubkeyAcceptedKeyTypes=+ssh-ed25519"
           ssh -i "$KEY_FILE" $SSH_OPTS "$VM_USER@$VM_HOST" '
             set -e
             cd /opt/ysong-auth

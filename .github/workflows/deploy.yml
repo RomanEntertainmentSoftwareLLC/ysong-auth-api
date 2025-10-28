@@ -48,10 +48,10 @@ jobs:
 
       - name: Install & restart on VM
         run: |
-          ssh -i "$SSH_KEY" $SSH_OPTS "$SSH_USER@$SSH_HOST" <<'EOF'
-            set -e
-            cd /opt/ysong-auth
-            npm ci
-            sudo systemctl restart ysong-auth
-            sudo systemctl status ysong-auth --no-pager -l | tail -n 30
-EOF
+          ssh -i "$SSH_KEY" $SSH_OPTS "$SSH_USER@$SSH_HOST" << 'EOF'
+          set -e
+          cd /opt/ysong-auth
+          npm ci
+          sudo systemctl restart ysong-auth
+          sudo systemctl status ysong-auth --no-pager -l | tail -n 30
+          EOF

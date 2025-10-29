@@ -170,5 +170,9 @@ export async function sendVerifyEmail(toEmail, token) {
     subject,
     html,
     text,                              // always include plaintext
+	headers: {
+		"List-Unsubscribe": "<mailto:support@ysong.ai>",
+		"List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+	},
   });
 }

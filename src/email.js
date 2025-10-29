@@ -95,6 +95,7 @@ function buildVerifyEmail(verifyUrl, toEmail) {
 						<td align="center" style="padding:22px 24px 6px;">
 						<a href="${verifyUrl}"
 							class="btn"
+							rel="noopener noreferrer"
 							style="display:inline-block;background:#0f172a;color:#ffffff;text-decoration:none;
 									font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
 									font-weight:600;font-size:15px;line-height:1;border-radius:10px;

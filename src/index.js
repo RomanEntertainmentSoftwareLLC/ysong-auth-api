@@ -17,27 +17,33 @@ const allowedOrigins = [
   "http://127.0.0.1:5173",
   "https://ysong.ai",
   "https://www.ysong.ai",
-  /\.vercel\.app$/, // preview deployments
+  /\.vercel\.app$/,        // preview deployments
 ];
 
 const corsOptions = {
-	origin: (origin, cb) => {
-		// allow same-origin/no-origin (curl, server-to-server)
-		if (!origin) return cb(null, true);
-		const ok = allowedOrigins.some((o) =>
-			o instanceof RegExp ? o.test(origin) : o === origin
-		);
-		return ok ? cb(null, true) : cb(new Error("Not allowed by CORS"));
-	},
-	methods: ["GET", "POST", "OPTIONS"],
-	allowedHeaders: ["Content-Type", "Authorization"],
-	credentials: false,
-	maxAge: 86400,
+  origin: (origin, cb) => {
+    // same-origin / server-to-server / curl have no Origin header — allow them
+    if (!origin) return cb(null, true);
+    const ok = allowedOrigins.some((o) =>
+      o instanceof RegExp ? o.test(origin) : o === origin
+    );
+    return ok ? cb(null, true) : cb(new Error("Not allowed by CORS"));
+  },
+  credentials: true,                      // <-- REQUIRED since the browser sends cookies
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  maxAge: 86400,
 };
 
 const LoginSchema = z.object({
   email: z.string().email().max(320),
   password: z.string().min(8).max(200),
+});
+
+app.set("trust proxy", 1);                // behind nginx so secure cookies work
+app.use((_, res, next) => {               // helpful for caches/CDNs
+  res.header("Vary", "Origin");
+  next();
 });
 
 app.use(cors(corsOptions));

@@ -313,35 +313,15 @@ app.post("/ai/chat", async (req, res) => {
   try {
     const { messages, model } = req.body || {};
     const chosenModel = model || process.env.OPENAI_MODEL || "gpt-5-mini";
-
     const transcript =
       "You are YSong's friendly music co-pilot.\n\n" +
-      (messages || [])
-        .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text}`)
-        .join("\n") +
+      (messages||[]).map(m=>`${m.role==='user'?'User':'Assistant'}: ${m.text}`).join("\n") +
       "\nAssistant:";
 
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
-
-    const stream = await openai.responses.stream({
-      model: chosenModel,
-      input: transcript,
-    });
-
-    stream.on("text.delta", (chunk) => res.write(`data: ${chunk}\n\n`));
-    stream.on("text.completed", () => {
-      res.write("event: done\ndata: end\n\n");
-      res.end();
-    });
-    stream.on("error", (err) => {
-      res.write(`event: error\ndata: ${JSON.stringify(err.message || "err")}\n\n`);
-      res.end();
-    });
-  } catch (e) {
-    res.status(500).json({ error: e?.message || "AI error" });
-  }
+    const resp = await openai.responses.create({ model: chosenModel, input: transcript });
+    const text = resp.output_text || "";
+    res.json({ text });
+  } catch (e) { res.status(500).json({ error: e?.message || "AI error" }); }
 });
 
 /* -------------------- Start -------------------- */

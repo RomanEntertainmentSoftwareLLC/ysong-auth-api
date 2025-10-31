@@ -7,10 +7,8 @@ import { z } from "zod";
 import { pool } from "./db.js";
 import { sendVerifyEmail } from "./email.js";
 import jwt from "jsonwebtoken";
-import OpenAI from "openai";
 
 const app = express();
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // Cross-Origin Resource Sharing (CORS)
 /* -------------------- CORS (whitelist) -------------------- */
@@ -307,21 +305,6 @@ app.get("/auth/me", async (req, res) => {
     console.error(e);
     res.status(500).json({ error: "server_error" });
   }
-});
-
-app.post("/ai/chat", async (req, res) => {
-  try {
-    const { messages, model } = req.body || {};
-    const chosenModel = model || process.env.OPENAI_MODEL || "gpt-5-mini";
-    const transcript =
-      "You are YSong's friendly music co-pilot.\n\n" +
-      (messages||[]).map(m=>`${m.role==='user'?'User':'Assistant'}: ${m.text}`).join("\n") +
-      "\nAssistant:";
-
-    const resp = await openai.responses.create({ model: chosenModel, input: transcript });
-    const text = resp.output_text || "";
-    res.json({ text });
-  } catch (e) { res.status(500).json({ error: e?.message || "AI error" }); }
 });
 
 /* -------------------- Start -------------------- */

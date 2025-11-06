@@ -50,6 +50,41 @@ app.options("*", cors(corsOptions)); // preflight for all routes
 /* -------------------- Body parsing -------------------- */
 app.use(express.json());
 
+/* GET newest chats for the signed-in user */
+app.get("/api/chats", requireAuth, async (req, res) => {
+	try {
+		const userId = req.user.id;                   // from requireAuth
+		const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
+
+		const { rows } = await pool.query(
+			`
+			SELECT id, title, pinned, is_cloud_saved, created_at, updated_at
+			FROM chats
+			WHERE user_id = $1
+			ORDER BY created_at DESC
+			LIMIT $2
+			`,
+			[userId, limit]
+		);
+
+		// Minimal shape your sidebar expects right now
+		const chats = rows.map(r => ({
+			id: r.id,
+			title: r.title || "",
+			messages: [],               // we’ll fetch messages later
+			pinned: r.pinned,
+			isCloudSaved: r.is_cloud_saved,
+			createdAt: r.created_at,
+			updatedAt: r.updated_at,
+		}));
+
+		res.json({ chats });
+	} catch (err) {
+		console.error("GET /api/chats failed:", err);
+		res.status(500).json({ error: "failed_to_fetch_chats" });
+	}
+});
+
 /* -------------------- Health checks -------------------- */
 app.get("/", (_req, res) => res.send("ysong-api"));
 app.get("/healthz", (_req, res) => res.send("ok"));
@@ -67,6 +102,23 @@ const SignupSchema = z.object({
 	email: z.string().email().max(320),
 	password: z.string().min(8).max(200), // (we'll add strength rules later)
 });
+
+// simple JWT auth middleware (adjust secret to the existing one)
+function requireAuth(req, res, next) {
+	try {
+		const header = req.get("authorization") || "";
+		const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+		if (!token) return res.status(401).json({ error: "missing_token" });
+
+		const payload = jwt.verify(token, process.env.JWT_SECRET);
+		const userId = payload.uid || payload.id;   // <-- accept both
+		if (!userId) return res.status(401).json({ error: "invalid_token" });
+		req.user = { id: userId, email: payload.email };
+		next();
+	} catch {
+		return res.status(401).json({ error: "unauthorized" });
+	}
+}
 
 function sha256(hexOrBuffer) {
   	return crypto.createHash("sha256").update(hexOrBuffer).digest("hex");

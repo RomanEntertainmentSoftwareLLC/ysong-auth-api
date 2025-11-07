@@ -357,5 +357,14 @@ app.get("/auth/me", async (req, res) => {
 });
 
 // -------------------- Start --------------------
+if (!process.env.DATABASE_URL) {
+  console.error("❌ DATABASE_URL is not set");
+  process.exit(1);
+}
+if (!process.env.JWT_SECRET) {
+  console.error("❌ JWT_SECRET is not set");
+  process.exit(1);
+}
+
 const port = process.env.PORT || 8081;
 app.listen(port, () => console.log(`YSong API listening on ${port}`));

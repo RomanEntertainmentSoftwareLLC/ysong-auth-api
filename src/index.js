@@ -224,6 +224,21 @@ app.post("/auth/signup", async (req, res) => {
 	}
 });
 
+app.post("/auth/accept-tos", requireAuth, async (req, res) => {
+  try {
+    await pool.query(
+      `UPDATE users
+         SET tos_accepted_at = now(), updated_at = now()
+       WHERE id = $1`,
+      [req.user.id]
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false });
+  }
+});
+
 
 // GET /auth/verify?token=...&email=...
 app.get("/auth/verify", async (req, res) => {
@@ -344,7 +359,7 @@ app.get("/auth/me", async (req, res) => {
 
     // Optionally re-fetch user (handy if you may disable accounts)
     const { rows } = await pool.query(
-      `SELECT id, email, email_verified_at
+      `SELECT id, email, email_verified_at, tos_accepted_at
          FROM users
         WHERE id = $1
         LIMIT 1`,
@@ -352,7 +367,7 @@ app.get("/auth/me", async (req, res) => {
     );
     if (rows.length === 0) return res.status(401).json({ error: "invalid_token" });
 
-    res.json({ ok: true, user: { id: rows[0].id, email: rows[0].email } });
+    res.json({ ok: true, user: { id: rows[0].id, email: rows[0].email, tosAcceptedAt: rows[0].tos_accepted_at } });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "server_error" });

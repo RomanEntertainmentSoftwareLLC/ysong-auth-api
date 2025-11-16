@@ -86,7 +86,7 @@ function authFromHeader(req) {
 	return m ? m[1] : null;
 }
 
-// -------------------- API: Chats (read-only for now) --------------------
+// -------------------- API: Chats --------------------
 app.get("/api/chats", requireAuth, async (req, res) => {
 	try {
 		const userId = req.user.id;
@@ -102,7 +102,6 @@ app.get("/api/chats", requireAuth, async (req, res) => {
 		const chats = rows.map(r => ({
 		id: r.id,
 		title: r.title || "",
-		messages: [],
 		pinned: r.pinned,
 		isCloudSaved: r.is_cloud_saved,
 		createdAt: r.created_at,
@@ -114,6 +113,87 @@ app.get("/api/chats", requireAuth, async (req, res) => {
 		res.status(500).json({ error: "failed_to_fetch_chats" });
 	}
 });
+
+app.get("/api/chats/:id/messages", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const chatId = String(req.params.id);
+
+    // Make sure the chat belongs to this user
+    const { rows: chatRows } = await pool.query(
+      `SELECT id FROM chats WHERE id = $1 AND user_id = $2 LIMIT 1`,
+      [chatId, userId]
+    );
+    if (chatRows.length === 0) {
+      return res.status(404).json({ error: "chat_not_found" });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT id, role, content, attachments_json, created_at
+       FROM messages
+       WHERE chat_id = $1
+       ORDER BY created_at ASC`,
+      [chatId]
+    );
+
+    const messages = rows.map((r) => ({
+      id: r.id,
+      role: r.role,
+      content: r.content,
+      attachments: r.attachments_json,
+      createdAt: r.created_at,
+    }));
+
+    res.json({ messages });
+  } catch (e) {
+    console.error("GET /api/chats/:id/messages", e);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+app.post("/api/chats/:id/messages", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const chatId = String(req.params.id);
+    const { role, content, attachments } = req.body ?? {};
+
+    if (!role || !content) {
+      return res.status(400).json({ error: "missing_fields" });
+    }
+    if (!["user", "assistant"].includes(role)) {
+      return res.status(400).json({ error: "invalid_role" });
+    }
+
+    // Verify chat belongs to user
+    const { rows: chatRows } = await pool.query(
+      `SELECT id FROM chats WHERE id = $1 AND user_id = $2 LIMIT 1`,
+      [chatId, userId]
+    );
+    if (chatRows.length === 0) {
+      return res.status(404).json({ error: "chat_not_found" });
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO messages (chat_id, role, content, attachments_json)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, role, content, attachments_json, created_at`,
+      [chatId, role, content, attachments ?? null]
+    );
+
+    const m = rows[0];
+    res.status(201).json({
+      id: m.id,
+      role: m.role,
+      content: m.content,
+      attachments: m.attachments_json,
+      createdAt: m.created_at,
+    });
+  } catch (e) {
+    console.error("POST /api/chats/:id/messages", e);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
 
 // -------------------- Health --------------------
 app.get("/", (_req, res) => res.send("ysong-api"));

@@ -200,6 +200,41 @@ app.post("/api/chats/:id/messages", requireAuth, async (req, res) => {
 	}
 });
 
+// assuming: app = express(), pool = new Pool(...), requireAuth sets req.user.id
+app.post("/api/chats/delete", requireAuth, async (req, res) => {
+	const userId = req.user.id;               // or whatever you use
+	const { chatId } = req.body;
+
+	if (!chatId) {
+		return res.status(400).json({ error: "chatId is required" });
+	}
+
+	const client = await pool.connect();
+		try {
+			await client.query("BEGIN");
+
+			// If you DON'T have ON DELETE CASCADE on chat_messages.chat_id:
+			await client.query(
+				"DELETE FROM chat_messages WHERE chat_id = $1 AND user_id = $2",
+				[chatId, userId]
+			);
+
+			await client.query(
+				"DELETE FROM chats WHERE id = $1 AND user_id = $2",
+				[chatId, userId]
+			);
+
+			await client.query("COMMIT");
+			res.json({ ok: true });
+		} catch (err) {
+			await client.query("ROLLBACK");
+			console.error("Error deleting chat", err);
+			res.status(500).json({ error: "Failed to delete chat" });
+		} finally {
+			client.release();
+	}
+});
+
 
 
 // -------------------- Health --------------------

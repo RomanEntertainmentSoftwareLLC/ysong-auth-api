@@ -152,47 +152,54 @@ app.get("/api/chats/:id/messages", requireAuth, async (req, res) => {
 });
 
 app.post("/api/chats/:id/messages", requireAuth, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const chatId = String(req.params.id);
-    const { role, content, attachments } = req.body ?? {};
+	try {
+		const userId = req.user.id;
+		const chatId = String(req.params.id);
+		const { role, content, attachments } = req.body ?? {};
 
-    if (!role || !content) {
-      return res.status(400).json({ error: "missing_fields" });
-    }
-    if (!["user", "assistant"].includes(role)) {
-      return res.status(400).json({ error: "invalid_role" });
-    }
+		if (!role || !content) {
+			return res.status(400).json({ error: "missing_fields" });
+		}
+		if (!["user", "assistant"].includes(role)) {
+			return res.status(400).json({ error: "invalid_role" });
+		}
 
-    // Verify chat belongs to user
-    const { rows: chatRows } = await pool.query(
-      `SELECT id FROM chats WHERE id = $1 AND user_id = $2 LIMIT 1`,
-      [chatId, userId]
-    );
-    if (chatRows.length === 0) {
-      return res.status(404).json({ error: "chat_not_found" });
-    }
+		// Ensure chat exists for this user; create it if it doesn't
+		const { rows: chatRows } = await pool.query(
+			`SELECT id FROM chats WHERE id = $1 AND user_id = $2 LIMIT 1`,
+			[chatId, userId]
+		);
 
-    const { rows } = await pool.query(
-      `INSERT INTO messages (chat_id, role, content, attachments_json)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, role, content, attachments_json, created_at`,
-      [chatId, role, content, attachments ?? null]
-    );
+		if (chatRows.length === 0) {
+		// chat didn't exist yet -> create it with this id
+		await pool.query(
+			`INSERT INTO chats (id, user_id, title, pinned, is_cloud_saved)
+			VALUES ($1, $2, $3, FALSE, TRUE)`,
+			[chatId, userId, ""] // title will get updated later from UI if you want
+		);
+		}
 
-    const m = rows[0];
-    res.status(201).json({
-      id: m.id,
-      role: m.role,
-      content: m.content,
-      attachments: m.attachments_json,
-      createdAt: m.created_at,
-    });
-  } catch (e) {
-    console.error("POST /api/chats/:id/messages", e);
-    res.status(500).json({ error: "server_error" });
-  }
+		const { rows } = await pool.query(
+			`INSERT INTO messages (chat_id, role, content, attachments_json)
+			VALUES ($1, $2, $3, $4)
+			RETURNING id, role, content, attachments_json, created_at`,
+			[chatId, role, content, attachments ?? null]
+		);
+
+		const m = rows[0];
+			res.status(201).json({
+			id: m.id,
+			role: m.role,
+			content: m.content,
+			attachments: m.attachments_json,
+			createdAt: m.created_at,
+		});
+	} catch (e) {
+		console.error("POST /api/chats/:id/messages", e);
+		res.status(500).json({ error: "server_error" });
+	}
 });
+
 
 
 // -------------------- Health --------------------

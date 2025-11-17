@@ -479,43 +479,100 @@ app.get("/auth/me", async (req, res) => {
 });
 
 
-// GET settings  -> { saveChats:boolean, theme:'light'|'dark'|'system' }
+// ---------- Settings (GET) ----------
 app.get("/api/settings", requireAuth, async (req, res) => {
-	try {
-		const { rows } = await pool.query(
-		`SELECT save_chats, theme FROM user_settings WHERE user_id = $1 LIMIT 1`,
-		[req.user.id]
-		);
-		if (!rows[0]) return res.json({ saveChats: true, theme: "system" }); // defaults
-		res.json({ saveChats: rows[0].save_chats, theme: rows[0].theme || "system" });
-	} catch (e) {
-		console.error("GET /api/settings", e);
-		res.status(500).json({ error: "server_error" });
-	}
+    const userId = req.user.id;
+    console.log("GET /api/settings for user", userId);
+
+    const { rows } = await pool.query(
+        `SELECT save_chats, theme, show_timestamps, compact_mode
+         FROM user_settings
+         WHERE user_id = $1`,
+        [userId]
+    );
+
+    const row = rows[0] || {};
+    console.log("  DB row:", row);
+
+    const saveChats = row.save_chats ?? true;
+
+    let theme = row.theme;
+    if (theme !== "light" && theme !== "dark") {
+        theme = "dark"; // kill "system" / garbage values on read
+    }
+
+    const showTimestamps =
+        row.show_timestamps === undefined || row.show_timestamps === null
+            ? true
+            : !!row.show_timestamps;
+
+    const compactMode =
+        row.compact_mode === undefined || row.compact_mode === null
+            ? false
+            : !!row.compact_mode;
+
+    const payload = {
+        saveChats,
+        theme,
+        showTimestamps,
+        compactMode,
+    };
+
+    console.log("  GET /api/settings response:", payload);
+    res.json(payload);
 });
 
-// POST settings (upsert)
+// ---------- Settings (POST) ----------
 app.post("/api/settings", requireAuth, async (req, res) => {
-	try {
-		const { saveChats, theme } = req.body ?? {};
-		if (theme && !["light", "dark", "system"].includes(theme)) {
-		return res.status(400).json({ error: "invalid_theme" });
-		}
-		await pool.query(
-		`INSERT INTO user_settings (user_id, save_chats, theme, updated_at)
-		VALUES ($1, COALESCE($2,true), COALESCE($3,'system'), now())
-		ON CONFLICT (user_id)
-		DO UPDATE SET
-			save_chats = COALESCE(EXCLUDED.save_chats, user_settings.save_chats),
-			theme      = COALESCE(EXCLUDED.theme, user_settings.theme),
-			updated_at = now()`,
-		[req.user.id, saveChats, theme]
-		);
-		res.json({ ok: true });
-	} catch (e) {
-		console.error("POST /api/settings", e);
-		res.status(500).json({ error: "server_error" });
-	}
+    const userId = req.user.id;
+
+    console.log("POST /api/settings raw body:", req.body);
+
+    let { saveChats, theme, showTimestamps, compactMode } = req.body || {};
+
+    if (typeof saveChats !== "boolean") saveChats = null;
+
+    if (theme !== "light" && theme !== "dark") {
+        theme = null; // don't overwrite with junk, keep existing
+    }
+
+    if (typeof showTimestamps !== "boolean") showTimestamps = null;
+    if (typeof compactMode !== "boolean") compactMode = null;
+
+    console.log("POST /api/settings normalized:", {
+        saveChats,
+        theme,
+        showTimestamps,
+        compactMode,
+    });
+
+    await pool.query(
+        `
+        INSERT INTO user_settings (
+            user_id,
+            save_chats,
+            theme,
+            show_timestamps,
+            compact_mode
+        )
+        VALUES (
+            $1,
+            COALESCE($2, true),
+            COALESCE($3, 'dark'),
+            COALESCE($4, true),
+            COALESCE($5, false)
+        )
+        ON CONFLICT (user_id) DO UPDATE SET
+            save_chats      = COALESCE($2, user_settings.save_chats),
+            theme           = COALESCE($3, user_settings.theme),
+            show_timestamps = COALESCE($4, user_settings.show_timestamps),
+            compact_mode    = COALESCE($5, user_settings.compact_mode)
+        `,
+        [userId, saveChats, theme, showTimestamps, compactMode]
+    );
+
+    console.log("POST /api/settings completed for user", userId);
+    res.json({ ok: true });
 });
 
 // GET layout -> { tabs: TabRecord[], activeId: string|null }

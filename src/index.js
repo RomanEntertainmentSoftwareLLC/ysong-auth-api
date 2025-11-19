@@ -200,42 +200,51 @@ app.post("/api/chats/:id/messages", requireAuth, async (req, res) => {
 	}
 });
 
-// assuming: app = express(), pool = new Pool(...), requireAuth sets req.user.id
+// Delete a chat (and its messages)
 app.post("/api/chats/delete", requireAuth, async (req, res) => {
-	const userId = req.user.id;               // or whatever you use
-	const { chatId } = req.body;
+	const userId = req.user.id;
+	const { chatId } = req.body ?? {};
 
 	if (!chatId) {
 		return res.status(400).json({ error: "chatId is required" });
 	}
 
 	const client = await pool.connect();
-		try {
-			await client.query("BEGIN");
 
-			// If you DON'T have ON DELETE CASCADE on chat_messages.chat_id:
-			await client.query(
-				"DELETE FROM chat_messages WHERE chat_id = $1 AND user_id = $2",
-				[chatId, userId]
-			);
+	try {
+		await client.query("BEGIN");
 
-			await client.query(
-				"DELETE FROM chats WHERE id = $1 AND user_id = $2",
-				[chatId, userId]
-			);
+		// Make sure this chat belongs to the user
+		const { rows: chatRows } = await client.query(
+			"SELECT id FROM chats WHERE id = $1 AND user_id = $2 LIMIT 1",
+			[chatId, userId]
+		);
 
-			await client.query("COMMIT");
-			res.json({ ok: true });
-		} catch (err) {
+		if (chatRows.length === 0) {
 			await client.query("ROLLBACK");
-			console.error("Error deleting chat", err);
-			res.status(500).json({ error: "Failed to delete chat" });
-		} finally {
-			client.release();
+			return res.status(404).json({ error: "chat_not_found" });
+		}
+
+		// Delete all messages for this chat
+		// (no user_id column on messages; ownership is enforced via chats.user_id)
+		await client.query("DELETE FROM messages WHERE chat_id = $1", [chatId]);
+
+		// Delete the chat row itself
+		await client.query(
+			"DELETE FROM chats WHERE id = $1 AND user_id = $2",
+			[chatId, userId]
+		);
+
+		await client.query("COMMIT");
+		res.json({ ok: true });
+	} catch (err) {
+		await client.query("ROLLBACK");
+		console.error("Error deleting chat", err);
+		res.status(500).json({ error: "failed_to_delete_chat" });
+	} finally {
+		client.release();
 	}
 });
-
-
 
 // -------------------- Health --------------------
 app.get("/", (_req, res) => res.send("ysong-api"));

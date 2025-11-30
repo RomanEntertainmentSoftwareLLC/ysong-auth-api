@@ -246,6 +246,46 @@ app.post("/api/chats/delete", requireAuth, async (req, res) => {
 	}
 });
 
+// Rename a chat (used by auto title and manual rename)
+app.post("/api/chats/rename", requireAuth, async (req, res) => {
+	const userId = req.user.id;
+	const { chatId, title } = req.body ?? {};
+
+	if (!chatId || typeof chatId !== "string") {
+		return res.status(400).json({ error: "chatId_required" });
+	}
+
+	// Normalize and cap title length
+	let safeTitle =
+		typeof title === "string" ? title.trim() : "";
+	if (!safeTitle) {
+		return res.status(400).json({ error: "title_required" });
+	}
+	if (safeTitle.length > 200) {
+		safeTitle = safeTitle.slice(0, 200);
+	}
+
+	try {
+		const result = await pool.query(
+		`UPDATE chats
+		SET title = $1,
+			updated_at = now()
+		WHERE id = $2
+			AND user_id = $3`,
+		[safeTitle, chatId, userId]
+		);
+
+		if (result.rowCount === 0) {
+		return res.status(404).json({ error: "chat_not_found" });
+		}
+
+		res.json({ ok: true, title: safeTitle });
+	} catch (err) {
+		console.error("POST /api/chats/rename", err);
+		res.status(500).json({ error: "server_error" });
+	}
+});
+
 // -------------------- Health --------------------
 app.get("/", (_req, res) => res.send("ysong-api"));
 app.get("/healthz", (_req, res) => res.send("ok"));

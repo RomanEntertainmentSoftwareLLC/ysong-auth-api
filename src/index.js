@@ -221,7 +221,12 @@ app.post("/api/uploads", requireAuth, upload.single("file"), async (req, res) =>
     });
   } catch (e) {
     console.error("POST /api/uploads ERROR", e);
-    return res.status(500).json({ error: "upload_failed" });
+	return res.status(500).json({
+		error: "upload_failed",
+		message: e && e.message,
+		code: e && e.code,
+		stack: e && e.stack,
+    });
   }
 });
 

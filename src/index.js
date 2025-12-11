@@ -7,8 +7,33 @@ import { z } from "zod";
 import { pool } from "./db.js";
 import { sendVerifyEmail } from "./email.js";
 import jwt from "jsonwebtoken";
+import multer from "multer";
+import { Storage } from "@google-cloud/storage";
+import fs from "fs";
+import path from "path";
 
 const app = express();
+
+// ---- File uploads: Google Cloud Storage ----
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 1024 * 1024 * 100, // 100 MB cap for now
+  },
+});
+
+// Uses default credentials on the VM (same as your FastAPI code).
+// For local dev, you'll need ADC (gcloud auth application-default login
+// or a service account JSON pointed to by GOOGLE_APPLICATION_CREDENTIALS).
+const storage = new Storage();
+
+const bucketName = process.env.GCS_BUCKET_NAME || "ysong-assets";
+const assetsBucket = storage.bucket(bucketName);
+
+if (!process.env.GCS_BUCKET_NAME) {
+  console.warn("⚠️ GCS_BUCKET_NAME is not set; /api/uploads will fail.");
+}
+
 
 // ---- ToS version (server-driven) ----
 const CURRENT_TOS_VERSION = process.env.TOS_VERSION || "2025-11-05-v1";
@@ -86,6 +111,120 @@ function authFromHeader(req) {
 	return m ? m[1] : null;
 }
 
+// --- Dev uploads JSON (local-only) --------------------------------
+const USE_DEV_UPLOADS =
+  process.env.NODE_ENV !== "production" &&
+  process.env.USE_DEV_UPLOADS !== "0";
+
+const DEV_UPLOADS_JSON =
+  process.env.DEV_UPLOADS_JSON ||
+  path.join(process.cwd(), "uploads-dev.json");
+
+function appendDevUpload(entry) {
+  try {
+    let existing = [];
+
+    if (fs.existsSync(DEV_UPLOADS_JSON)) {
+      const raw = fs.readFileSync(DEV_UPLOADS_JSON, "utf8");
+      existing = JSON.parse(raw);
+      if (!Array.isArray(existing)) existing = [];
+    }
+
+    existing.push(entry);
+
+    fs.writeFileSync(
+      DEV_UPLOADS_JSON,
+      JSON.stringify(existing, null, 2),
+      "utf8"
+    );
+  } catch (err) {
+    console.error("DEV_UPLOADS: failed to write JSON file", err);
+  }
+}
+
+// -------------------- API: Uploads --------------------
+// -------------------- API: Uploads --------------------
+app.post("/api/uploads", requireAuth, upload.single("file"), async (req, res) => {
+  console.log("DEBUG /api/uploads hit", {
+    userId: req.user?.id,
+    file: req.file?.originalname,
+    useDev: USE_DEV_UPLOADS,
+    jsonPath: DEV_UPLOADS_JSON,
+  });
+
+  try {
+    const userId = req.user.id;
+    const file = req.file;
+    if (!file) {
+      return res.status(400).json({ error: "no_file" });
+    }
+
+    const objectKey = `user-uploads/${userId}/${Date.now()}-${file.originalname}`;
+
+    // ---- DEV PATH: writes metadata to uploads-dev.json (no GCS) ----
+    if (USE_DEV_UPLOADS) {
+      const entry = {
+        userId: String(userId),
+        objectKey,
+        filename: file.originalname,
+        size: file.size,
+        contentType: file.mimetype,
+        createdAt: new Date().toISOString(),
+      };
+
+      appendDevUpload(entry);
+      console.log("DEV_UPLOADS -> simulated upload", entry);
+
+      return res.status(201).json({
+        filename: file.originalname,
+        size: file.size,
+        contentType: file.mimetype,
+        bucket: "dev-local",
+        objectKey,
+        publicUrl: null,
+      });
+    }
+
+    // ---- PROD PATH: real Google Cloud Storage upload ----
+    if (!assetsBucket) {
+      console.error("GCS bucket is not configured");
+      return res.status(500).json({ error: "storage_not_configured" });
+    }
+
+    const gcsFile = assetsBucket.file(objectKey);
+
+    await gcsFile.save(file.buffer, {
+      resumable: false,
+      contentType: file.mimetype,
+      metadata: {
+        cacheControl: "public, max-age=31536000",
+        metadata: {
+          userId: String(userId),
+          originalName: file.originalname,
+        },
+      },
+    });
+
+    const publicUrl = `https://storage.googleapis.com/${bucketName}/${encodeURIComponent(
+      objectKey
+    )}`;
+
+    console.log("DEBUG: Uploaded file to GCS", { userId, objectKey, publicUrl });
+
+    return res.status(201).json({
+      filename: file.originalname,
+      size: file.size,
+      contentType: file.mimetype,
+      bucket: bucketName,
+      objectKey,
+      publicUrl,
+    });
+  } catch (e) {
+    console.error("POST /api/uploads ERROR", e);
+    return res.status(500).json({ error: "upload_failed" });
+  }
+});
+
 // -------------------- API: Chats --------------------
 app.get("/api/chats", requireAuth, async (req, res) => {
 	try {
@@ -152,52 +291,85 @@ app.get("/api/chats/:id/messages", requireAuth, async (req, res) => {
 });
 
 app.post("/api/chats/:id/messages", requireAuth, async (req, res) => {
-	try {
-		const userId = req.user.id;
-		const chatId = String(req.params.id);
-		const { role, content, attachments } = req.body ?? {};
+  try {
+    const userId = req.user.id;
+    const chatId = String(req.params.id);
 
-		if (!role || !content) {
-			return res.status(400).json({ error: "missing_fields" });
-		}
-		if (!["user", "assistant"].includes(role)) {
-			return res.status(400).json({ error: "invalid_role" });
-		}
+    console.log("DEBUG /api/chats/:id/messages body:", req.body);
 
-		// Ensure chat exists for this user; create it if it doesn't
-		const { rows: chatRows } = await pool.query(
-			`SELECT id FROM chats WHERE id = $1 AND user_id = $2 LIMIT 1`,
-			[chatId, userId]
-		);
+    const { role, content, attachments } = req.body ?? {};
 
-		if (chatRows.length === 0) {
-		// chat didn't exist yet -> create it with this id
-		await pool.query(
-			`INSERT INTO chats (id, user_id, title, pinned, is_cloud_saved)
-			VALUES ($1, $2, $3, FALSE, TRUE)`,
-			[chatId, userId, ""] // title will get updated later from UI if you want
-		);
-		}
+    if (!role || !content) {
+      console.log("DEBUG -> missing_role_or_content");
+      return res.status(400).json({ error: "missing_role_or_content" });
+    }
+    if (!["user", "assistant"].includes(role)) {
+      console.log("DEBUG -> invalid_role");
+      return res.status(400).json({ error: "invalid_role" });
+    }
 
-		const { rows } = await pool.query(
-			`INSERT INTO messages (chat_id, role, content, attachments_json)
-			VALUES ($1, $2, $3, $4)
-			RETURNING id, role, content, attachments_json, created_at`,
-			[chatId, role, content, attachments ?? null]
-		);
+    const safeContent = typeof content === "string" ? content : "";
 
-		const m = rows[0];
-			res.status(201).json({
-			id: m.id,
-			role: m.role,
-			content: m.content,
-			attachments: m.attachments_json,
-			createdAt: m.created_at,
-		});
-	} catch (e) {
-		console.error("POST /api/chats/:id/messages", e);
-		res.status(500).json({ error: "server_error" });
-	}
+    const normalizedAttachments =
+      Array.isArray(attachments) && attachments.length > 0
+        ? attachments.map((a) => ({
+            name: typeof a.name === "string" ? a.name.slice(0, 500) : "",
+            size:
+              typeof a.size === "number" && Number.isFinite(a.size)
+                ? a.size
+                : 0,
+            type: typeof a.type === "string" ? a.type.slice(0, 200) : "",
+          }))
+        : null;
+
+    console.log(
+      "DEBUG -> normalizedAttachments param:",
+      normalizedAttachments
+    );
+
+    const attachmentsJson =
+      normalizedAttachments !== null
+        ? JSON.stringify(normalizedAttachments)
+        : null;
+
+    // Make sure chat exists for this user
+    const { rows: chatRows } = await pool.query(
+      `SELECT id FROM chats WHERE id = $1 AND user_id = $2 LIMIT 1`,
+      [chatId, userId]
+    );
+
+    if (chatRows.length === 0) {
+      console.log("DEBUG -> creating chat shell for id", chatId);
+      await pool.query(
+        `INSERT INTO chats (id, user_id, title, pinned, is_cloud_saved)
+         VALUES ($1, $2, $3, FALSE, TRUE)`,
+        [chatId, userId, ""]
+      );
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO messages (chat_id, role, content, attachments_json)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, role, content, attachments_json, created_at`,
+      [chatId, role, safeContent, attachmentsJson]
+    );
+
+    const m = rows[0];
+    console.log("DEBUG -> inserted message id", m.id);
+
+    // Single response only
+    return res.status(201).json({
+      id: m.id,
+      role: m.role,
+      content: m.content,
+      attachments: m.attachments_json,
+      createdAt: m.created_at,
+    });
+  } catch (e) {
+    console.error("POST /api/chats/:id/messages ERROR", e);
+    console.error("Request body that failed:", req.body);
+    return res.status(500).json({ error: "server_error" });
+  }
 });
 
 // Delete a chat (and its messages)

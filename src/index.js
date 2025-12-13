@@ -224,6 +224,45 @@ app.post("/api/uploads", requireAuth, upload.single("file"), async (req, res) =>
   }
 });
 
+app.post("/api/uploads/delete", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { objectKey } = req.body ?? {};
+
+    if (!objectKey || typeof objectKey !== "string") {
+      return res.status(400).json({ error: "missing_objectKey" });
+    }
+
+    const prefix = `user-uploads/${userId}/`;
+    if (!objectKey.startsWith(prefix)) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+
+    if (USE_DEV_UPLOADS) {
+      // remove from uploads-dev.json
+      const arr = readDevUploads();
+      const next = arr.filter((x) => x.objectKey !== objectKey);
+      writeDevUploads(next);
+      return res.json({ ok: true, dev: true });
+    }
+
+    // real GCS delete
+    const file = assetsBucket.file(objectKey);
+
+    try {
+      await file.delete(); // if it 404s, we treat it as already gone
+    } catch (e) {
+      if (e?.code !== 404) throw e;
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("POST /api/uploads/delete ERROR", e);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+
 // -------------------- API: Chats --------------------
 app.get("/api/chats", requireAuth, async (req, res) => {
 	try {
@@ -297,29 +336,30 @@ app.post("/api/chats/:id/messages", requireAuth, async (req, res) => {
     console.log("DEBUG /api/chats/:id/messages body:", req.body);
 
     const { role, content, attachments } = req.body ?? {};
+	const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
+	const hasContent = typeof content === "string" && content.length > 0;
 
-    if (!role || !content) {
-      console.log("DEBUG -> missing_role_or_content");
-      return res.status(400).json({ error: "missing_role_or_content" });
-    }
+	if (!role || (!hasContent && !hasAttachments)) {
+		return res.status(400).json({ error: "missing_role_or_content" });
+	}
+
     if (!["user", "assistant"].includes(role)) {
-      console.log("DEBUG -> invalid_role");
-      return res.status(400).json({ error: "invalid_role" });
+		console.log("DEBUG -> invalid_role");
+		return res.status(400).json({ error: "invalid_role" });
     }
 
     const safeContent = typeof content === "string" ? content : "";
 
-    const normalizedAttachments =
-      Array.isArray(attachments) && attachments.length > 0
-        ? attachments.map((a) => ({
-            name: typeof a.name === "string" ? a.name.slice(0, 500) : "",
-            size:
-              typeof a.size === "number" && Number.isFinite(a.size)
-                ? a.size
-                : 0,
-            type: typeof a.type === "string" ? a.type.slice(0, 200) : "",
-          }))
-        : null;
+	const normalizedAttachments = Array.isArray(attachments)
+	? attachments.map((a) => ({
+		name: typeof a.name === "string" ? a.name.slice(0, 512) : "",
+		size: typeof a.size === "number" ? a.size : 0,
+		type: typeof a.type === "string" ? a.type.slice(0, 200) : "",
+		objectKey: typeof a.objectKey === "string" ? a.objectKey.slice(0, 2048) : "",
+		publicUrl: typeof a.publicUrl === "string" ? a.publicUrl.slice(0, 2048) : "",
+		}))
+	: null;
+
 
     console.log(
       "DEBUG -> normalizedAttachments param:",

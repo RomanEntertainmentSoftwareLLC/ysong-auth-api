@@ -31,7 +31,7 @@ const bucketName = process.env.GCS_BUCKET_NAME || "ysong-assets";
 const assetsBucket = storage.bucket(bucketName);
 
 if (!process.env.GCS_BUCKET_NAME) {
-  console.warn("⚠️ GCS_BUCKET_NAME is not set; /api/uploads will fail.");
+  console.warn(`⚠️ GCS_BUCKET_NAME not set; defaulting to ${bucketName}`);
 }
 
 
@@ -67,7 +67,7 @@ const LoginSchema = z.object({
 app.set("trust proxy", 1);
 app.use((_, res, next) => { res.header("Vary", "Origin"); next(); });
 app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
+app.options(/.*/, cors(corsOptions));
 app.use(express.json());
 
 // -------------------- Helpers --------------------
@@ -186,11 +186,6 @@ app.post("/api/uploads", requireAuth, upload.single("file"), async (req, res) =>
     }
 
     // ---- PROD PATH: real Google Cloud Storage upload ----
-    if (!assetsBucket) {
-      console.error("GCS bucket is not configured");
-      return res.status(500).json({ error: "storage_not_configured" });
-    }
-
     const gcsFile = assetsBucket.file(objectKey);
 
     await gcsFile.save(file.buffer, {
@@ -205,9 +200,8 @@ app.post("/api/uploads", requireAuth, upload.single("file"), async (req, res) =>
       },
     });
 
-    const publicUrl = `https://storage.googleapis.com/${bucketName}/${encodeURIComponent(
-      objectKey
-    )}`;
+	const encodedKey = objectKey.split("/").map(encodeURIComponent).join("/");
+	const publicUrl = `https://storage.googleapis.com/${bucketName}/${encodedKey}`;
 
     console.log("DEBUG: Uploaded file to GCS", { userId, objectKey, publicUrl });
 

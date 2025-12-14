@@ -262,6 +262,40 @@ app.post("/api/uploads/delete", requireAuth, async (req, res) => {
   }
 });
 
+// GET a short-lived signed URL for a private object
+app.get("/api/uploads/url", requireAuth, async (req, res) => {
+  try {
+    const user = req.user;
+    const { objectKey, disposition = "inline" } = req.query;
+
+    if (!objectKey || typeof objectKey !== "string") {
+      return res.status(400).json({ error: "missing_objectKey" });
+    }
+
+    // IMPORTANT: prevent users from signing URLs for other users’ objects
+    const expectedPrefix = `uploads/${user.id}/`;
+    if (!objectKey.startsWith(expectedPrefix)) {
+      return res.status(403).json({ error: "forbidden_objectKey" });
+    }
+
+    const file = bucket.file(objectKey);
+
+    const expiresAt = Date.now() + 15 * 60 * 1000; // 15 minutes
+    const disp = disposition === "attachment" ? "attachment" : "inline";
+
+    const [url] = await file.getSignedUrl({
+      version: "v4",
+      action: "read",
+      expires: expiresAt,
+      responseDisposition: disp,
+    });
+
+    res.json({ url, expiresAt });
+  } catch (err) {
+    console.error("signed url error", err);
+    res.status(500).json({ error: "signed_url_failed" });
+  }
+});
 
 // -------------------- API: Chats --------------------
 app.get("/api/chats", requireAuth, async (req, res) => {

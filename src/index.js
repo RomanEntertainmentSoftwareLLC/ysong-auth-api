@@ -262,38 +262,78 @@ app.post("/api/uploads/delete", requireAuth, async (req, res) => {
   }
 });
 
-// GET a short-lived signed URL for a private object
-app.get("/api/uploads/url", requireAuth, async (req, res) => {
+// -------------------- API: Upload signed read URLs (private bucket) --------------------
+app.get("/api/uploads/signed-url", requireAuth, async (req, res) => {
   try {
-    const user = req.user;
-    const { objectKey, disposition = "inline" } = req.query;
+    const userId = req.user.id;
 
-    if (!objectKey || typeof objectKey !== "string") {
+    const objectKey = String(req.query.objectKey || "");
+    const mode = String(req.query.mode || "play"); // "play" | "download"
+
+    if (!objectKey) {
       return res.status(400).json({ error: "missing_objectKey" });
     }
 
-    // IMPORTANT: prevent users from signing URLs for other users’ objects
-    const expectedPrefix = `uploads/${user.id}/`;
-    if (!objectKey.startsWith(expectedPrefix)) {
-      return res.status(403).json({ error: "forbidden_objectKey" });
+    // Make sure users can only sign their own objects
+    const prefix = `user-uploads/${userId}/`;
+    if (!objectKey.startsWith(prefix)) {
+      return res.status(403).json({ error: "forbidden" });
     }
 
-    const file = bucket.file(objectKey);
+    if (USE_DEV_UPLOADS) {
+      return res.status(400).json({ error: "dev_no_signed_url" });
+    }
 
-    const expiresAt = Date.now() + 15 * 60 * 1000; // 15 minutes
-    const disp = disposition === "attachment" ? "attachment" : "inline";
+    const file = assetsBucket.file(objectKey);
+
+    // Grab metadata so contentType + original filename are correct
+    let meta = null;
+    try {
+      const [m] = await file.getMetadata();
+      meta = m;
+    } catch (e) {
+      if (e?.code === 404) {
+        return res.status(404).json({ error: "not_found" });
+      }
+      throw e;
+    }
+
+    const contentType =
+      meta?.contentType || "application/octet-stream";
+
+    // Prefer the originalName you stored during upload
+    const originalName =
+      meta?.metadata?.originalName ||
+      meta?.name?.split("/").pop() ||
+      "download";
+
+    const responseDisposition =
+      mode === "download"
+        ? `attachment; filename="${originalName}"`
+        : `inline; filename="${originalName}"`;
+
+    // Long enough for playback without expiring mid-stream
+    const expiresMs = 2 * 60 * 60 * 1000; // 2 hours
+    const expiresAt = Date.now() + expiresMs;
 
     const [url] = await file.getSignedUrl({
       version: "v4",
       action: "read",
       expires: expiresAt,
-      responseDisposition: disp,
+      responseDisposition,
+      responseType: contentType,
     });
 
-    res.json({ url, expiresAt });
-  } catch (err) {
-    console.error("signed url error", err);
-    res.status(500).json({ error: "signed_url_failed" });
+    return res.json({
+      url,
+      contentType,
+      expiresAt,
+      objectKey,
+      mode,
+    });
+  } catch (e) {
+    console.error("GET /api/uploads/signed-url ERROR", e);
+    return res.status(500).json({ error: "signed_url_failed" });
   }
 });
 

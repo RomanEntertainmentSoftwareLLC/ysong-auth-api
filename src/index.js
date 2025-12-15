@@ -571,6 +571,58 @@ app.post("/api/chats/rename", requireAuth, async (req, res) => {
 	}
 });
 
+// Remove a single attachment from a message; if none left, set attachments_json = NULL
+app.post("/api/messages/remove-attachment", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { messageId, objectKey } = req.body || {};
+
+    if (!messageId || !objectKey) {
+      return res.status(400).json({ error: "missing_messageId_or_objectKey" });
+    }
+
+    const sql = `
+      WITH owned AS (
+        SELECT m.id, m.attachments_json
+        FROM messages m
+        JOIN chats c ON c.id = m.chat_id
+        WHERE m.id = $1
+          AND c.user_id = $2
+        LIMIT 1
+      ),
+      filtered AS (
+        SELECT
+          owned.id AS mid,
+          jsonb_agg(elem) FILTER (WHERE elem->>'objectKey' <> $3) AS kept
+        FROM owned
+        LEFT JOIN LATERAL jsonb_array_elements(
+          COALESCE(owned.attachments_json, '[]'::jsonb)
+        ) elem ON TRUE
+        GROUP BY owned.id
+      )
+      UPDATE messages m
+      SET attachments_json = CASE
+        WHEN filtered.kept IS NULL OR filtered.kept = '[]'::jsonb THEN NULL
+        ELSE filtered.kept
+      END
+      FROM filtered
+      WHERE m.id = filtered.mid
+      RETURNING m.id;
+    `;
+
+    const result = await pool.query(sql, [messageId, userId, objectKey]);
+
+    if (!result.rowCount) {
+      return res.status(404).json({ error: "not_found" });
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("POST /api/messages/remove-attachment ERROR", e);
+    return res.status(500).json({ error: "remove_attachment_failed" });
+  }
+});
+
 // -------------------- Health --------------------
 app.get("/", (_req, res) => res.send("ysong-api"));
 app.get("/healthz", (_req, res) => res.send("ok"));

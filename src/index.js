@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import crypto from "crypto";
@@ -16,10 +16,10 @@ const app = express();
 
 // ---- File uploads: Google Cloud Storage ----
 const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 1024 * 1024 * 100, // 100 MB cap for now
-  },
+	storage: multer.memoryStorage(),
+	limits: {
+		fileSize: 1024 * 1024 * 100, // 100 MB cap for now
+	},
 });
 
 // Uses default credentials on the VM (same as your FastAPI code).
@@ -31,9 +31,8 @@ const bucketName = process.env.GCS_BUCKET_NAME || "ysong-assets";
 const assetsBucket = storage.bucket(bucketName);
 
 if (!process.env.GCS_BUCKET_NAME) {
-  console.warn(`⚠️ GCS_BUCKET_NAME not set; defaulting to ${bucketName}`);
+	console.warn(`⚠️ GCS_BUCKET_NAME not set; defaulting to ${bucketName}`);
 }
-
 
 // ---- ToS version (server-driven) ----
 const CURRENT_TOS_VERSION = process.env.TOS_VERSION || "2025-11-05-v1";
@@ -50,7 +49,7 @@ const allowedOrigins = [
 const corsOptions = {
 	origin(origin, cb) {
 		if (!origin) return cb(null, true);
-		const ok = allowedOrigins.some(o => o instanceof RegExp ? o.test(origin) : o === origin);
+		const ok = allowedOrigins.some((o) => (o instanceof RegExp ? o.test(origin) : o === origin));
 		return ok ? cb(null, true) : cb(new Error("Not allowed by CORS"));
 	},
 	methods: ["GET", "POST", "OPTIONS"],
@@ -60,12 +59,15 @@ const corsOptions = {
 };
 
 const LoginSchema = z.object({
-  email: z.string().email().max(320),
-  password: z.string().min(8).max(200),
+	email: z.string().email().max(320),
+	password: z.string().min(8).max(200),
 });
 
 app.set("trust proxy", 1);
-app.use((_, res, next) => { res.header("Vary", "Origin"); next(); });
+app.use((_, res, next) => {
+	res.header("Vary", "Origin");
+	next();
+});
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
 app.use(express.json());
@@ -93,17 +95,16 @@ function requireAuth(req, res, next) {
 }
 
 function sha256(hexOrBuffer) {
-  	return crypto.createHash("sha256").update(hexOrBuffer).digest("hex");
+	return crypto.createHash("sha256").update(hexOrBuffer).digest("hex");
 }
 function minutesFromNow(mins) {
-  	return new Date(Date.now() + mins * 60_000);
+	return new Date(Date.now() + mins * 60_000);
 }
 function signToken(user) {
-	return jwt.sign(
-		{ uid: user.id, email: user.email },
-		process.env.JWT_SECRET,
-		{ algorithm: "HS256", expiresIn: "7d" }
-	);
+	return jwt.sign({ uid: user.id, email: user.email }, process.env.JWT_SECRET, {
+		algorithm: "HS256",
+		expiresIn: "7d",
+	});
 }
 function authFromHeader(req) {
 	const h = req.headers.authorization || "";
@@ -112,229 +113,215 @@ function authFromHeader(req) {
 }
 
 // --- Dev uploads JSON (local-only) --------------------------------
-const USE_DEV_UPLOADS =
-  process.env.NODE_ENV !== "production" &&
-  process.env.USE_DEV_UPLOADS !== "0";
+const USE_DEV_UPLOADS = process.env.NODE_ENV !== "production" && process.env.USE_DEV_UPLOADS !== "0";
 
-const DEV_UPLOADS_JSON =
-  process.env.DEV_UPLOADS_JSON ||
-  path.join(process.cwd(), "uploads-dev.json");
+const DEV_UPLOADS_JSON = process.env.DEV_UPLOADS_JSON || path.join(process.cwd(), "uploads-dev.json");
 
 function appendDevUpload(entry) {
-  try {
-    let existing = [];
+	try {
+		let existing = [];
 
-    if (fs.existsSync(DEV_UPLOADS_JSON)) {
-      const raw = fs.readFileSync(DEV_UPLOADS_JSON, "utf8");
-      existing = JSON.parse(raw);
-      if (!Array.isArray(existing)) existing = [];
-    }
+		if (fs.existsSync(DEV_UPLOADS_JSON)) {
+			const raw = fs.readFileSync(DEV_UPLOADS_JSON, "utf8");
+			existing = JSON.parse(raw);
+			if (!Array.isArray(existing)) existing = [];
+		}
 
-    existing.push(entry);
+		existing.push(entry);
 
-    fs.writeFileSync(
-      DEV_UPLOADS_JSON,
-      JSON.stringify(existing, null, 2),
-      "utf8"
-    );
-  } catch (err) {
-    console.error("DEV_UPLOADS: failed to write JSON file", err);
-  }
+		fs.writeFileSync(DEV_UPLOADS_JSON, JSON.stringify(existing, null, 2), "utf8");
+	} catch (err) {
+		console.error("DEV_UPLOADS: failed to write JSON file", err);
+	}
 }
 
 // -------------------- API: Uploads --------------------
 // -------------------- API: Uploads --------------------
 app.post("/api/uploads", requireAuth, upload.single("file"), async (req, res) => {
-  console.log("DEBUG /api/uploads hit", {
-    userId: req.user?.id,
-    file: req.file?.originalname,
-    useDev: USE_DEV_UPLOADS,
-    jsonPath: DEV_UPLOADS_JSON,
-  });
+	console.log("DEBUG /api/uploads hit", {
+		userId: req.user?.id,
+		file: req.file?.originalname,
+		useDev: USE_DEV_UPLOADS,
+		jsonPath: DEV_UPLOADS_JSON,
+	});
 
-  try {
-    const userId = req.user.id;
-    const file = req.file;
-    if (!file) {
-      return res.status(400).json({ error: "no_file" });
-    }
+	try {
+		const userId = req.user.id;
+		const file = req.file;
+		if (!file) {
+			return res.status(400).json({ error: "no_file" });
+		}
 
-    const objectKey = `user-uploads/${userId}/${Date.now()}-${file.originalname}`;
+		const objectKey = `user-uploads/${userId}/${Date.now()}-${file.originalname}`;
 
-    // ---- DEV PATH: writes metadata to uploads-dev.json (no GCS) ----
-    if (USE_DEV_UPLOADS) {
-      const entry = {
-        userId: String(userId),
-        objectKey,
-        filename: file.originalname,
-        size: file.size,
-        contentType: file.mimetype,
-        createdAt: new Date().toISOString(),
-      };
+		// ---- DEV PATH: writes metadata to uploads-dev.json (no GCS) ----
+		if (USE_DEV_UPLOADS) {
+			const entry = {
+				userId: String(userId),
+				objectKey,
+				filename: file.originalname,
+				size: file.size,
+				contentType: file.mimetype,
+				createdAt: new Date().toISOString(),
+			};
 
-      appendDevUpload(entry);
-      console.log("DEV_UPLOADS -> simulated upload", entry);
+			appendDevUpload(entry);
+			console.log("DEV_UPLOADS -> simulated upload", entry);
 
-      return res.status(201).json({
-        filename: file.originalname,
-        size: file.size,
-        contentType: file.mimetype,
-        bucket: "dev-local",
-        objectKey,
-        publicUrl: null,
-      });
-    }
+			return res.status(201).json({
+				filename: file.originalname,
+				size: file.size,
+				contentType: file.mimetype,
+				bucket: "dev-local",
+				objectKey,
+				publicUrl: null,
+			});
+		}
 
-    // ---- PROD PATH: real Google Cloud Storage upload ----
-    const gcsFile = assetsBucket.file(objectKey);
+		// ---- PROD PATH: real Google Cloud Storage upload ----
+		const gcsFile = assetsBucket.file(objectKey);
 
-    await gcsFile.save(file.buffer, {
-      resumable: false,
-      contentType: file.mimetype,
-      metadata: {
-        cacheControl: "public, max-age=31536000",
-        metadata: {
-          userId: String(userId),
-          originalName: file.originalname,
-        },
-      },
-    });
+		await gcsFile.save(file.buffer, {
+			resumable: false,
+			contentType: file.mimetype,
+			metadata: {
+				cacheControl: "public, max-age=31536000",
+				metadata: {
+					userId: String(userId),
+					originalName: file.originalname,
+				},
+			},
+		});
 
-	const encodedKey = objectKey.split("/").map(encodeURIComponent).join("/");
-	const publicUrl = `https://storage.googleapis.com/${bucketName}/${encodedKey}`;
+		const encodedKey = objectKey.split("/").map(encodeURIComponent).join("/");
+		const publicUrl = `https://storage.googleapis.com/${bucketName}/${encodedKey}`;
 
-    console.log("DEBUG: Uploaded file to GCS", { userId, objectKey, publicUrl });
+		console.log("DEBUG: Uploaded file to GCS", { userId, objectKey, publicUrl });
 
-    return res.status(201).json({
-      filename: file.originalname,
-      size: file.size,
-      contentType: file.mimetype,
-      bucket: bucketName,
-      objectKey,
-      publicUrl,
-    });
-  } catch (e) {
-    console.error("POST /api/uploads ERROR", e);
-	return res.status(500).json({
-		error: "upload_failed",
-		message: e && e.message,
-		code: e && e.code,
-		stack: e && e.stack,
-    });
-  }
+		return res.status(201).json({
+			filename: file.originalname,
+			size: file.size,
+			contentType: file.mimetype,
+			bucket: bucketName,
+			objectKey,
+			publicUrl,
+		});
+	} catch (e) {
+		console.error("POST /api/uploads ERROR", e);
+		return res.status(500).json({
+			error: "upload_failed",
+			message: e && e.message,
+			code: e && e.code,
+			stack: e && e.stack,
+		});
+	}
 });
 
 app.post("/api/uploads/delete", requireAuth, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { objectKey } = req.body ?? {};
+	try {
+		const userId = req.user.id;
+		const { objectKey } = req.body ?? {};
 
-    if (!objectKey || typeof objectKey !== "string") {
-      return res.status(400).json({ error: "missing_objectKey" });
-    }
+		if (!objectKey || typeof objectKey !== "string") {
+			return res.status(400).json({ error: "missing_objectKey" });
+		}
 
-    const prefix = `user-uploads/${userId}/`;
-    if (!objectKey.startsWith(prefix)) {
-      return res.status(403).json({ error: "forbidden" });
-    }
+		const prefix = `user-uploads/${userId}/`;
+		if (!objectKey.startsWith(prefix)) {
+			return res.status(403).json({ error: "forbidden" });
+		}
 
-    if (USE_DEV_UPLOADS) {
-      // remove from uploads-dev.json
-      const arr = readDevUploads();
-      const next = arr.filter((x) => x.objectKey !== objectKey);
-      writeDevUploads(next);
-      return res.json({ ok: true, dev: true });
-    }
+		if (USE_DEV_UPLOADS) {
+			// remove from uploads-dev.json
+			const arr = readDevUploads();
+			const next = arr.filter((x) => x.objectKey !== objectKey);
+			writeDevUploads(next);
+			return res.json({ ok: true, dev: true });
+		}
 
-    // real GCS delete
-    const file = assetsBucket.file(objectKey);
+		// real GCS delete
+		const file = assetsBucket.file(objectKey);
 
-    try {
-      await file.delete(); // if it 404s, we treat it as already gone
-    } catch (e) {
-      if (e?.code !== 404) throw e;
-    }
+		try {
+			await file.delete(); // if it 404s, we treat it as already gone
+		} catch (e) {
+			if (e?.code !== 404) throw e;
+		}
 
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("POST /api/uploads/delete ERROR", e);
-    return res.status(500).json({ error: "server_error" });
-  }
+		return res.json({ ok: true });
+	} catch (e) {
+		console.error("POST /api/uploads/delete ERROR", e);
+		return res.status(500).json({ error: "server_error" });
+	}
 });
 
 // -------------------- API: Upload signed read URLs (private bucket) --------------------
 app.get("/api/uploads/signed-url", requireAuth, async (req, res) => {
-  try {
-    const userId = req.user.id;
+	try {
+		const userId = req.user.id;
 
-    const objectKey = String(req.query.objectKey || "");
-    const mode = String(req.query.mode || "play"); // "play" | "download"
+		const objectKey = String(req.query.objectKey || "");
+		const mode = String(req.query.mode || "play"); // "play" | "download"
 
-    if (!objectKey) {
-      return res.status(400).json({ error: "missing_objectKey" });
-    }
+		if (!objectKey) {
+			return res.status(400).json({ error: "missing_objectKey" });
+		}
 
-    // Make sure users can only sign their own objects
-    const prefix = `user-uploads/${userId}/`;
-    if (!objectKey.startsWith(prefix)) {
-      return res.status(403).json({ error: "forbidden" });
-    }
+		// Make sure users can only sign their own objects
+		const prefix = `user-uploads/${userId}/`;
+		if (!objectKey.startsWith(prefix)) {
+			return res.status(403).json({ error: "forbidden" });
+		}
 
-    if (USE_DEV_UPLOADS) {
-      return res.status(400).json({ error: "dev_no_signed_url" });
-    }
+		if (USE_DEV_UPLOADS) {
+			return res.status(400).json({ error: "dev_no_signed_url" });
+		}
 
-    const file = assetsBucket.file(objectKey);
+		const file = assetsBucket.file(objectKey);
 
-    // Grab metadata so contentType + original filename are correct
-    let meta = null;
-    try {
-      const [m] = await file.getMetadata();
-      meta = m;
-    } catch (e) {
-      if (e?.code === 404) {
-        return res.status(404).json({ error: "not_found" });
-      }
-      throw e;
-    }
+		// Grab metadata so contentType + original filename are correct
+		let meta = null;
+		try {
+			const [m] = await file.getMetadata();
+			meta = m;
+		} catch (e) {
+			if (e?.code === 404) {
+				return res.status(404).json({ error: "not_found" });
+			}
+			throw e;
+		}
 
-    const contentType =
-      meta?.contentType || "application/octet-stream";
+		const contentType = meta?.contentType || "application/octet-stream";
 
-    // Prefer the originalName you stored during upload
-    const originalName =
-      meta?.metadata?.originalName ||
-      meta?.name?.split("/").pop() ||
-      "download";
+		// Prefer the originalName you stored during upload
+		const originalName = meta?.metadata?.originalName || meta?.name?.split("/").pop() || "download";
 
-    const responseDisposition =
-      mode === "download"
-        ? `attachment; filename="${originalName}"`
-        : `inline; filename="${originalName}"`;
+		const responseDisposition =
+			mode === "download" ? `attachment; filename="${originalName}"` : `inline; filename="${originalName}"`;
 
-    // Long enough for playback without expiring mid-stream
-    const expiresMs = 2 * 60 * 60 * 1000; // 2 hours
-    const expiresAt = Date.now() + expiresMs;
+		// Long enough for playback without expiring mid-stream
+		const expiresMs = 2 * 60 * 60 * 1000; // 2 hours
+		const expiresAt = Date.now() + expiresMs;
 
-    const [url] = await file.getSignedUrl({
-      version: "v4",
-      action: "read",
-      expires: expiresAt,
-      responseDisposition,
-      responseType: contentType,
-    });
+		const [url] = await file.getSignedUrl({
+			version: "v4",
+			action: "read",
+			expires: expiresAt,
+			responseDisposition,
+			responseType: contentType,
+		});
 
-    return res.json({
-      url,
-      contentType,
-      expiresAt,
-      objectKey,
-      mode,
-    });
-  } catch (e) {
-    console.error("GET /api/uploads/signed-url ERROR", e);
-    return res.status(500).json({ error: "signed_url_failed" });
-  }
+		return res.json({
+			url,
+			contentType,
+			expiresAt,
+			objectKey,
+			mode,
+		});
+	} catch (e) {
+		console.error("GET /api/uploads/signed-url ERROR", e);
+		return res.status(500).json({ error: "signed_url_failed" });
+	}
 });
 
 // -------------------- API: Chats --------------------
@@ -343,20 +330,20 @@ app.get("/api/chats", requireAuth, async (req, res) => {
 		const userId = req.user.id;
 		const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
 		const { rows } = await pool.query(
-		`SELECT id, title, pinned, is_cloud_saved, created_at, updated_at
+			`SELECT id, title, pinned, is_cloud_saved, created_at, updated_at
 			FROM chats
 			WHERE user_id = $1
 			ORDER BY created_at DESC
 			LIMIT $2`,
-		[userId, limit]
+			[userId, limit]
 		);
-		const chats = rows.map(r => ({
-		id: r.id,
-		title: r.title || "",
-		pinned: r.pinned,
-		isCloudSaved: r.is_cloud_saved,
-		createdAt: r.created_at,
-		updatedAt: r.updated_at,
+		const chats = rows.map((r) => ({
+			id: r.id,
+			title: r.title || "",
+			pinned: r.pinned,
+			isCloudSaved: r.is_cloud_saved,
+			createdAt: r.created_at,
+			updatedAt: r.updated_at,
 		}));
 		res.json({ chats });
 	} catch (err) {
@@ -366,123 +353,116 @@ app.get("/api/chats", requireAuth, async (req, res) => {
 });
 
 app.get("/api/chats/:id/messages", requireAuth, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const chatId = String(req.params.id);
+	try {
+		const userId = req.user.id;
+		const chatId = String(req.params.id);
 
-    // Make sure the chat belongs to this user
-    const { rows: chatRows } = await pool.query(
-      `SELECT id FROM chats WHERE id = $1 AND user_id = $2 LIMIT 1`,
-      [chatId, userId]
-    );
-    if (chatRows.length === 0) {
-      return res.status(404).json({ error: "chat_not_found" });
-    }
+		// Make sure the chat belongs to this user
+		const { rows: chatRows } = await pool.query(`SELECT id FROM chats WHERE id = $1 AND user_id = $2 LIMIT 1`, [
+			chatId,
+			userId,
+		]);
+		if (chatRows.length === 0) {
+			return res.status(404).json({ error: "chat_not_found" });
+		}
 
-    const { rows } = await pool.query(
-      `SELECT id, role, content, attachments_json, created_at
+		const { rows } = await pool.query(
+			`SELECT id, role, content, attachments_json, created_at
        FROM messages
        WHERE chat_id = $1
        ORDER BY created_at ASC`,
-      [chatId]
-    );
+			[chatId]
+		);
 
-    const messages = rows.map((r) => ({
-      id: r.id,
-      role: r.role,
-      content: r.content,
-      attachments: r.attachments_json,
-      createdAt: r.created_at,
-    }));
+		const messages = rows.map((r) => ({
+			id: r.id,
+			role: r.role,
+			content: r.content,
+			attachments: r.attachments_json,
+			createdAt: r.created_at,
+		}));
 
-    res.json({ messages });
-  } catch (e) {
-    console.error("GET /api/chats/:id/messages", e);
-    res.status(500).json({ error: "server_error" });
-  }
+		res.json({ messages });
+	} catch (e) {
+		console.error("GET /api/chats/:id/messages", e);
+		res.status(500).json({ error: "server_error" });
+	}
 });
 
 app.post("/api/chats/:id/messages", requireAuth, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const chatId = String(req.params.id);
+	try {
+		const userId = req.user.id;
+		const chatId = String(req.params.id);
 
-    console.log("DEBUG /api/chats/:id/messages body:", req.body);
+		console.log("DEBUG /api/chats/:id/messages body:", req.body);
 
-    const { role, content, attachments } = req.body ?? {};
-	const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
-	const hasContent = typeof content === "string" && content.length > 0;
+		const { role, content, attachments } = req.body ?? {};
+		const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
+		const hasContent = typeof content === "string" && content.length > 0;
 
-	if (!role || (!hasContent && !hasAttachments)) {
-		return res.status(400).json({ error: "missing_role_or_content" });
-	}
+		if (!role || (!hasContent && !hasAttachments)) {
+			return res.status(400).json({ error: "missing_role_or_content" });
+		}
 
-    if (!["user", "assistant"].includes(role)) {
-		console.log("DEBUG -> invalid_role");
-		return res.status(400).json({ error: "invalid_role" });
-    }
+		if (!["user", "assistant"].includes(role)) {
+			console.log("DEBUG -> invalid_role");
+			return res.status(400).json({ error: "invalid_role" });
+		}
 
-    const safeContent = typeof content === "string" ? content : "";
+		const safeContent = typeof content === "string" ? content : "";
 
-	const normalizedAttachments = Array.isArray(attachments)
-	? attachments.map((a) => ({
-		name: typeof a.name === "string" ? a.name.slice(0, 512) : "",
-		size: typeof a.size === "number" ? a.size : 0,
-		type: typeof a.type === "string" ? a.type.slice(0, 200) : "",
-		objectKey: typeof a.objectKey === "string" ? a.objectKey.slice(0, 2048) : "",
-		publicUrl: typeof a.publicUrl === "string" ? a.publicUrl.slice(0, 2048) : "",
-		}))
-	: null;
+		const normalizedAttachments = Array.isArray(attachments)
+			? attachments.map((a) => ({
+					name: typeof a.name === "string" ? a.name.slice(0, 512) : "",
+					size: typeof a.size === "number" ? a.size : 0,
+					type: typeof a.type === "string" ? a.type.slice(0, 200) : "",
+					objectKey: typeof a.objectKey === "string" ? a.objectKey.slice(0, 2048) : "",
+					publicUrl: typeof a.publicUrl === "string" ? a.publicUrl.slice(0, 2048) : "",
+			  }))
+			: null;
 
+		console.log("DEBUG -> normalizedAttachments param:", normalizedAttachments);
 
-    console.log(
-      "DEBUG -> normalizedAttachments param:",
-      normalizedAttachments
-    );
+		const attachmentsJson = normalizedAttachments !== null ? JSON.stringify(normalizedAttachments) : null;
 
-    const attachmentsJson =
-      normalizedAttachments !== null
-        ? JSON.stringify(normalizedAttachments)
-        : null;
+		// Make sure chat exists for this user
+		const { rows: chatRows } = await pool.query(`SELECT id FROM chats WHERE id = $1 AND user_id = $2 LIMIT 1`, [
+			chatId,
+			userId,
+		]);
 
-    // Make sure chat exists for this user
-    const { rows: chatRows } = await pool.query(
-      `SELECT id FROM chats WHERE id = $1 AND user_id = $2 LIMIT 1`,
-      [chatId, userId]
-    );
-
-    if (chatRows.length === 0) {
-      console.log("DEBUG -> creating chat shell for id", chatId);
-      await pool.query(
-        `INSERT INTO chats (id, user_id, title, pinned, is_cloud_saved)
+		if (chatRows.length === 0) {
+			console.log("DEBUG -> creating chat shell for id", chatId);
+			await pool.query(
+				`INSERT INTO chats (id, user_id, title, pinned, is_cloud_saved)
          VALUES ($1, $2, $3, FALSE, TRUE)`,
-        [chatId, userId, ""]
-      );
-    }
+				[chatId, userId, ""]
+			);
+		}
 
-    const { rows } = await pool.query(
-      `INSERT INTO messages (chat_id, role, content, attachments_json)
+		const { rows } = await pool.query(
+			`INSERT INTO messages (chat_id, role, content, attachments_json)
        VALUES ($1, $2, $3, $4)
        RETURNING id, role, content, attachments_json, created_at`,
-      [chatId, role, safeContent, attachmentsJson]
-    );
+			[chatId, role, safeContent, attachmentsJson]
+		);
 
-    const m = rows[0];
-    console.log("DEBUG -> inserted message id", m.id);
+		const m = rows[0];
+		console.log("DEBUG -> inserted message id", m.id);
 
-    // Single response only
-    return res.status(201).json({
-      id: m.id,
-      role: m.role,
-      content: m.content,
-      attachments: m.attachments_json,
-      createdAt: m.created_at,
-    });
-  } catch (e) {
-    console.error("POST /api/chats/:id/messages ERROR", e);
-    console.error("Request body that failed:", req.body);
-    return res.status(500).json({ error: "server_error" });
-  }
+		// Single response only
+		return res.status(201).json({
+			id: m.id,
+			role: m.role,
+			content: m.content,
+			attachments: m.attachments_json,
+			createdAt: m.created_at,
+		});
+	} catch (e) {
+		console.error("POST /api/chats/:id/messages ERROR", e);
+		console.error("Request body that failed:", req.body);
+		return res.status(500).json({ error: "server_error" });
+	}
 });
 
 // Delete a chat (and its messages)
@@ -500,10 +480,10 @@ app.post("/api/chats/delete", requireAuth, async (req, res) => {
 		await client.query("BEGIN");
 
 		// Make sure this chat belongs to the user
-		const { rows: chatRows } = await client.query(
-			"SELECT id FROM chats WHERE id = $1 AND user_id = $2 LIMIT 1",
-			[chatId, userId]
-		);
+		const { rows: chatRows } = await client.query("SELECT id FROM chats WHERE id = $1 AND user_id = $2 LIMIT 1", [
+			chatId,
+			userId,
+		]);
 
 		if (chatRows.length === 0) {
 			await client.query("ROLLBACK");
@@ -515,10 +495,7 @@ app.post("/api/chats/delete", requireAuth, async (req, res) => {
 		await client.query("DELETE FROM messages WHERE chat_id = $1", [chatId]);
 
 		// Delete the chat row itself
-		await client.query(
-			"DELETE FROM chats WHERE id = $1 AND user_id = $2",
-			[chatId, userId]
-		);
+		await client.query("DELETE FROM chats WHERE id = $1 AND user_id = $2", [chatId, userId]);
 
 		await client.query("COMMIT");
 		res.json({ ok: true });
@@ -541,8 +518,7 @@ app.post("/api/chats/rename", requireAuth, async (req, res) => {
 	}
 
 	// Normalize and cap title length
-	let safeTitle =
-		typeof title === "string" ? title.trim() : "";
+	let safeTitle = typeof title === "string" ? title.trim() : "";
 	if (!safeTitle) {
 		return res.status(400).json({ error: "title_required" });
 	}
@@ -552,16 +528,16 @@ app.post("/api/chats/rename", requireAuth, async (req, res) => {
 
 	try {
 		const result = await pool.query(
-		`UPDATE chats
+			`UPDATE chats
 		SET title = $1,
 			updated_at = now()
 		WHERE id = $2
 			AND user_id = $3`,
-		[safeTitle, chatId, userId]
+			[safeTitle, chatId, userId]
 		);
 
 		if (result.rowCount === 0) {
-		return res.status(404).json({ error: "chat_not_found" });
+			return res.status(404).json({ error: "chat_not_found" });
 		}
 
 		res.json({ ok: true, title: safeTitle });
@@ -573,15 +549,15 @@ app.post("/api/chats/rename", requireAuth, async (req, res) => {
 
 // Remove a single attachment from a message; if none left, set attachments_json = NULL
 app.post("/api/messages/remove-attachment", requireAuth, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const { messageId, objectKey } = req.body || {};
+	try {
+		const userId = req.user.id;
+		const { messageId, objectKey } = req.body || {};
 
-    if (!messageId || !objectKey) {
-      return res.status(400).json({ error: "missing_messageId_or_objectKey" });
-    }
+		if (!messageId || !objectKey) {
+			return res.status(400).json({ error: "missing_messageId_or_objectKey" });
+		}
 
-    const sql = `
+		const sql = `
       WITH owned AS (
         SELECT m.id, m.attachments_json
         FROM messages m
@@ -610,17 +586,17 @@ app.post("/api/messages/remove-attachment", requireAuth, async (req, res) => {
       RETURNING m.id;
     `;
 
-    const result = await pool.query(sql, [messageId, userId, objectKey]);
+		const result = await pool.query(sql, [messageId, userId, objectKey]);
 
-    if (!result.rowCount) {
-      return res.status(404).json({ error: "not_found" });
-    }
+		if (!result.rowCount) {
+			return res.status(404).json({ error: "not_found" });
+		}
 
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("POST /api/messages/remove-attachment ERROR", e);
-    return res.status(500).json({ error: "remove_attachment_failed" });
-  }
+		return res.json({ ok: true });
+	} catch (e) {
+		console.error("POST /api/messages/remove-attachment ERROR", e);
+		return res.status(500).json({ error: "remove_attachment_failed" });
+	}
 });
 
 // -------------------- Health --------------------
@@ -644,45 +620,45 @@ app.post("/auth/signup", async (req, res) => {
 		const password_hash = await argon2.hash(password, { type: argon2.argon2id });
 
 		const { rows: existingRows } = await pool.query(
-		`SELECT id, email_verified_at FROM users WHERE email = $1 LIMIT 1`,
-		[normalized]
+			`SELECT id, email_verified_at FROM users WHERE email = $1 LIMIT 1`,
+			[normalized]
 		);
 
 		if (existingRows.length > 0) {
-		const existing = existingRows[0];
-		if (existing.email_verified_at) {
-			return res.status(409).json({ error: "account_exists" });
-		}
-		await pool.query(
-			`UPDATE email_verifications
+			const existing = existingRows[0];
+			if (existing.email_verified_at) {
+				return res.status(409).json({ error: "account_exists" });
+			}
+			await pool.query(
+				`UPDATE email_verifications
 				SET consumed_at = now()
 			WHERE user_id = $1
 				AND consumed_at IS NULL
 				AND expires_at > now()`,
-			[existing.id]
-		);
+				[existing.id]
+			);
 
-		const raw = crypto.randomBytes(32).toString("hex");
-		const token_hash = sha256(raw);
-		const expires_at = minutesFromNow(30);
+			const raw = crypto.randomBytes(32).toString("hex");
+			const token_hash = sha256(raw);
+			const expires_at = minutesFromNow(30);
 
-		await pool.query(
-			`INSERT INTO email_verifications (user_id, token_hash, expires_at)
+			await pool.query(
+				`INSERT INTO email_verifications (user_id, token_hash, expires_at)
 			VALUES ($1, $2, $3)`,
-			[existing.id, token_hash, expires_at]
-		);
+				[existing.id, token_hash, expires_at]
+			);
 
-		await sendVerifyEmail(normalized, raw);
-		return res.json({
-			message: "If an account exists, check your email for a verification link.",
-		});
+			await sendVerifyEmail(normalized, raw);
+			return res.json({
+				message: "If an account exists, check your email for a verification link.",
+			});
 		}
 
 		const { rows: newRows } = await pool.query(
-		`INSERT INTO users (email, password_hash)
+			`INSERT INTO users (email, password_hash)
 		VALUES ($1, $2)
 		RETURNING id, email`,
-		[normalized, password_hash]
+			[normalized, password_hash]
 		);
 		const user_id = newRows[0].id;
 
@@ -691,15 +667,15 @@ app.post("/auth/signup", async (req, res) => {
 		const expires_at = minutesFromNow(30);
 
 		await pool.query(
-		`INSERT INTO email_verifications (user_id, token_hash, expires_at)
+			`INSERT INTO email_verifications (user_id, token_hash, expires_at)
 		VALUES ($1, $2, $3)`,
-		[user_id, token_hash, expires_at]
+			[user_id, token_hash, expires_at]
 		);
 
 		await sendVerifyEmail(normalized, raw);
 
 		res.json({
-		message: "If an account exists, check your email for a verification link.",
+			message: "If an account exists, check your email for a verification link.",
 		});
 	} catch (err) {
 		console.error(err);
@@ -711,12 +687,12 @@ app.post("/auth/signup", async (req, res) => {
 app.post("/auth/accept-tos", requireAuth, async (req, res) => {
 	try {
 		await pool.query(
-		`UPDATE users
+			`UPDATE users
 			SET tos_accepted_at = now(),
 				tos_accepted_version = $2,
 				updated_at = now()
 			WHERE id = $1`,
-		[req.user.id, CURRENT_TOS_VERSION]
+			[req.user.id, CURRENT_TOS_VERSION]
 		);
 		res.json({ ok: true, version: CURRENT_TOS_VERSION });
 	} catch (e) {
@@ -728,14 +704,16 @@ app.post("/auth/accept-tos", requireAuth, async (req, res) => {
 // Verify email
 app.get("/auth/verify", async (req, res) => {
 	const token = String(req.query.token || "");
-	const email = String(req.query.email || "").trim().toLowerCase();
+	const email = String(req.query.email || "")
+		.trim()
+		.toLowerCase();
 	if (!token || !email) return res.status(400).json({ error: "missing_params" });
 
 	const token_hash = sha256(token);
 
 	try {
 		const { rows } = await pool.query(
-		`SELECT ev.id, ev.consumed_at,
+			`SELECT ev.id, ev.consumed_at,
 				u.id AS user_id, u.email_verified_at
 			FROM email_verifications ev
 			JOIN users u ON u.id = ev.user_id
@@ -744,32 +722,25 @@ app.get("/auth/verify", async (req, res) => {
 			AND ev.expires_at > now()
 			ORDER BY ev.created_at DESC
 			LIMIT 1`,
-		[email, token_hash]
+			[email, token_hash]
 		);
 
 		if (rows.length === 0) {
-		const { rows: urows } = await pool.query(
-			`SELECT email_verified_at FROM users WHERE email = $1 LIMIT 1`,
-			[email]
-		);
-		if (urows.length && urows[0].email_verified_at) {
-			return res.json({ ok: true });
-		}
-		return res.status(400).json({ ok: false, reason: "invalid_or_expired" });
+			const { rows: urows } = await pool.query(`SELECT email_verified_at FROM users WHERE email = $1 LIMIT 1`, [
+				email,
+			]);
+			if (urows.length && urows[0].email_verified_at) {
+				return res.json({ ok: true });
+			}
+			return res.status(400).json({ ok: false, reason: "invalid_or_expired" });
 		}
 
 		const { user_id, id: ev_id, consumed_at, email_verified_at } = rows[0];
 		if (email_verified_at) return res.json({ ok: true });
 
-		await pool.query(
-		"UPDATE users SET email_verified_at = now(), updated_at = now() WHERE id = $1",
-		[user_id]
-		);
+		await pool.query("UPDATE users SET email_verified_at = now(), updated_at = now() WHERE id = $1", [user_id]);
 		if (!consumed_at) {
-		await pool.query(
-			"UPDATE email_verifications SET consumed_at = now() WHERE id = $1",
-			[ev_id]
-		);
+			await pool.query("UPDATE email_verifications SET consumed_at = now() WHERE id = $1", [ev_id]);
 		}
 		res.json({ ok: true });
 	} catch (e) {
@@ -785,12 +756,12 @@ app.post("/auth/login", async (req, res) => {
 		const normalized = email.trim().toLowerCase();
 
 		const { rows } = await pool.query(
-		`SELECT id, email, password_hash, email_verified_at,
+			`SELECT id, email, password_hash, email_verified_at,
 				tos_accepted_at, tos_accepted_version
 			FROM users
 			WHERE email = $1
 			LIMIT 1`,
-		[normalized]
+			[normalized]
 		);
 
 		const invalid = () => res.status(401).json({ error: "invalid_credentials" });
@@ -798,7 +769,7 @@ app.post("/auth/login", async (req, res) => {
 
 		const user = rows[0];
 		if (!user.email_verified_at) {
-		return res.status(403).json({ error: "email_unverified" });
+			return res.status(403).json({ error: "email_unverified" });
 		}
 
 		const ok = await argon2.verify(user.password_hash, password);
@@ -807,18 +778,18 @@ app.post("/auth/login", async (req, res) => {
 		const token = signToken(user);
 
 		res.json({
-		token,
-		user: {
-			id: user.id,
-			email: user.email,
-			tosAcceptedAt: user.tos_accepted_at,
-			tosAcceptedVersion: user.tos_accepted_version,
-			currentTosVersion: CURRENT_TOS_VERSION,
-		},
+			token,
+			user: {
+				id: user.id,
+				email: user.email,
+				tosAcceptedAt: user.tos_accepted_at,
+				tosAcceptedVersion: user.tos_accepted_version,
+				currentTosVersion: CURRENT_TOS_VERSION,
+			},
 		});
 	} catch (err) {
 		if (err instanceof z.ZodError) {
-		return res.status(400).json({ error: "invalid_request" });
+			return res.status(400).json({ error: "invalid_request" });
 		}
 		console.error(err);
 		res.status(500).json({ error: "server_error" });
@@ -833,30 +804,30 @@ app.get("/auth/me", async (req, res) => {
 
 		let payload;
 		try {
-		payload = jwt.verify(raw, process.env.JWT_SECRET);
+			payload = jwt.verify(raw, process.env.JWT_SECRET);
 		} catch {
-		return res.status(401).json({ error: "invalid_token" });
+			return res.status(401).json({ error: "invalid_token" });
 		}
 
 		const { rows } = await pool.query(
-		`SELECT id, email, email_verified_at,
+			`SELECT id, email, email_verified_at,
 				tos_accepted_at, tos_accepted_version
 			FROM users
 			WHERE id = $1
 			LIMIT 1`,
-		[payload.uid]
+			[payload.uid]
 		);
 		if (rows.length === 0) return res.status(401).json({ error: "invalid_token" });
 
 		res.json({
-		ok: true,
-		user: {
-			id: rows[0].id,
-			email: rows[0].email,
-			tosAcceptedAt: rows[0].tos_accepted_at,
-			tosAcceptedVersion: rows[0].tos_accepted_version,
-			currentTosVersion: CURRENT_TOS_VERSION,
-		},
+			ok: true,
+			user: {
+				id: rows[0].id,
+				email: rows[0].email,
+				tosAcceptedAt: rows[0].tos_accepted_at,
+				tosAcceptedVersion: rows[0].tos_accepted_version,
+				currentTosVersion: CURRENT_TOS_VERSION,
+			},
 		});
 	} catch (e) {
 		console.error(e);
@@ -864,76 +835,70 @@ app.get("/auth/me", async (req, res) => {
 	}
 });
 
-
 // ---------- Settings (GET) ----------
 app.get("/api/settings", requireAuth, async (req, res) => {
-    const userId = req.user.id;
-    console.log("GET /api/settings for user", userId);
+	const userId = req.user.id;
+	console.log("GET /api/settings for user", userId);
 
-    const { rows } = await pool.query(
-        `SELECT save_chats, theme, show_timestamps, compact_mode
+	const { rows } = await pool.query(
+		`SELECT save_chats, theme, show_timestamps, compact_mode
          FROM user_settings
          WHERE user_id = $1`,
-        [userId]
-    );
+		[userId]
+	);
 
-    const row = rows[0] || {};
-    console.log("  DB row:", row);
+	const row = rows[0] || {};
+	console.log("  DB row:", row);
 
-    const saveChats = row.save_chats ?? true;
+	const saveChats = row.save_chats ?? true;
 
-    let theme = row.theme;
-    if (theme !== "light" && theme !== "dark") {
-        theme = "dark"; // kill "system" / garbage values on read
-    }
+	let theme = row.theme;
+	if (theme !== "light" && theme !== "dark") {
+		theme = "dark"; // kill "system" / garbage values on read
+	}
 
-    const showTimestamps =
-        row.show_timestamps === undefined || row.show_timestamps === null
-            ? true
-            : !!row.show_timestamps;
+	const showTimestamps =
+		row.show_timestamps === undefined || row.show_timestamps === null ? true : !!row.show_timestamps;
 
-    const compactMode =
-        row.compact_mode === undefined || row.compact_mode === null
-            ? false
-            : !!row.compact_mode;
+	const compactMode = row.compact_mode === undefined || row.compact_mode === null ? false : !!row.compact_mode;
 
-    const payload = {
-        saveChats,
-        theme,
-        showTimestamps,
-        compactMode,
-    };
+	const payload = {
+		saveChats,
+		theme,
+		showTimestamps,
+		compactMode,
+	};
 
-    console.log("  GET /api/settings response:", payload);
-    res.json(payload);
+	console.log("  GET /api/settings response:", payload);
+	res.json(payload);
 });
 
 // ---------- Settings (POST) ----------
 app.post("/api/settings", requireAuth, async (req, res) => {
-    const userId = req.user.id;
+	const userId = req.user.id;
 
-    console.log("POST /api/settings raw body:", req.body);
+	console.log("POST /api/settings raw body:", req.body);
 
-    let { saveChats, theme, showTimestamps, compactMode } = req.body || {};
+	let { saveChats, theme, showTimestamps, compactMode } = req.body || {};
 
-    if (typeof saveChats !== "boolean") saveChats = null;
+	if (typeof saveChats !== "boolean") saveChats = null;
 
-    if (theme !== "light" && theme !== "dark") {
-        theme = null; // don't overwrite with junk, keep existing
-    }
+	if (theme !== "light" && theme !== "dark") {
+		theme = null; // don't overwrite with junk, keep existing
+	}
 
-    if (typeof showTimestamps !== "boolean") showTimestamps = null;
-    if (typeof compactMode !== "boolean") compactMode = null;
+	if (typeof showTimestamps !== "boolean") showTimestamps = null;
+	if (typeof compactMode !== "boolean") compactMode = null;
 
-    console.log("POST /api/settings normalized:", {
-        saveChats,
-        theme,
-        showTimestamps,
-        compactMode,
-    });
+	console.log("POST /api/settings normalized:", {
+		saveChats,
+		theme,
+		showTimestamps,
+		compactMode,
+	});
 
-    await pool.query(
-        `
+	await pool.query(
+		`
         INSERT INTO user_settings (
             user_id,
             save_chats,
@@ -954,24 +919,23 @@ app.post("/api/settings", requireAuth, async (req, res) => {
             show_timestamps = COALESCE($4, user_settings.show_timestamps),
             compact_mode    = COALESCE($5, user_settings.compact_mode)
         `,
-        [userId, saveChats, theme, showTimestamps, compactMode]
-    );
+		[userId, saveChats, theme, showTimestamps, compactMode]
+	);
 
-    console.log("POST /api/settings completed for user", userId);
-    res.json({ ok: true });
+	console.log("POST /api/settings completed for user", userId);
+	res.json({ ok: true });
 });
 
 // GET layout -> { tabs: TabRecord[], activeId: string|null }
 app.get("/api/ui/layout", requireAuth, async (req, res) => {
 	try {
-		const { rows } = await pool.query(
-		`SELECT tabs, active_id FROM ui_layouts WHERE user_id = $1 LIMIT 1`,
-		[req.user.id]
-		);
+		const { rows } = await pool.query(`SELECT tabs, active_id FROM ui_layouts WHERE user_id = $1 LIMIT 1`, [
+			req.user.id,
+		]);
 		if (!rows[0]) return res.json({ tabs: [], activeId: null });
 		res.json({
-		tabs: Array.isArray(rows[0].tabs) ? rows[0].tabs : [],
-		activeId: rows[0].active_id,
+			tabs: Array.isArray(rows[0].tabs) ? rows[0].tabs : [],
+			activeId: rows[0].active_id,
 		});
 	} catch (e) {
 		console.error("GET /api/ui/layout", e);
@@ -986,14 +950,14 @@ app.post("/api/ui/layout", requireAuth, async (req, res) => {
 		const { tabs, activeId } = req.body ?? {};
 		if (!Array.isArray(tabs)) return res.status(400).json({ error: "tabs_must_be_array" });
 		await pool.query(
-		`INSERT INTO ui_layouts (user_id, tabs, active_id, updated_at)
+			`INSERT INTO ui_layouts (user_id, tabs, active_id, updated_at)
 		VALUES ($1, $2::jsonb, $3::uuid, now())
 		ON CONFLICT (user_id)
 		DO UPDATE SET
 			tabs      = EXCLUDED.tabs,
 			active_id = EXCLUDED.active_id,
 			updated_at = now()`,
-		[req.user.id, JSON.stringify(tabs), activeId || null]
+			[req.user.id, JSON.stringify(tabs), activeId || null]
 		);
 		res.json({ ok: true });
 	} catch (e) {
@@ -1004,12 +968,12 @@ app.post("/api/ui/layout", requireAuth, async (req, res) => {
 
 // -------------------- Start --------------------
 if (!process.env.DATABASE_URL) {
-  console.error("❌ DATABASE_URL is not set");
-  process.exit(1);
+	console.error("❌ DATABASE_URL is not set");
+	process.exit(1);
 }
 if (!process.env.JWT_SECRET) {
-  console.error("❌ JWT_SECRET is not set");
-  process.exit(1);
+	console.error("❌ JWT_SECRET is not set");
+	process.exit(1);
 }
 
 const port = process.env.PORT || 8081;

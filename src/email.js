@@ -8,7 +8,7 @@ const EMAIL_FROM = process.env.EMAIL_FROM;
 const APP_URL = process.env.APP_URL;
 
 if (!RESEND_API_KEY || !EMAIL_FROM || !APP_URL) {
-  throw new Error("Missing RESEND_API_KEY or EMAIL_FROM or APP_URL");
+	throw new Error("Missing RESEND_API_KEY or EMAIL_FROM or APP_URL");
 }
 
 const resend = new Resend(RESEND_API_KEY);
@@ -158,21 +158,21 @@ function buildVerifyEmail(verifyUrl, toEmail) {
 }
 
 export async function sendVerifyEmail(toEmail, token) {
-  const verifyUrl = `${process.env.APP_URL}/verify?token=${encodeURIComponent(
-    token
-  )}&email=${encodeURIComponent(toEmail)}`;
+	const verifyUrl = `${process.env.APP_URL}/verify?token=${encodeURIComponent(token)}&email=${encodeURIComponent(
+		toEmail
+	)}`;
 
-  const { subject, html, text } = buildVerifyEmail(verifyUrl, toEmail);
+	const { subject, html, text } = buildVerifyEmail(verifyUrl, toEmail);
 
-  await resend.emails.send({
-    from: process.env.EMAIL_FROM,     // e.g. "YSong <noreply@ysong.ai>"
-    to: toEmail,
-    subject,
-    html,
-    text,                              // always include plaintext
-	headers: {
-		"List-Unsubscribe": "<mailto:support@ysong.ai>",
-		"List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
-	},
-  });
+	await resend.emails.send({
+		from: process.env.EMAIL_FROM, // e.g. "YSong <noreply@ysong.ai>"
+		to: toEmail,
+		subject,
+		html,
+		text, // always include plaintext
+		headers: {
+			"List-Unsubscribe": "<mailto:support@ysong.ai>",
+			"List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+		},
+	});
 }

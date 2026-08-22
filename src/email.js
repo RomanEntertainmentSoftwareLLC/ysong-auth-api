@@ -3,15 +3,15 @@ import { Resend } from "resend";
 const BRAND = "ysong";
 const BRAND_URL = "https://www.ysong.ai";
 const SUPPORT_EMAIL = "support@ysong.ai";
+const LOCAL_MODE = process.env.LOCAL_MODE !== "0";
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const EMAIL_FROM = process.env.EMAIL_FROM;
-const APP_URL = process.env.APP_URL;
+const APP_URL = process.env.APP_URL || "http://127.0.0.1:5173";
 
-if (!RESEND_API_KEY || !EMAIL_FROM || !APP_URL) {
-	throw new Error("Missing RESEND_API_KEY or EMAIL_FROM or APP_URL");
+const resend = !LOCAL_MODE && RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
+if (!LOCAL_MODE && (!RESEND_API_KEY || !EMAIL_FROM || !APP_URL)) {
+	console.warn("Email verification is enabled but Resend is not fully configured.");
 }
-
-const resend = new Resend(RESEND_API_KEY);
 
 function buildVerifyEmail(verifyUrl, toEmail) {
 	const subject = `Verify your ${BRAND} account`;
@@ -158,14 +158,16 @@ function buildVerifyEmail(verifyUrl, toEmail) {
 }
 
 export async function sendVerifyEmail(toEmail, token) {
-	const verifyUrl = `${process.env.APP_URL}/verify?token=${encodeURIComponent(token)}&email=${encodeURIComponent(
+	if (LOCAL_MODE) return { skipped: true, local: true };
+	if (!resend || !EMAIL_FROM) throw new Error("Email service is not configured");
+	const verifyUrl = `${APP_URL}/verify?token=${encodeURIComponent(token)}&email=${encodeURIComponent(
 		toEmail
 	)}`;
 
 	const { subject, html, text } = buildVerifyEmail(verifyUrl, toEmail);
 
 	await resend.emails.send({
-		from: process.env.EMAIL_FROM, // e.g. "YSong <noreply@ysong.ai>"
+		from: EMAIL_FROM, // e.g. "YSong <noreply@ysong.ai>"
 		to: toEmail,
 		subject,
 		html,
@@ -175,4 +177,37 @@ export async function sendVerifyEmail(toEmail, token) {
 			"List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
 		},
 	});
+}
+
+export async function sendSocialNotificationEmail(toEmail, notification) {
+	if (LOCAL_MODE) return { skipped: true, local: true };
+	if (!resend || !EMAIL_FROM) throw new Error("Email service is not configured");
+	const title = String(notification?.title || "New YSong notification");
+	const body = String(notification?.body || "You have new activity on YSong.");
+	const href = String(notification?.href || "/app");
+	const destination = href.startsWith("http") ? href : `${APP_URL}${href.startsWith("/") ? href : `/${href}`}`;
+	const subject = `${title} • YSong`;
+	const text = `${title}\n\n${body}\n\nOpen YSong: ${destination}\n\nYSong • ${BRAND_URL}`;
+	const html = `<!doctype html><html><body style="margin:0;background:#09090b;color:#f4f4f5;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif"><table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr><td align="center" style="padding:32px 16px"><table role="presentation" width="560" style="max-width:560px;width:100%;background:#18181b;border:1px solid #27272a;border-radius:18px"><tr><td style="padding:28px"><img src="https://www.ysong.ai/ysong-logo-with-title-darkmode-no-transparency.png" width="123" height="44" alt="YSong" style="display:block;margin-bottom:22px"><div style="font-size:21px;font-weight:700;line-height:1.3">${escapeEmailHtml(title)}</div><div style="margin-top:10px;color:#a1a1aa;font-size:15px;line-height:1.6">${escapeEmailHtml(body)}</div><a href="${escapeEmailHtml(destination)}" style="display:inline-block;margin-top:22px;background:#4f46e5;color:#fff;text-decoration:none;padding:12px 18px;border-radius:10px;font-weight:650">Open YSong</a><div style="margin-top:26px;color:#71717a;font-size:12px">You can change social email notifications from the notification bell inside YSong.</div></td></tr></table></td></tr></table></body></html>`;
+	await resend.emails.send({
+		from: EMAIL_FROM,
+		to: toEmail,
+		subject,
+		html,
+		text,
+		headers: {
+			"List-Unsubscribe": "<mailto:support@ysong.ai>",
+			"List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+		},
+	});
+	return { ok: true };
+}
+
+function escapeEmailHtml(value) {
+	return String(value ?? "")
+		.replaceAll("&", "&amp;")
+		.replaceAll("<", "&lt;")
+		.replaceAll(">", "&gt;")
+		.replaceAll('"', "&quot;")
+		.replaceAll("'", "&#039;");
 }

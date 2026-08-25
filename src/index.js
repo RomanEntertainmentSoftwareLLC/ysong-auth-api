@@ -1816,14 +1816,116 @@ app.get("/api/world/media/:trackId/:kind", async (req, res) => {
 	}
 });
 
-// Optional AI bridge. LOCAL_MODE does not imply paid AI usage: provider defaults
-// to "none" so nothing can consume tokens until you explicitly configure it.
+
+// -------------------- MiniMax Music 3 local generation bridge --------------------
+// YSong keeps the browser isolated from the heavyweight model server. Today this
+// normally points at a local SGLang-Omni instance; later the exact same route can
+// point at a cloud GPU service without changing Create Song or DAW project data.
+function miniMaxMusicBase() {
+	return String(process.env.MINIMAX_MUSIC_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
+}
+
+function miniMaxMusicModel() {
+	return String(process.env.MINIMAX_MUSIC_MODEL || "minimax_ttm");
+}
+
+async function probeMiniMaxMusic(timeoutMs = 1400) {
+	const baseUrl = miniMaxMusicBase();
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		// SGLang exposes the OpenAI-compatible model list. A non-2xx HTTP reply still
+		// proves that the process is reachable; only network/timeout failures are offline.
+		const response = await fetch(`${baseUrl}/v1/models`, { signal: controller.signal });
+		return { reachable: true, httpStatus: response.status };
+	} catch (error) {
+		return { reachable: false, message: error?.name === "AbortError" ? "MiniMax Music server timed out." : String(error?.message || error) };
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+app.get("/api/music/status", async (_req, res) => {
+	const baseUrl = miniMaxMusicBase();
+	const model = miniMaxMusicModel();
+	const probe = await probeMiniMaxMusic();
+	return res.json({
+		configured: Boolean(baseUrl),
+		reachable: probe.reachable,
+		baseUrl,
+		model,
+		message: probe.reachable ? undefined : (probe.message || "MiniMax Music 3 is not running."),
+	});
+});
+
+const MusicGenerateSchema = z.object({
+	lyrics: z.string().max(120000).default("[Instrumental]"),
+	instructions: z.string().trim().min(1).max(80000),
+	seed: z.number().int().min(0).max(2147483647).optional(),
+	maxNewTokens: z.number().int().min(256).max(9000).optional(),
+});
+
+app.post("/api/music/generate", async (req, res) => {
+	try {
+		const body = MusicGenerateSchema.parse(req.body || {});
+		const baseUrl = miniMaxMusicBase();
+		const controller = new AbortController();
+		// Full songs are non-streaming and can take a while on local GPUs.
+		const timeoutMs = Math.max(60_000, Number(process.env.MINIMAX_MUSIC_TIMEOUT_MS || 20 * 60_000));
+		const timer = setTimeout(() => controller.abort(), timeoutMs);
+		let response;
+		try {
+			response = await fetch(`${baseUrl}/v1/audio/speech`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				signal: controller.signal,
+				body: JSON.stringify({
+					model: miniMaxMusicModel(),
+					input: body.lyrics || "[Instrumental]",
+					instructions: body.instructions,
+					response_format: "wav",
+					seed: body.seed ?? 7,
+					max_new_tokens: body.maxNewTokens ?? 9000,
+					stream: false,
+				}),
+			});
+		} finally {
+			clearTimeout(timer);
+		}
+
+		if (!response.ok) {
+			const detail = await response.text().catch(() => "");
+			return res.status(502).json({ error: "minimax_generation_failed", message: detail.slice(0, 1200) || `MiniMax returned HTTP ${response.status}` });
+		}
+		const audio = Buffer.from(await response.arrayBuffer());
+		if (!audio.length) return res.status(502).json({ error: "minimax_empty_audio" });
+		res.setHeader("Content-Type", response.headers.get("content-type") || "audio/wav");
+		res.setHeader("Content-Length", String(audio.length));
+		res.setHeader("Cache-Control", "no-store");
+		return res.status(200).send(audio);
+	} catch (error) {
+		if (error?.name === "ZodError") return res.status(400).json({ error: "invalid_music_request", message: error.message });
+		if (error?.name === "AbortError") return res.status(504).json({ error: "minimax_timeout", message: "MiniMax Music 3 generation timed out." });
+		console.error("POST /api/music/generate ERROR", error);
+		return res.status(502).json({ error: "minimax_unreachable", message: error?.message || "Could not reach MiniMax Music 3." });
+	}
+});
+
+// Optional AI bridge. A configured OPENAI_API_KEY is enough to enable the local
+// assistant; AI_PROVIDER can still explicitly disable/override it. Secrets remain
+// backend-only and are never returned to the browser.
+app.get("/api/ai/status", (_req, res) => {
+	const configured = Boolean(process.env.OPENAI_API_KEY);
+	const provider = String(process.env.AI_PROVIDER || (configured ? "openai" : "none")).toLowerCase();
+	return res.json({ configured: configured && provider === "openai", provider, model: process.env.OPENAI_MODEL || "gpt-5.6" });
+});
+
 app.post("/chat", async (req, res) => {
 	try {
-		const provider = String(process.env.AI_PROVIDER || "none").toLowerCase();
+		const provider = String(process.env.AI_PROVIDER || (process.env.OPENAI_API_KEY ? "openai" : "none")).toLowerCase();
 		if (provider !== "openai") {
 			return res.json({
-				reply: "YSong Local AI is not configured. Set AI_PROVIDER=openai, OPENAI_API_KEY, and OPENAI_MODEL in ysong-auth-api/.env to enable chat.",
+				reply: "YSong AI is not configured on this server yet.",
 				local: true,
 			});
 		}

@@ -10,6 +10,8 @@ import jwt from "jsonwebtoken";
 import multer from "multer";
 import fs from "fs";
 import path from "path";
+import os from "os";
+import { spawn } from "child_process";
 
 const app = express();
 
@@ -151,6 +153,10 @@ const SignupSchema = z.object({
 	password: z.string().min(8).max(200),
 	// Public identity is required for every new account. Email remains private/auth-only.
 	name: z.string().trim().min(1).max(80),
+	gender: z.enum(["female", "male", "nonbinary", "other", "prefer_not_to_say"]),
+	country: z.string().trim().min(2).max(80),
+	region: z.string().trim().max(120).optional().default(""),
+	city: z.string().trim().max(120).optional().default(""),
 });
 
 function requireAuth(req, res, next) {
@@ -506,6 +512,7 @@ function worldRow(row) {
 		id: String(row.id),
 		releaseId: String(row.release_id),
 		title: row.title,
+		artistId: row.artist_id ? String(row.artist_id) : "",
 		artistName: row.artist_name,
 		albumName: row.album_name,
 		releaseType: row.release_type,
@@ -713,7 +720,45 @@ async function initializeAchievementBaselines() {
 async function ensureWorldSchema() {
 	await pool.query(`
 		ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name text;
+		ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_object_key text;
+		ALTER TABLE users ADD COLUMN IF NOT EXISTS gender text;
+		ALTER TABLE users ADD COLUMN IF NOT EXISTS country text;
+		ALTER TABLE users ADD COLUMN IF NOT EXISTS region text;
+		ALTER TABLE users ADD COLUMN IF NOT EXISTS city text;
 		CREATE UNIQUE INDEX IF NOT EXISTS users_display_name_unique_idx ON users (lower(display_name)) WHERE display_name IS NOT NULL AND btrim(display_name) <> '';
+
+		CREATE TABLE IF NOT EXISTS artists (
+			id uuid PRIMARY KEY,
+			owner_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			artist_type text NOT NULL DEFAULT 'band' CHECK (artist_type IN ('solo','band')),
+			name text NOT NULL,
+			genre text NOT NULL DEFAULT '',
+			bio text NOT NULL DEFAULT '',
+			members text NOT NULL DEFAULT '',
+			symbol text NOT NULL DEFAULT '',
+			primary_color text NOT NULL DEFAULT '#171717',
+			accent_color text NOT NULL DEFAULT '#a78bfa',
+			avatar_object_key text,
+			created_at timestamptz NOT NULL DEFAULT now(),
+			updated_at timestamptz NOT NULL DEFAULT now(),
+			UNIQUE(owner_user_id, id)
+		);
+		CREATE UNIQUE INDEX IF NOT EXISTS artists_owner_name_unique_idx ON artists(owner_user_id, lower(name));
+		CREATE INDEX IF NOT EXISTS artists_owner_idx ON artists(owner_user_id, updated_at DESC);
+
+		CREATE TABLE IF NOT EXISTS singer_profiles (
+			id uuid PRIMARY KEY,
+			owner_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			name text NOT NULL,
+			description text NOT NULL DEFAULT '',
+			voice_type text NOT NULL DEFAULT '',
+			artist_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+			reference_audio_object_key text,
+			avatar_object_key text,
+			created_at timestamptz NOT NULL DEFAULT now(),
+			updated_at timestamptz NOT NULL DEFAULT now()
+		);
+		CREATE INDEX IF NOT EXISTS singer_profiles_owner_idx ON singer_profiles(owner_user_id, updated_at DESC);
 
 		-- Browser-local project/DAW state mirrored for authenticated device sync.
 		-- Keep this in the runtime schema guard so an older Neon/local database can
@@ -735,6 +780,8 @@ async function ensureWorldSchema() {
 			created_at timestamptz NOT NULL DEFAULT now(),
 			published_at timestamptz NOT NULL DEFAULT now()
 		);
+		ALTER TABLE world_releases ADD COLUMN IF NOT EXISTS artist_id uuid REFERENCES artists(id) ON DELETE RESTRICT;
+		CREATE INDEX IF NOT EXISTS world_releases_artist_idx ON world_releases(artist_id);
 		CREATE INDEX IF NOT EXISTS world_releases_owner_idx ON world_releases(owner_user_id);
 		CREATE INDEX IF NOT EXISTS world_releases_published_idx ON world_releases(published_at DESC);
 
@@ -755,6 +802,8 @@ async function ensureWorldSchema() {
 			created_at timestamptz NOT NULL DEFAULT now(),
 			published_at timestamptz NOT NULL DEFAULT now()
 		);
+		ALTER TABLE world_tracks ADD COLUMN IF NOT EXISTS artist_id uuid REFERENCES artists(id) ON DELETE RESTRICT;
+		CREATE INDEX IF NOT EXISTS world_tracks_artist_idx ON world_tracks(artist_id);
 		CREATE INDEX IF NOT EXISTS world_tracks_release_idx ON world_tracks(release_id, track_number);
 		CREATE INDEX IF NOT EXISTS world_tracks_published_idx ON world_tracks(status, published_at DESC);
 		CREATE INDEX IF NOT EXISTS world_tracks_genre_idx ON world_tracks(genre);
@@ -856,6 +905,26 @@ async function ensureWorldSchema() {
 			PRIMARY KEY (comment_id, user_id)
 		);
 
+		CREATE TABLE IF NOT EXISTS world_play_events (
+			id uuid PRIMARY KEY,
+			track_id uuid NOT NULL REFERENCES world_tracks(id) ON DELETE CASCADE,
+			owner_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			listener_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+			listener_key text,
+			gender text,
+			country text,
+			region text,
+			city text,
+			source text NOT NULL DEFAULT 'ysong_world',
+			listen_seconds double precision,
+			completed boolean NOT NULL DEFAULT false,
+			synthetic boolean NOT NULL DEFAULT false,
+			occurred_at timestamptz NOT NULL DEFAULT now()
+		);
+		CREATE INDEX IF NOT EXISTS world_play_events_owner_time_idx ON world_play_events(owner_user_id, occurred_at DESC);
+		CREATE INDEX IF NOT EXISTS world_play_events_track_time_idx ON world_play_events(track_id, occurred_at DESC);
+		CREATE INDEX IF NOT EXISTS world_play_events_synthetic_idx ON world_play_events(owner_user_id, synthetic);
+
 		CREATE TABLE IF NOT EXISTS ysong_notifications (
 			id uuid PRIMARY KEY,
 			user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -896,7 +965,10 @@ app.post("/api/world/publish", requireAuth, async (req, res) => {
 	try {
 		const body = req.body ?? {};
 		const title = String(body.title || "").trim().slice(0, 180);
-		const artistName = String(body.artistName || "").trim().slice(0, 180);
+		const artistId = String(body.artistId || "");
+		const artistResult = await pool.query(`SELECT id, name FROM artists WHERE id=$1 AND owner_user_id=$2 LIMIT 1`, [artistId, req.user.id]);
+		if (!artistResult.rows[0]) return res.status(400).json({ error: "artist_required" });
+		const artistName = String(artistResult.rows[0].name || "").trim().slice(0, 180);
 		const releaseType = body.releaseType === "album" ? "album" : "single";
 		const albumTitle = String(body.albumTitle || title).trim().slice(0, 180);
 		const genre = String(body.genre || "Other").trim().slice(0, 80) || "Other";
@@ -912,7 +984,6 @@ app.post("/api/world/publish", requireAuth, async (req, res) => {
 		const rightsConfirmed = body.rightsConfirmed === true;
 
 		if (!title) return res.status(400).json({ error: "title_required" });
-		if (!artistName) return res.status(400).json({ error: "artist_required" });
 		if (releaseType === "album" && !albumTitle) return res.status(400).json({ error: "album_required" });
 		if (!rightsConfirmed) return res.status(400).json({ error: "rights_confirmation_required" });
 		if (previouslyReleased && !isrc) return res.status(400).json({ error: "isrc_required_for_released_track" });
@@ -943,9 +1014,9 @@ app.post("/api/world/publish", requireAuth, async (req, res) => {
 			const existing = await pool.query(
 				`SELECT id, artwork_object_key FROM world_releases
 				 WHERE owner_user_id = $1 AND release_type = 'album'
-				   AND lower(artist_name) = lower($2) AND lower(title) = lower($3)
+				   AND artist_id = $2 AND lower(title) = lower($3)
 				 ORDER BY created_at ASC LIMIT 1`,
-				[req.user.id, artistName, albumTitle]
+				[req.user.id, artistId, albumTitle]
 			);
 			if (existing.rows[0]) {
 				releaseId = existing.rows[0].id;
@@ -958,18 +1029,18 @@ app.post("/api/world/publish", requireAuth, async (req, res) => {
 		if (!releaseId) {
 			releaseId = crypto.randomUUID();
 			await pool.query(
-				`INSERT INTO world_releases (id, owner_user_id, artist_name, title, release_type, genre, artwork_object_key)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-				[releaseId, req.user.id, artistName, releaseType === "album" ? albumTitle : title, releaseType, genre, artworkObjectKey]
+				`INSERT INTO world_releases (id, owner_user_id, artist_id, artist_name, title, release_type, genre, artwork_object_key)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+				[releaseId, req.user.id, artistId, artistName, releaseType === "album" ? albumTitle : title, releaseType, genre, artworkObjectKey]
 			);
 		}
 
 		const trackId = crypto.randomUUID();
 		await pool.query(
 			`INSERT INTO world_tracks
-			 (id, release_id, owner_user_id, title, track_number, audio_object_key, genre, tags, description, explicit, duration_seconds, isrc, previously_released, status)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13, 'published')`,
-			[trackId, releaseId, req.user.id, title, trackNumber, audioObjectKey, genre, JSON.stringify(tags), description, explicit, durationSeconds, isrc || null, previouslyReleased]
+			 (id, release_id, owner_user_id, artist_id, title, track_number, audio_object_key, genre, tags, description, explicit, duration_seconds, isrc, previously_released, status)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, 'published')`,
+			[trackId, releaseId, req.user.id, artistId, title, trackNumber, audioObjectKey, genre, JSON.stringify(tags), description, explicit, durationSeconds, isrc || null, previouslyReleased]
 		);
 
 		const { rows } = await pool.query(
@@ -1057,7 +1128,7 @@ app.get("/api/world/releases/:id", async (req, res) => {
 		const user = verifyTokenString(authFromHeader(req));
 		const releaseId = String(req.params.id || "");
 		const releaseResult = await pool.query(
-			`SELECT id, owner_user_id, artist_name, title, release_type, genre, published_at, (artwork_object_key IS NOT NULL) AS has_artwork,
+			`SELECT id, owner_user_id, artist_id, artist_name, title, release_type, genre, published_at, (artwork_object_key IS NOT NULL) AS has_artwork,
 			        COALESCE(owner_user_id = $2::uuid, false) AS is_owner,
 			        EXISTS(SELECT 1 FROM world_saved_releases s WHERE s.release_id = world_releases.id AND s.user_id = $2::uuid) AS is_saved,
 			        EXISTS(SELECT 1 FROM world_followed_artists f WHERE f.user_id = $2::uuid AND f.artist_owner_user_id = world_releases.owner_user_id AND f.artist_name = world_releases.artist_name) AS is_artist_followed
@@ -1083,7 +1154,7 @@ app.get("/api/world/releases/:id", async (req, res) => {
 		);
 		const r = releaseResult.rows[0];
 		return res.json({
-			id: String(r.id), ownerUserId: String(r.owner_user_id || ""), artistName: r.artist_name, title: r.title, releaseType: r.release_type,
+			id: String(r.id), ownerUserId: String(r.owner_user_id || ""), artistId: r.artist_id ? String(r.artist_id) : "", artistName: r.artist_name, title: r.title, releaseType: r.release_type,
 			genre: r.genre || "Other", publishedAt: r.published_at, hasArtwork: !!r.has_artwork, isOwner: !!r.is_owner,
 			isSaved: !!r.is_saved, isArtistFollowed: !!r.is_artist_followed, tracks: tracksResult.rows.map(worldRow),
 		});
@@ -1157,10 +1228,10 @@ app.patch("/api/world/releases/:id", requireAuth, async (req, res) => {
 		if (!existing.rows[0]) return res.status(404).json({ error: "release_not_found_or_not_owner" });
 		const current = existing.rows[0];
 		const body = req.body ?? {};
-		const artistName = body.artistName === undefined ? current.artist_name : String(body.artistName || "").trim().slice(0, 180);
+		const linkedArtist = current.artist_id ? await pool.query(`SELECT name FROM artists WHERE id=$1 AND owner_user_id=$2 LIMIT 1`, [current.artist_id, req.user.id]) : null;
+		const artistName = String(linkedArtist?.rows?.[0]?.name || current.artist_name || "").trim();
 		const title = body.title === undefined ? current.title : String(body.title || "").trim().slice(0, 180);
 		const genre = body.genre === undefined ? current.genre : (String(body.genre || "Other").trim().slice(0, 80) || "Other");
-		if (!artistName) return res.status(400).json({ error: "artist_required" });
 		if (!title) return res.status(400).json({ error: "title_required" });
 		await pool.query(`UPDATE world_releases SET artist_name = $3, title = $4, genre = $5 WHERE id = $1 AND owner_user_id = $2`, [releaseId, req.user.id, artistName, title, genre]);
 		if (current.release_type === "single") {
@@ -1170,6 +1241,43 @@ app.patch("/api/world/releases/:id", requireAuth, async (req, res) => {
 	} catch (e) {
 		console.error("PATCH /api/world/releases/:id ERROR", e);
 		return res.status(500).json({ error: "release_update_failed" });
+	}
+});
+
+// Remove an owner's track from YSong World. The uploaded source object is kept in
+// the user's storage; this removes the World catalog/social record only.
+app.delete("/api/world/tracks/:id", requireAuth, async (req, res) => {
+	const client = await pool.connect();
+	try {
+		const trackId = String(req.params.id || "");
+		await client.query("BEGIN");
+		const found = await client.query(`SELECT id, release_id FROM world_tracks WHERE id=$1 AND owner_user_id=$2 FOR UPDATE`, [trackId, req.user.id]);
+		if (!found.rows[0]) { await client.query("ROLLBACK"); return res.status(404).json({ error:"track_not_found_or_not_owner" }); }
+		const releaseId = String(found.rows[0].release_id);
+		await client.query(`DELETE FROM world_tracks WHERE id=$1 AND owner_user_id=$2`, [trackId, req.user.id]);
+		const remaining = await client.query(`SELECT count(*)::int AS count FROM world_tracks WHERE release_id=$1`, [releaseId]);
+		const releaseDeleted = Number(remaining.rows[0]?.count || 0) === 0;
+		if (releaseDeleted) await client.query(`DELETE FROM world_releases WHERE id=$1 AND owner_user_id=$2`, [releaseId, req.user.id]);
+		await client.query("COMMIT");
+		return res.json({ ok:true, releaseDeleted, releaseId });
+	} catch (e) {
+		try { await client.query("ROLLBACK"); } catch {}
+		console.error("DELETE /api/world/tracks/:id ERROR", e);
+		return res.status(500).json({ error:"track_remove_failed" });
+	} finally { client.release(); }
+});
+
+// Remove a complete owner release and all of its World tracks/social records.
+// Artist/band identity is intentionally preserved.
+app.delete("/api/world/releases/:id", requireAuth, async (req, res) => {
+	try {
+		const releaseId = String(req.params.id || "");
+		const deleted = await pool.query(`DELETE FROM world_releases WHERE id=$1 AND owner_user_id=$2 RETURNING id`, [releaseId, req.user.id]);
+		if (!deleted.rows[0]) return res.status(404).json({ error:"release_not_found_or_not_owner" });
+		return res.json({ ok:true, deleted:true });
+	} catch (e) {
+		console.error("DELETE /api/world/releases/:id ERROR", e);
+		return res.status(500).json({ error:"release_remove_failed" });
 	}
 });
 
@@ -1223,19 +1331,43 @@ app.post("/api/world/tracks/:id/reaction", requireAuth, async (req, res) => {
 
 app.post("/api/world/tracks/:id/play", async (req, res) => {
 	try {
-		const { rows } = await pool.query(
-			`UPDATE world_tracks SET play_count = play_count + 1 WHERE id = $1 AND status = 'published' RETURNING play_count, owner_user_id`,
-			[String(req.params.id || "")]
-		);
+		const { rows } = await pool.query(`UPDATE world_tracks SET play_count = play_count + 1 WHERE id = $1 AND status = 'published' RETURNING play_count, owner_user_id`, [String(req.params.id || "")]);
 		if (!rows[0]) return res.status(404).json({ error: "track_not_found" });
+		const authUser = verifyTokenString(authFromHeader(req));
+		let profile = null;
+		if (authUser?.id) { const q=await pool.query(`SELECT gender,country,region,city FROM users WHERE id=$1`,[authUser.id]); profile=q.rows[0]||null; }
+		await pool.query(`INSERT INTO world_play_events (id,track_id,owner_user_id,listener_user_id,listener_key,gender,country,region,city,source,listen_seconds,completed,synthetic) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,false)`,[crypto.randomUUID(),String(req.params.id||""),rows[0].owner_user_id,authUser?.id||null,authUser?.id?`u:${authUser.id}`:null,profile?.gender||null,profile?.country||null,profile?.region||null,profile?.city||null,String(req.body?.source||"ysong_world").slice(0,80),Number.isFinite(Number(req.body?.listenSeconds))?Number(req.body.listenSeconds):null,req.body?.completed===true]);
 		syncAchievementsForUser(rows[0].owner_user_id).catch(() => {});
 		return res.json({ ok: true, playCount: Number(rows[0].play_count || 0) });
-	} catch (e) {
-		console.error("POST /api/world/tracks/:id/play ERROR", e);
-		return res.status(500).json({ error: "play_count_failed" });
-	}
+	} catch (e) { console.error("POST /api/world/tracks/:id/play ERROR", e); return res.status(500).json({ error: "play_count_failed" }); }
 });
 
+
+// -------------------- Creator analytics --------------------
+app.get("/api/analytics/creator", requireAuth, async (req,res)=>{
+	try {
+		const days=Math.max(7,Math.min(365,Number(req.query.days||30)||30));
+		const daily=await pool.query(`SELECT to_char(series.day::date,'YYYY-MM-DD') AS day, COALESCE(count(e.id),0)::int AS plays, COALESCE(count(DISTINCT e.listener_key),0)::int AS listeners FROM generate_series(current_date-($2::int-1),current_date,'1 day') AS series(day) LEFT JOIN world_play_events e ON e.owner_user_id=$1 AND e.occurred_at>=series.day AND e.occurred_at<series.day+interval '1 day' GROUP BY series.day ORDER BY series.day`,[req.user.id,days]);
+		const totals=await pool.query(`SELECT count(*)::int plays,count(DISTINCT listener_key)::int listeners,count(*) FILTER (WHERE synthetic)::int synthetic_plays FROM world_play_events WHERE owner_user_id=$1 AND occurred_at>=now()-($2::text||' days')::interval`,[req.user.id,String(days)]);
+		const countries=await pool.query(`SELECT COALESCE(NULLIF(country,''),'Unknown') name,count(*)::int value FROM world_play_events WHERE owner_user_id=$1 AND occurred_at>=now()-($2::text||' days')::interval GROUP BY 1 ORDER BY value DESC LIMIT 8`,[req.user.id,String(days)]);
+		const genders=await pool.query(`SELECT COALESCE(NULLIF(gender,''),'Unknown') name,count(*)::int value FROM world_play_events WHERE owner_user_id=$1 AND occurred_at>=now()-($2::text||' days')::interval GROUP BY 1 ORDER BY value DESC`,[req.user.id,String(days)]);
+		return res.json({days,daily:daily.rows.map(r=>({day:r.day,plays:Number(r.plays),listeners:Number(r.listeners)})),totals:totals.rows[0]||{plays:0,listeners:0,synthetic_plays:0},countries:countries.rows,genders:genders.rows});
+	}catch(e){console.error("GET /api/analytics/creator ERROR",e);return res.status(500).json({error:"analytics_failed"});}
+});
+
+app.post("/api/analytics/dev/seed", requireAuth, async (req,res)=>{
+	try {
+		if(!LOCAL_MODE && process.env.ALLOW_SYNTHETIC_ANALYTICS!=="1") return res.status(403).json({error:"dev_analytics_disabled"});
+		const days=Math.max(7,Math.min(90,Number(req.body?.days||30)||30)); const total=Math.max(1,Math.min(50000,Number(req.body?.total||1000)||1000)); const preset=["steady","viral","release","slowburn"].includes(String(req.body?.preset))?String(req.body.preset):"steady";
+		const tracks=await pool.query(`SELECT id FROM world_tracks WHERE owner_user_id=$1 AND status='published'`,[req.user.id]); if(!tracks.rows.length)return res.status(400).json({error:"publish_track_first"});
+		const countries=["United States","Argentina","United Kingdom","Canada","Germany","Brazil","Mexico","Japan"]; const genders=["female","male","nonbinary","other","prefer_not_to_say"];
+		const vals=[];
+		for(let i=0;i<total;i++){ const x=Math.random(); let age; if(preset==="viral") age=Math.pow(x,3)*days; else if(preset==="release") age=Math.pow(x,2)*days; else if(preset==="slowburn") age=(1-Math.pow(x,2))*days; else age=x*days; const track=tracks.rows[i%tracks.rows.length].id; vals.push([crypto.randomUUID(),track,req.user.id,`synthetic:${Math.floor(i/1.7)}`,genders[i%genders.length],countries[i%countries.length],new Date(Date.now()-age*86400000)]); }
+		for(let i=0;i<vals.length;i+=500){const batch=vals.slice(i,i+500);const ph=[];const args=[];batch.forEach((v,j)=>{const b=j*7;ph.push(`($${b+1},$${b+2},$${b+3},$${b+4},$${b+5},$${b+6},'synthetic',true,$${b+7})`);args.push(...v)});await pool.query(`INSERT INTO world_play_events (id,track_id,owner_user_id,listener_key,gender,country,source,synthetic,occurred_at) VALUES ${ph.join(',')}`,args);}
+		return res.json({ok:true,created:total});
+	}catch(e){console.error("POST /api/analytics/dev/seed ERROR",e);return res.status(500).json({error:"analytics_seed_failed"});}
+});
+app.post("/api/analytics/dev/reset", requireAuth, async (req,res)=>{try{if(!LOCAL_MODE&&process.env.ALLOW_SYNTHETIC_ANALYTICS!=="1")return res.status(403).json({error:"dev_analytics_disabled"});const r=await pool.query(`DELETE FROM world_play_events WHERE owner_user_id=$1 AND synthetic=true`,[req.user.id]);return res.json({ok:true,deleted:r.rowCount||0});}catch(e){return res.status(500).json({error:"analytics_reset_failed"});}});
 
 // -------------------- YSong World social / library / playlists --------------------
 app.post("/api/world/tracks/:id/save", requireAuth, async (req, res) => {
@@ -1691,7 +1823,7 @@ app.get("/api/library", requireAuth, async (req, res) => {
 		const uploads = await pool.query(`SELECT t.*, r.artist_name, r.title AS album_name, r.release_type, (r.artwork_object_key IS NOT NULL) AS has_artwork, true AS is_owner, (SELECT count(*) FROM world_track_reactions x WHERE x.track_id=t.id AND x.reaction=1) AS likes, (SELECT count(*) FROM world_track_reactions x WHERE x.track_id=t.id AND x.reaction=-1) AS dislikes, COALESCE((SELECT x.reaction FROM world_track_reactions x WHERE x.track_id=t.id AND x.user_id=$1),0) AS my_reaction, EXISTS(SELECT 1 FROM world_saved_tracks s WHERE s.track_id=t.id AND s.user_id=$1) AS is_saved, EXISTS(SELECT 1 FROM world_saved_releases s WHERE s.release_id=t.release_id AND s.user_id=$1) AS is_release_saved, EXISTS(SELECT 1 FROM world_followed_artists f WHERE f.user_id=$1 AND f.artist_owner_user_id=t.owner_user_id AND f.artist_name=r.artist_name) AS is_artist_followed, (SELECT count(*) FROM world_track_comments c WHERE c.track_id=t.id AND c.is_deleted=false) AS comment_count FROM world_tracks t JOIN world_releases r ON r.id=t.release_id WHERE t.owner_user_id=$1 AND t.status='published' ORDER BY t.published_at DESC`, [uid]);
 		return res.json({
 			tracks: savedTracks.rows.map(worldRow),
-			releases: releases.rows.map((r) => ({ id:String(r.id), ownerUserId:String(r.owner_user_id), artistName:r.artist_name, title:r.title, releaseType:r.release_type, genre:r.genre||"Other", publishedAt:r.published_at, hasArtwork:!!r.has_artwork, coverTrackId:r.cover_track_id?String(r.cover_track_id):null, trackCount:Number(r.track_count||0), isSaved:true })),
+			releases: releases.rows.map((r) => ({ id:String(r.id), ownerUserId:String(r.owner_user_id), artistId:r.artist_id?String(r.artist_id):"", artistName:r.artist_name, title:r.title, releaseType:r.release_type, genre:r.genre||"Other", publishedAt:r.published_at, hasArtwork:!!r.has_artwork, coverTrackId:r.cover_track_id?String(r.cover_track_id):null, trackCount:Number(r.track_count||0), isSaved:true })),
 			artists: artists.rows.map((r) => ({ ownerUserId:String(r.artist_owner_user_id), artistName:r.artist_name, followedAt:r.created_at })),
 			playlists: ownPlaylists.rows.map(playlistRow), savedPlaylists: savedPlaylists.rows.map(playlistRow), uploads: uploads.rows.map(worldRow),
 		});
@@ -1817,25 +1949,85 @@ app.get("/api/world/media/:trackId/:kind", async (req, res) => {
 });
 
 
-// -------------------- MiniMax Music 3 local generation bridge --------------------
-// YSong keeps the browser isolated from the heavyweight model server. Today this
-// normally points at a local SGLang-Omni instance; later the exact same route can
-// point at a cloud GPU service without changing Create Song or DAW project data.
+// -------------------- MiniMax Music 3 generation provider --------------------
+// MiniMax is a replaceable generation provider, not YSong's permanent model identity.
+// Local Windows development prefers the proven audio.cpp GGUF runtime when present;
+// otherwise this bridge keeps supporting the older HTTP/OpenAI-compatible service.
 function miniMaxMusicBase() {
 	return String(process.env.MINIMAX_MUSIC_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
 }
 
 function miniMaxMusicModel() {
-	return String(process.env.MINIMAX_MUSIC_MODEL || "minimax_ttm");
+	return String(process.env.MINIMAX_MUSIC_MODEL || "minimax_music3");
 }
 
-async function probeMiniMaxMusic(timeoutMs = 1400) {
+function defaultAudioCppPaths() {
+	const root = String(process.env.MINIMAX_AUDIOCPP_ROOT || (process.platform === "win32" ? "C:\\YSong" : ""));
+	const cudaExe = root ? path.join(root, "audio.cpp-main", "build", "windows-cuda-release", "bin", "audiocpp_cli.exe") : "";
+	const cpuExe = root ? path.join(root, "audio.cpp-main", "build", "windows-cpu-release", "bin", "audiocpp_cli.exe") : "";
+	const explicitExe = String(process.env.MINIMAX_AUDIOCPP_EXE || "").trim();
+	const exe = explicitExe || (cudaExe && fs.existsSync(cudaExe) ? cudaExe : cpuExe);
+	const modelDir = String(process.env.MINIMAX_AUDIOCPP_MODEL_DIR || (root ? path.join(root, "MiniMax-Music3-GGUF") : "")).trim();
+	const inferredBackend = exe && /windows-cuda-release/i.test(exe) ? "cuda" : "cpu";
+	return {
+		exe,
+		modelDir,
+		backend: String(process.env.MINIMAX_AUDIOCPP_BACKEND || inferredBackend || "cpu").toLowerCase(),
+		device: Math.max(0, Number(process.env.MINIMAX_AUDIOCPP_DEVICE || 0) || 0),
+		threads: Math.max(1, Math.min(64, Number(process.env.MINIMAX_AUDIOCPP_THREADS || 4) || 4)),
+	};
+}
+
+function miniMaxProvider() {
+	const requested = String(process.env.MINIMAX_MUSIC_PROVIDER || "auto").trim().toLowerCase();
+	if (requested === "http" || requested === "server") return "http";
+	if (requested === "audio_cpp" || requested === "audiocpp") return "audio_cpp";
+	const local = defaultAudioCppPaths();
+	return local.exe && local.modelDir && fs.existsSync(local.exe) && fs.existsSync(local.modelDir) ? "audio_cpp" : "http";
+}
+
+function runCapturedProcess(exe, args, { timeoutMs = 10_000 } = {}) {
+	return new Promise((resolve, reject) => {
+		let stdout = "";
+		let stderr = "";
+		let timedOut = false;
+		const child = spawn(exe, args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+		const timer = setTimeout(() => {
+			timedOut = true;
+			try { child.kill(); } catch {}
+		}, timeoutMs);
+		child.stdout.on("data", (chunk) => { stdout += String(chunk); if (stdout.length > 2_000_000) stdout = stdout.slice(-2_000_000); });
+		child.stderr.on("data", (chunk) => { stderr += String(chunk); if (stderr.length > 2_000_000) stderr = stderr.slice(-2_000_000); });
+		child.on("error", (error) => { clearTimeout(timer); reject(error); });
+		child.on("close", (code) => {
+			clearTimeout(timer);
+			if (timedOut) return reject(Object.assign(new Error("process_timeout"), { code: "PROCESS_TIMEOUT", stdout, stderr }));
+			resolve({ code: Number(code ?? -1), stdout, stderr });
+		});
+	});
+}
+
+async function probeAudioCpp(timeoutMs = 8000) {
+	const local = defaultAudioCppPaths();
+	if (!local.exe || !fs.existsSync(local.exe)) return { reachable: false, message: `audio.cpp executable not found: ${local.exe || "not configured"}` };
+	if (!local.modelDir || !fs.existsSync(local.modelDir)) return { reachable: false, message: `MiniMax GGUF model directory not found: ${local.modelDir || "not configured"}` };
+	try {
+		const result = await runCapturedProcess(local.exe, ["--list-loaders", "--json"], { timeoutMs });
+		if (result.code !== 0) return { reachable: false, message: (result.stderr || result.stdout || `audio.cpp exited ${result.code}`).trim().slice(0, 1200) };
+		let parsed;
+		try { parsed = JSON.parse(result.stdout.trim()); } catch {}
+		const hasLoader = Boolean(parsed?.loaders?.minimax_music3) || /minimax_music3/i.test(result.stdout);
+		return hasLoader ? { reachable: true, httpStatus: 200, local } : { reachable: false, message: "This audio.cpp build does not include the MiniMax Music 3 loader." };
+	} catch (error) {
+		return { reachable: false, message: String(error?.message || error) };
+	}
+}
+
+async function probeMiniMaxHttp(timeoutMs = 1400) {
 	const baseUrl = miniMaxMusicBase();
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), timeoutMs);
 	try {
-		// SGLang exposes the OpenAI-compatible model list. A non-2xx HTTP reply still
-		// proves that the process is reachable; only network/timeout failures are offline.
 		const response = await fetch(`${baseUrl}/v1/models`, { signal: controller.signal });
 		return { reachable: true, httpStatus: response.status };
 	} catch (error) {
@@ -1845,15 +2037,33 @@ async function probeMiniMaxMusic(timeoutMs = 1400) {
 	}
 }
 
+let localMusicGenerationBusy = false;
+
 app.get("/api/music/status", async (_req, res) => {
+	const provider = miniMaxProvider();
+	if (provider === "audio_cpp") {
+		const local = defaultAudioCppPaths();
+		const probe = await probeAudioCpp();
+		return res.json({
+			configured: Boolean(local.exe && local.modelDir),
+			reachable: probe.reachable,
+			provider,
+			baseUrl: "audio.cpp://local",
+			model: "minimax_music3",
+			backend: local.backend,
+			busy: localMusicGenerationBusy,
+			message: probe.reachable ? undefined : (probe.message || "Local audio.cpp MiniMax Music 3 runtime is not ready."),
+		});
+	}
 	const baseUrl = miniMaxMusicBase();
-	const model = miniMaxMusicModel();
-	const probe = await probeMiniMaxMusic();
+	const probe = await probeMiniMaxHttp();
 	return res.json({
 		configured: Boolean(baseUrl),
 		reachable: probe.reachable,
+		provider,
 		baseUrl,
-		model,
+		model: miniMaxMusicModel(),
+		busy: false,
 		message: probe.reachable ? undefined : (probe.message || "MiniMax Music 3 is not running."),
 	});
 });
@@ -1863,51 +2073,128 @@ const MusicGenerateSchema = z.object({
 	instructions: z.string().trim().min(1).max(80000),
 	seed: z.number().int().min(0).max(2147483647).optional(),
 	maxNewTokens: z.number().int().min(256).max(9000).optional(),
+	durationSeconds: z.number().min(2).max(600).optional(),
+	quality: z.enum(["draft", "standard", "final"]).optional(),
 });
+
+function audioCppSteps(body) {
+	const configured = Number(process.env.MINIMAX_AUDIOCPP_STEPS || 0);
+	if (Number.isFinite(configured) && configured > 0) return Math.max(1, Math.min(60, Math.round(configured)));
+	if (body.quality === "final") return 30;
+	if (body.quality === "draft") return 6;
+	return 10;
+}
+
+async function generateWithAudioCpp(body) {
+	if (localMusicGenerationBusy) {
+		const error = new Error("Local MiniMax Music 3 is already generating another track.");
+		error.code = "MINIMAX_BUSY";
+		throw error;
+	}
+	const local = defaultAudioCppPaths();
+	if (!local.exe || !fs.existsSync(local.exe)) throw new Error(`audio.cpp executable not found: ${local.exe || "not configured"}`);
+	if (!local.modelDir || !fs.existsSync(local.modelDir)) throw new Error(`MiniMax model directory not found: ${local.modelDir || "not configured"}`);
+
+	const outPath = path.join(os.tmpdir(), `ysong-minimax-${crypto.randomUUID()}.wav`);
+	const duration = Math.max(2, Math.min(600, Number(body.durationSeconds || process.env.MINIMAX_AUDIOCPP_DURATION_SECONDS || 20) || 20));
+	const steps = audioCppSteps(body);
+	const guidance = Math.max(0.01, Number(process.env.MINIMAX_AUDIOCPP_GUIDANCE || 1.7) || 1.7);
+	const arGuidance = Math.max(0.01, Number(process.env.MINIMAX_AUDIOCPP_AR_GUIDANCE || 1.5) || 1.5);
+	const args = [
+		"--task", "gen",
+		"--family", "minimax_music3",
+		"--model", local.modelDir,
+		"--backend", local.backend,
+		...(local.backend === "cuda" ? ["--device", String(local.device)] : []),
+		"--threads", String(local.threads),
+		"--text", body.instructions,
+		"--request-option", `lyrics=${body.lyrics || "[Instrumental]"}`,
+		"--request-option", `duration_sec=${duration}`,
+		"--request-option", `num_inference_steps=${steps}`,
+		"--request-option", `guidance_scale=${guidance}`,
+		"--request-option", `ar_guidance_scale=${arGuidance}`,
+		"--request-option", `seed=${body.seed ?? 7}`,
+		"--session-option", `minimax_music3.language_model_gguf=${process.env.MINIMAX_AUDIOCPP_LANGUAGE_MODEL || "language_model_q4_0.gguf"}`,
+		"--session-option", `minimax_music3.rvq_depth_decoder_gguf=${process.env.MINIMAX_AUDIOCPP_RVQ_MODEL || "rvq_depth_decoder_q8_0.gguf"}`,
+		"--session-option", `minimax_music3.flow_transformer_gguf=${process.env.MINIMAX_AUDIOCPP_TRANSFORMER || "transformer_q4_0.gguf"}`,
+		"--session-option", "minimax_music3.mem_saver=true",
+		"--out", outPath,
+		"--metrics",
+	];
+
+	localMusicGenerationBusy = true;
+	try {
+		const timeoutMs = Math.max(60_000, Number(process.env.MINIMAX_AUDIOCPP_TIMEOUT_MS || 12 * 60 * 60_000));
+		const result = await runCapturedProcess(local.exe, args, { timeoutMs });
+		if (result.code !== 0) {
+			// Known Pascal CUDA-graph notices are intentionally kept out of YSong UI,
+			// while real stderr remains available if the process actually fails.
+			const detail = String(result.stderr || result.stdout || `audio.cpp exited ${result.code}`)
+				.split(/\r?\n/)
+				.filter((line) => !/ggml_cuda_graph_set_enabled: disabling CUDA graphs due to GPU architecture/i.test(line))
+				.join("\n")
+				.trim();
+			throw new Error(detail.slice(-5000) || `audio.cpp exited ${result.code}`);
+		}
+		const audio = await fs.promises.readFile(outPath);
+		if (!audio.length) throw new Error("audio.cpp completed but produced an empty WAV file.");
+		return { audio, contentType: "audio/wav", provider: "audio_cpp", backend: local.backend, metrics: result.stdout.trim().slice(-4000) };
+	} finally {
+		localMusicGenerationBusy = false;
+		await fs.promises.unlink(outPath).catch(() => {});
+	}
+}
+
+async function generateWithMiniMaxHttp(body) {
+	const baseUrl = miniMaxMusicBase();
+	const controller = new AbortController();
+	const timeoutMs = Math.max(60_000, Number(process.env.MINIMAX_MUSIC_TIMEOUT_MS || 20 * 60_000));
+	const timer = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		const response = await fetch(`${baseUrl}/v1/audio/speech`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			signal: controller.signal,
+			body: JSON.stringify({
+				model: miniMaxMusicModel(),
+				input: body.lyrics || "[Instrumental]",
+				instructions: body.instructions,
+				response_format: "wav",
+				seed: body.seed ?? 7,
+				max_new_tokens: body.maxNewTokens ?? 9000,
+				stream: false,
+			}),
+		});
+		if (!response.ok) {
+			const detail = await response.text().catch(() => "");
+			const error = new Error(detail.slice(0, 1200) || `MiniMax returned HTTP ${response.status}`);
+			error.code = "HTTP_GENERATION_FAILED";
+			throw error;
+		}
+		const audio = Buffer.from(await response.arrayBuffer());
+		if (!audio.length) throw new Error("MiniMax returned an empty audio file.");
+		return { audio, contentType: response.headers.get("content-type") || "audio/wav", provider: "http" };
+	} finally {
+		clearTimeout(timer);
+	}
+}
 
 app.post("/api/music/generate", async (req, res) => {
 	try {
 		const body = MusicGenerateSchema.parse(req.body || {});
-		const baseUrl = miniMaxMusicBase();
-		const controller = new AbortController();
-		// Full songs are non-streaming and can take a while on local GPUs.
-		const timeoutMs = Math.max(60_000, Number(process.env.MINIMAX_MUSIC_TIMEOUT_MS || 20 * 60_000));
-		const timer = setTimeout(() => controller.abort(), timeoutMs);
-		let response;
-		try {
-			response = await fetch(`${baseUrl}/v1/audio/speech`, {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				signal: controller.signal,
-				body: JSON.stringify({
-					model: miniMaxMusicModel(),
-					input: body.lyrics || "[Instrumental]",
-					instructions: body.instructions,
-					response_format: "wav",
-					seed: body.seed ?? 7,
-					max_new_tokens: body.maxNewTokens ?? 9000,
-					stream: false,
-				}),
-			});
-		} finally {
-			clearTimeout(timer);
-		}
-
-		if (!response.ok) {
-			const detail = await response.text().catch(() => "");
-			return res.status(502).json({ error: "minimax_generation_failed", message: detail.slice(0, 1200) || `MiniMax returned HTTP ${response.status}` });
-		}
-		const audio = Buffer.from(await response.arrayBuffer());
-		if (!audio.length) return res.status(502).json({ error: "minimax_empty_audio" });
-		res.setHeader("Content-Type", response.headers.get("content-type") || "audio/wav");
-		res.setHeader("Content-Length", String(audio.length));
+		const provider = miniMaxProvider();
+		const generated = provider === "audio_cpp" ? await generateWithAudioCpp(body) : await generateWithMiniMaxHttp(body);
+		res.setHeader("Content-Type", generated.contentType || "audio/wav");
+		res.setHeader("Content-Length", String(generated.audio.length));
 		res.setHeader("Cache-Control", "no-store");
-		return res.status(200).send(audio);
+		res.setHeader("X-YSong-Music-Provider", generated.provider || provider);
+		return res.status(200).send(generated.audio);
 	} catch (error) {
 		if (error?.name === "ZodError") return res.status(400).json({ error: "invalid_music_request", message: error.message });
-		if (error?.name === "AbortError") return res.status(504).json({ error: "minimax_timeout", message: "MiniMax Music 3 generation timed out." });
+		if (error?.code === "MINIMAX_BUSY") return res.status(409).json({ error: "minimax_busy", message: error.message });
+		if (error?.code === "PROCESS_TIMEOUT" || error?.name === "AbortError") return res.status(504).json({ error: "minimax_timeout", message: "MiniMax Music 3 generation timed out." });
 		console.error("POST /api/music/generate ERROR", error);
-		return res.status(502).json({ error: "minimax_unreachable", message: error?.message || "Could not reach MiniMax Music 3." });
+		return res.status(502).json({ error: "minimax_unreachable", message: error?.message || "Could not run MiniMax Music 3." });
 	}
 });
 
@@ -2260,7 +2547,7 @@ app.get("/healthz/db", async (_req, res) => {
 // Signup. In LOCAL_MODE the account is verified immediately; no email service is required.
 app.post("/auth/signup", async (req, res) => {
 	try {
-		const { email, password, name } = SignupSchema.parse(req.body);
+		const { email, password, name, gender, country, region, city } = SignupSchema.parse(req.body);
 		const normalized = email.trim().toLowerCase();
 		if (name) {
 			const taken = await pool.query(`SELECT 1 FROM users WHERE lower(display_name)=lower($1) AND email<>$2 LIMIT 1`, [name, normalized]);
@@ -2278,8 +2565,8 @@ app.post("/auth/signup", async (req, res) => {
 			if (existing.email_verified_at) return res.status(409).json({ error: "account_exists" });
 			if (LOCAL_MODE) {
 				await pool.query(
-					`UPDATE users SET password_hash = $2, display_name = COALESCE(NULLIF($3,''), display_name), email_verified_at = now(), updated_at = now() WHERE id = $1`,
-					[existing.id, password_hash, name || ""]
+					`UPDATE users SET password_hash = $2, display_name = COALESCE(NULLIF($3,''), display_name), gender=$4, country=$5, region=$6, city=$7, email_verified_at = now(), updated_at = now() WHERE id = $1`,
+					[existing.id, password_hash, name || "", gender, country, region || "", city || ""]
 				);
 				return res.json({ message: "Local account ready. You can log in now.", local: true });
 			}
@@ -2299,10 +2586,10 @@ app.post("/auth/signup", async (req, res) => {
 		}
 
 		const { rows: newRows } = await pool.query(
-			`INSERT INTO users (email, password_hash, display_name, email_verified_at)
-			 VALUES ($1, $2, $3, CASE WHEN $4::boolean THEN now() ELSE NULL END)
+			`INSERT INTO users (email, password_hash, display_name, gender, country, region, city, email_verified_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, CASE WHEN $8::boolean THEN now() ELSE NULL END)
 			 RETURNING id, email, display_name`,
-			[normalized, password_hash, name || null, LOCAL_MODE]
+			[normalized, password_hash, name || null, gender, country, region || "", city || "", LOCAL_MODE]
 		);
 		const user_id = newRows[0].id;
 		await pool.query(`INSERT INTO ysong_achievement_state (user_id) VALUES ($1) ON CONFLICT DO NOTHING`, [user_id]).catch(() => {});
@@ -2397,7 +2684,7 @@ app.post("/auth/login", async (req, res) => {
 		const normalized = email.trim().toLowerCase();
 
 		const { rows } = await pool.query(
-			`SELECT id, email, display_name, password_hash, email_verified_at,
+			`SELECT id, email, display_name, avatar_object_key, gender, country, region, city, password_hash, email_verified_at,
 				tos_accepted_at, tos_accepted_version
 			FROM users
 			WHERE email = $1
@@ -2424,6 +2711,11 @@ app.post("/auth/login", async (req, res) => {
 				id: user.id,
 				email: user.email,
 				displayName: String(user.display_name || "").trim() || fallbackPublicName(user.id),
+				avatarObjectKey: user.avatar_object_key || "",
+				gender: user.gender || "prefer_not_to_say",
+				country: user.country || "",
+				region: user.region || "",
+				city: user.city || "",
 				tosAcceptedAt: user.tos_accepted_at,
 				tosAcceptedVersion: user.tos_accepted_version,
 				currentTosVersion: CURRENT_TOS_VERSION,
@@ -2452,7 +2744,7 @@ app.get("/auth/me", async (req, res) => {
 		}
 
 		const { rows } = await pool.query(
-			`SELECT id, email, display_name, email_verified_at,
+			`SELECT id, email, display_name, avatar_object_key, gender, country, region, city, email_verified_at,
 				tos_accepted_at, tos_accepted_version
 			FROM users
 			WHERE id = $1
@@ -2467,6 +2759,11 @@ app.get("/auth/me", async (req, res) => {
 				id: rows[0].id,
 				email: rows[0].email,
 				displayName: String(rows[0].display_name || "").trim() || fallbackPublicName(rows[0].id),
+				avatarObjectKey: rows[0].avatar_object_key || "",
+				gender: rows[0].gender || "prefer_not_to_say",
+				country: rows[0].country || "",
+				region: rows[0].region || "",
+				city: rows[0].city || "",
 				tosAcceptedAt: rows[0].tos_accepted_at,
 				tosAcceptedVersion: rows[0].tos_accepted_version,
 				currentTosVersion: CURRENT_TOS_VERSION,
@@ -2483,14 +2780,94 @@ app.post("/api/profile", requireAuth, async (req, res) => {
 	try {
 		const displayName = String(req.body?.displayName || "").trim().replace(/\s+/g, " ").slice(0, 80);
 		if (!displayName) return res.status(400).json({ error: "username_required" });
+		const gender = ["female","male","nonbinary","other","prefer_not_to_say"].includes(String(req.body?.gender)) ? String(req.body.gender) : "prefer_not_to_say";
+		const country = String(req.body?.country || "").trim().slice(0,80);
+		const region = String(req.body?.region || "").trim().slice(0,120);
+		const city = String(req.body?.city || "").trim().slice(0,120);
+		let avatarObjectKey = req.body?.avatarObjectKey == null ? undefined : String(req.body.avatarObjectKey || "");
+		if (avatarObjectKey) {
+			avatarObjectKey = assertOwnedObjectKey(req.user.id, avatarObjectKey, { uploadOnly: true });
+			const meta = await readObjectMetadata(avatarObjectKey);
+			if (!String(meta.contentType || "").startsWith("image/")) return res.status(400).json({ error: "image_file_required" });
+		}
 		const taken = await pool.query(`SELECT 1 FROM users WHERE lower(display_name)=lower($1) AND id<>$2 LIMIT 1`, [displayName, req.user.id]);
 		if (taken.rows[0]) return res.status(409).json({ error: "username_taken" });
-		await pool.query(`UPDATE users SET display_name=$2, updated_at=now() WHERE id=$1`, [req.user.id, displayName]);
-		return res.json({ ok: true, displayName });
+		await pool.query(`UPDATE users SET display_name=$2, gender=$3, country=$4, region=$5, city=$6, avatar_object_key=CASE WHEN $7::boolean THEN $8 ELSE avatar_object_key END, updated_at=now() WHERE id=$1`, [req.user.id, displayName, gender, country, region, city, avatarObjectKey !== undefined, avatarObjectKey || null]);
+		return res.json({ ok: true, displayName, gender, country, region, city, avatarObjectKey: avatarObjectKey === undefined ? null : avatarObjectKey });
 	} catch (e) {
+		if (e?.statusCode === 403) return res.status(403).json({ error: "forbidden" });
 		console.error("POST /api/profile ERROR", e);
 		return res.status(500).json({ error: "profile_update_failed" });
 	}
+});
+
+// Account-owned artist identities. World publishing must reference one of these IDs.
+app.get("/api/artists", requireAuth, async (req, res) => {
+	try {
+		const { rows } = await pool.query(`SELECT * FROM artists WHERE owner_user_id=$1 ORDER BY updated_at DESC`, [req.user.id]);
+		return res.json({ artists: rows.map((r) => ({ id:String(r.id), type:r.artist_type, name:r.name, genre:r.genre||"", bio:r.bio||"", members:r.members||"", symbol:r.symbol||"", primary:r.primary_color||"#171717", accent:r.accent_color||"#a78bfa", avatarObjectKey:r.avatar_object_key||"" })) });
+	} catch (e) { console.error("GET /api/artists ERROR", e); return res.status(500).json({ error:"artists_failed" }); }
+});
+
+app.post("/api/artists/upsert", requireAuth, async (req, res) => {
+	try {
+		const id = String(req.body?.id || "");
+		const name = String(req.body?.name || "").trim().slice(0,180);
+		const type = req.body?.type === "solo" ? "solo" : "band";
+		if (!/^[0-9a-f-]{36}$/i.test(id) || !name) return res.status(400).json({ error:"invalid_artist" });
+		let avatarObjectKey = String(req.body?.avatarObjectKey || "");
+		if (avatarObjectKey) {
+			avatarObjectKey = assertOwnedObjectKey(req.user.id, avatarObjectKey, { uploadOnly: true });
+			const meta = await readObjectMetadata(avatarObjectKey);
+			if (!String(meta.contentType || "").startsWith("image/")) return res.status(400).json({ error:"image_file_required" });
+		}
+		const before = await pool.query(`SELECT name FROM artists WHERE id=$1 AND owner_user_id=$2 LIMIT 1`, [id, req.user.id]);
+		const oldName = String(before.rows[0]?.name || "");
+		const values=[id,req.user.id,type,name,String(req.body?.genre||"").trim().slice(0,120),String(req.body?.bio||"").trim().slice(0,4000),String(req.body?.members||"").trim().slice(0,4000),String(req.body?.symbol||"").trim().slice(0,1000),String(req.body?.primary||"#171717").slice(0,32),String(req.body?.accent||"#a78bfa").slice(0,32),avatarObjectKey||null];
+		const saved = await pool.query(`INSERT INTO artists (id,owner_user_id,artist_type,name,genre,bio,members,symbol,primary_color,accent_color,avatar_object_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO UPDATE SET artist_type=EXCLUDED.artist_type,name=EXCLUDED.name,genre=EXCLUDED.genre,bio=EXCLUDED.bio,members=EXCLUDED.members,symbol=EXCLUDED.symbol,primary_color=EXCLUDED.primary_color,accent_color=EXCLUDED.accent_color,avatar_object_key=COALESCE(EXCLUDED.avatar_object_key,artists.avatar_object_key),updated_at=now() WHERE artists.owner_user_id=$2 RETURNING id`, values);
+		if (!saved.rows[0]) return res.status(403).json({ error:"artist_not_owned" });
+		// Release metadata remains a cached display field for legacy compatibility, but
+		// the stable artist_id is authoritative. Keep the cache/follows in sync on rename.
+		await pool.query(`UPDATE world_releases SET artist_name=$3 WHERE artist_id=$1 AND owner_user_id=$2`, [id, req.user.id, name]);
+		if (oldName && oldName !== name) await pool.query(`UPDATE world_followed_artists SET artist_name=$3 WHERE artist_owner_user_id=$1 AND artist_name=$2`, [req.user.id, oldName, name]);
+		return res.json({ ok:true, id, avatarObjectKey });
+	} catch (e) {
+		if (e?.statusCode === 403) return res.status(403).json({ error:"forbidden" });
+		if (e?.code === "23505") return res.status(409).json({ error:"artist_name_taken" });
+		console.error("POST /api/artists/upsert ERROR", e); return res.status(500).json({ error:"artist_save_failed" });
+	}
+});
+
+app.post("/api/artists/delete", requireAuth, async (req, res) => {
+	try {
+		const id = String(req.body?.id || "");
+		if (!/^[0-9a-f-]{36}$/i.test(id)) return res.status(400).json({ error:"invalid_artist" });
+		const artist = await pool.query(`SELECT id FROM artists WHERE id=$1 AND owner_user_id=$2 LIMIT 1`, [id, req.user.id]);
+		if (!artist.rows[0]) return res.json({ ok:true, deleted:false });
+		const used = await pool.query(`SELECT 1 FROM world_releases WHERE artist_id=$1 LIMIT 1`, [id]);
+		if (used.rows[0]) return res.status(409).json({ error:"artist_has_releases" });
+		await pool.query(`UPDATE singer_profiles SET artist_ids = artist_ids - $1 WHERE owner_user_id=$2 AND artist_ids ? $1`, [id, req.user.id]);
+		await pool.query(`DELETE FROM artists WHERE id=$1 AND owner_user_id=$2`, [id, req.user.id]);
+		return res.json({ ok:true, deleted:true });
+	} catch (e) { console.error("POST /api/artists/delete ERROR", e); return res.status(500).json({ error:"artist_delete_failed" }); }
+});
+
+app.get("/api/singers", requireAuth, async (req, res) => {
+	try { const {rows}=await pool.query(`SELECT * FROM singer_profiles WHERE owner_user_id=$1 ORDER BY updated_at DESC`,[req.user.id]); return res.json({singers:rows.map(r=>({id:String(r.id),name:r.name,description:r.description||"",voiceType:r.voice_type||"",artistIds:Array.isArray(r.artist_ids)?r.artist_ids:[],referenceAudioObjectKey:r.reference_audio_object_key||"",avatarObjectKey:r.avatar_object_key||""}))}); }
+	catch(e){ console.error("GET /api/singers ERROR",e); return res.status(500).json({error:"singers_failed"}); }
+});
+
+app.post("/api/singers/upsert", requireAuth, async (req,res)=>{
+	try {
+		const id=String(req.body?.id||""); const name=String(req.body?.name||"").trim().slice(0,180);
+		if(!/^[0-9a-f-]{36}$/i.test(id)||!name) return res.status(400).json({error:"invalid_singer"});
+		const artistIds=Array.isArray(req.body?.artistIds)?req.body.artistIds.map(String).filter(x=>/^[0-9a-f-]{36}$/i.test(x)).slice(0,50):[];
+		for(const artistId of artistIds){ const own=await pool.query(`SELECT 1 FROM artists WHERE id=$1 AND owner_user_id=$2`,[artistId,req.user.id]); if(!own.rows[0]) return res.status(403).json({error:"artist_not_owned"}); }
+		let ref=String(req.body?.referenceAudioObjectKey||""); if(ref){ ref=assertOwnedObjectKey(req.user.id,ref,{uploadOnly:true}); const meta=await readObjectMetadata(ref); if(!String(meta.contentType||"").startsWith("audio/")&&!/\.(wav|flac|mp3|m4a|aac|ogg)$/i.test(String(meta.originalName||ref))) return res.status(400).json({error:"audio_file_required"}); }
+		const saved=await pool.query(`INSERT INTO singer_profiles (id,owner_user_id,name,description,voice_type,artist_ids,reference_audio_object_key) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,description=EXCLUDED.description,voice_type=EXCLUDED.voice_type,artist_ids=EXCLUDED.artist_ids,reference_audio_object_key=EXCLUDED.reference_audio_object_key,updated_at=now() WHERE singer_profiles.owner_user_id=$2 RETURNING id`,[id,req.user.id,name,String(req.body?.description||"").trim().slice(0,4000),String(req.body?.voiceType||"").trim().slice(0,120),JSON.stringify(artistIds),ref||null]);
+		if(!saved.rows[0]) return res.status(403).json({error:"singer_not_owned"});
+		return res.json({ok:true,id});
+	} catch(e){ if(e?.statusCode===403)return res.status(403).json({error:"forbidden"}); console.error("POST /api/singers/upsert ERROR",e); return res.status(500).json({error:"singer_save_failed"}); }
 });
 
 // ---------- Settings (GET) ----------

@@ -12,6 +12,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { spawn } from "child_process";
+import { UNIVERSAL_RULE_SEED, BUILTIN_PERSONA_SEEDS } from "./aiPersonaSeeds.js";
 
 const app = express();
 
@@ -727,6 +728,84 @@ async function ensureWorldSchema() {
 		ALTER TABLE users ADD COLUMN IF NOT EXISTS city text;
 		CREATE UNIQUE INDEX IF NOT EXISTS users_display_name_unique_idx ON users (lower(display_name)) WHERE display_name IS NOT NULL AND btrim(display_name) <> '';
 
+		-- AI personas/rules. This table predates the Rooms work; keep the original
+		-- text IDs and content columns so existing Neon rows remain canonical.
+		CREATE TABLE IF NOT EXISTS ysong_ai_rule_sets (
+			id text PRIMARY KEY,
+			kind text NOT NULL,
+			name text NOT NULL,
+			version integer NOT NULL DEFAULT 1,
+			is_active boolean NOT NULL DEFAULT true,
+			content text NOT NULL DEFAULT '',
+			updated_at timestamptz NOT NULL DEFAULT now()
+		);
+		ALTER TABLE ysong_ai_rule_sets ADD COLUMN IF NOT EXISTS owner_user_id uuid REFERENCES users(id) ON DELETE CASCADE;
+		ALTER TABLE ysong_ai_rule_sets ADD COLUMN IF NOT EXISTS metadata jsonb NOT NULL DEFAULT '{}'::jsonb;
+		ALTER TABLE ysong_ai_rule_sets ADD COLUMN IF NOT EXISTS avatar_object_key text;
+		ALTER TABLE ysong_ai_rule_sets ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
+		CREATE INDEX IF NOT EXISTS ysong_ai_rule_sets_persona_idx ON ysong_ai_rule_sets(kind, is_active);
+		CREATE INDEX IF NOT EXISTS ysong_ai_rule_sets_owner_idx ON ysong_ai_rule_sets(owner_user_id) WHERE owner_user_id IS NOT NULL;
+
+		-- Persist the selected single-chat persona. Older chats/messages simply fall
+		-- back to Surfer Dude when these columns are null.
+		ALTER TABLE chats ADD COLUMN IF NOT EXISTS persona_id text;
+		ALTER TABLE messages ADD COLUMN IF NOT EXISTS persona_id text;
+
+		-- Persistent social studio rooms. Public rooms can be joined by any signed-in
+		-- user; private rooms are visible only to their membership.
+		CREATE TABLE IF NOT EXISTS ysong_rooms (
+			id uuid PRIMARY KEY,
+			owner_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			name text NOT NULL,
+			description text NOT NULL DEFAULT '',
+			visibility text NOT NULL DEFAULT 'private' CHECK (visibility IN ('public','private')),
+			created_at timestamptz NOT NULL DEFAULT now(),
+			updated_at timestamptz NOT NULL DEFAULT now()
+		);
+		CREATE INDEX IF NOT EXISTS ysong_rooms_public_idx ON ysong_rooms(visibility, updated_at DESC);
+		CREATE INDEX IF NOT EXISTS ysong_rooms_owner_idx ON ysong_rooms(owner_user_id, updated_at DESC);
+
+		CREATE TABLE IF NOT EXISTS ysong_room_members (
+			room_id uuid NOT NULL REFERENCES ysong_rooms(id) ON DELETE CASCADE,
+			user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			role text NOT NULL DEFAULT 'member' CHECK (role IN ('owner','admin','member')),
+			joined_at timestamptz NOT NULL DEFAULT now(),
+			PRIMARY KEY (room_id, user_id)
+		);
+		CREATE INDEX IF NOT EXISTS ysong_room_members_user_idx ON ysong_room_members(user_id, joined_at DESC);
+
+		CREATE TABLE IF NOT EXISTS ysong_room_personas (
+			room_id uuid NOT NULL REFERENCES ysong_rooms(id) ON DELETE CASCADE,
+			persona_id text NOT NULL REFERENCES ysong_ai_rule_sets(id) ON DELETE CASCADE,
+			added_by_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			participation_mode text NOT NULL DEFAULT 'active' CHECK (participation_mode IN ('active','listening','mention_only','muted')),
+			added_at timestamptz NOT NULL DEFAULT now(),
+			PRIMARY KEY (room_id, persona_id)
+		);
+
+		CREATE TABLE IF NOT EXISTS ysong_room_messages (
+			id uuid PRIMARY KEY,
+			room_id uuid NOT NULL REFERENCES ysong_rooms(id) ON DELETE CASCADE,
+			sender_kind text NOT NULL CHECK (sender_kind IN ('user','persona','system')),
+			sender_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+			sender_persona_id text REFERENCES ysong_ai_rule_sets(id) ON DELETE SET NULL,
+			content text NOT NULL,
+			reply_to_message_id uuid REFERENCES ysong_room_messages(id) ON DELETE SET NULL,
+			metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+			created_at timestamptz NOT NULL DEFAULT now()
+		);
+		CREATE INDEX IF NOT EXISTS ysong_room_messages_room_idx ON ysong_room_messages(room_id, created_at ASC);
+
+		CREATE TABLE IF NOT EXISTS ysong_room_reactions (
+			message_id uuid NOT NULL REFERENCES ysong_room_messages(id) ON DELETE CASCADE,
+			actor_kind text NOT NULL CHECK (actor_kind IN ('user','persona')),
+			actor_user_id uuid REFERENCES users(id) ON DELETE CASCADE,
+			actor_persona_id text REFERENCES ysong_ai_rule_sets(id) ON DELETE CASCADE,
+			emoji text NOT NULL,
+			created_at timestamptz NOT NULL DEFAULT now()
+		);
+		CREATE INDEX IF NOT EXISTS ysong_room_reactions_message_idx ON ysong_room_reactions(message_id, created_at ASC);
+
 		CREATE TABLE IF NOT EXISTS artists (
 			id uuid PRIMARY KEY,
 			owner_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -959,9 +1038,32 @@ async function ensureWorldSchema() {
 			baseline_initialized_at timestamptz NOT NULL DEFAULT now()
 		);
 	`);
+
+}
+
+async function ensureAiRuleSeeds() {
+	const seeds = [UNIVERSAL_RULE_SEED, ...BUILTIN_PERSONA_SEEDS];
+	for (const seed of seeds) {
+		await pool.query(
+			`INSERT INTO ysong_ai_rule_sets (id, kind, name, version, is_active, content, metadata, updated_at)
+			 VALUES ($1, $2, $3, $4, TRUE, $5, $6::jsonb, now())
+			 ON CONFLICT (id) DO NOTHING`,
+			[seed.id, seed.kind, seed.name, seed.version || 1, seed.content || "", JSON.stringify(seed.metadata || {})]
+		);
+		// Metadata is safe to enrich on an existing row, while its prompt text remains
+		// exactly whatever the owner already has in Neon.
+		await pool.query(
+			`UPDATE ysong_ai_rule_sets
+			 SET metadata = $2::jsonb || COALESCE(metadata, '{}'::jsonb),
+			     updated_at = CASE WHEN COALESCE(metadata, '{}'::jsonb) = '{}'::jsonb THEN now() ELSE updated_at END
+			 WHERE id = $1`,
+			[seed.id, JSON.stringify(seed.metadata || {})]
+		);
+	}
 }
 
 app.post("/api/world/publish", requireAuth, async (req, res) => {
+
 	try {
 		const body = req.body ?? {};
 		const title = String(body.title || "").trim().slice(0, 180);
@@ -2207,52 +2309,583 @@ app.get("/api/ai/status", (_req, res) => {
 	return res.json({ configured: configured && provider === "openai", provider, model: process.env.OPENAI_MODEL || "gpt-5.6" });
 });
 
-app.post("/chat", async (req, res) => {
-	try {
-		const provider = String(process.env.AI_PROVIDER || (process.env.OPENAI_API_KEY ? "openai" : "none")).toLowerCase();
-		if (provider !== "openai") {
-			return res.json({
-				reply: "YSong AI is not configured on this server yet.",
-				local: true,
-			});
-		}
-		if (!process.env.OPENAI_API_KEY) return res.status(503).json({ error: "openai_key_missing" });
-		const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
-		const input = messages
-			.filter((m) => m && typeof m.content === "string")
-			.map((m) => ({
-				role: m.role === "system" ? "developer" : (m.role === "assistant" ? "assistant" : "user"),
-				content: m.content,
-			}));
-		if (!input.length) return res.status(400).json({ error: "messages_required" });
+const DEFAULT_PERSONA_ID = "persona_surfer_v1";
+const UNIVERSAL_RULE_ID = "universal_v1";
 
-		const response = await fetch("https://api.openai.com/v1/responses", {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-			},
-			body: JSON.stringify({
-				model: process.env.OPENAI_MODEL || "gpt-5.6",
-				input,
-			}),
+function renderRuleContent(content) {
+	const appName = String(process.env.APP_NAME || "YSong");
+	return String(content || "").replace(/\$\{APP_NAME\}/g, appName);
+}
+
+function publicPersona(row) {
+	const metadata = row?.metadata && typeof row.metadata === "object" ? row.metadata : {};
+	return {
+		id: String(row.id),
+		name: String(metadata.displayName || row.name || "Persona"),
+		description: String(metadata.description || ""),
+		specialty: String(metadata.specialty || ""),
+		humorStyle: String(metadata.humorStyle || ""),
+		socialEnergy: Number.isFinite(Number(metadata.socialEnergy)) ? Number(metadata.socialEnergy) : 0.6,
+		critiqueLevel: Number.isFinite(Number(metadata.critiqueLevel)) ? Number(metadata.critiqueLevel) : 0.6,
+		avatarPath: typeof metadata.avatarPath === "string" ? metadata.avatarPath : "",
+		isCustom: !!row.owner_user_id,
+		hasCustomAvatar: !!row.avatar_object_key,
+		sortOrder: Number.isFinite(Number(metadata.sortOrder)) ? Number(metadata.sortOrder) : 999,
+		metadata,
+	};
+}
+
+async function getPersonaRowForUser(userId, personaId) {
+	const id = String(personaId || DEFAULT_PERSONA_ID);
+	const { rows } = await pool.query(
+		`SELECT id, kind, name, version, content, metadata, owner_user_id, avatar_object_key
+		 FROM ysong_ai_rule_sets
+		 WHERE id=$1 AND kind='persona' AND is_active=TRUE
+		   AND (owner_user_id IS NULL OR owner_user_id=$2)
+		 LIMIT 1`,
+		[id, userId]
+	);
+	if (rows[0]) return rows[0];
+	if (id !== DEFAULT_PERSONA_ID) return getPersonaRowForUser(userId, DEFAULT_PERSONA_ID);
+	return null;
+}
+
+async function loadPersonaBundle(userId, personaId) {
+	const [universalResult, persona] = await Promise.all([
+		pool.query(
+			`SELECT id, content FROM ysong_ai_rule_sets
+			 WHERE id=$1 AND kind='universal' AND is_active=TRUE LIMIT 1`,
+			[UNIVERSAL_RULE_ID]
+		),
+		getPersonaRowForUser(userId, personaId),
+	]);
+	return {
+		universal: renderRuleContent(universalResult.rows[0]?.content || UNIVERSAL_RULE_SEED.content),
+		persona,
+		personaContent: renderRuleContent(persona?.content || BUILTIN_PERSONA_SEEDS[0]?.content || ""),
+	};
+}
+
+async function callOpenAI(input, { maxOutputTokens } = {}) {
+	const provider = String(process.env.AI_PROVIDER || (process.env.OPENAI_API_KEY ? "openai" : "none")).toLowerCase();
+	if (provider !== "openai") return { text: "YSong AI is not configured on this server yet.", local: true };
+	if (!process.env.OPENAI_API_KEY) {
+		const err = new Error("openai_key_missing");
+		err.statusCode = 503;
+		throw err;
+	}
+	const body = { model: process.env.OPENAI_MODEL || "gpt-5.6", input };
+	if (Number.isFinite(Number(maxOutputTokens)) && Number(maxOutputTokens) > 0) body.max_output_tokens = Number(maxOutputTokens);
+	const response = await fetch("https://api.openai.com/v1/responses", {
+		method: "POST",
+		headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+		body: JSON.stringify(body),
+	});
+	const data = await response.json().catch(() => ({}));
+	if (!response.ok) {
+		const message = data?.error?.message || `OpenAI HTTP ${response.status}`;
+		const err = new Error(message);
+		err.statusCode = response.status;
+		throw err;
+	}
+	const text = Array.isArray(data?.output)
+		? data.output
+			.flatMap((item) => (item?.type === "message" && Array.isArray(item.content) ? item.content : []))
+			.filter((part) => part?.type === "output_text" && typeof part.text === "string")
+			.map((part) => part.text)
+			.join("")
+		: "";
+	return { text: text || "…", local: false };
+}
+
+function parsePersonaBubblePlan(text) {
+	const raw = String(text || "").trim();
+	const candidates = [raw, raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")];
+	const brace = raw.match(/\{[\s\S]*\}/);
+	if (brace) candidates.push(brace[0]);
+	for (const candidate of candidates) {
+		try {
+			const parsed = JSON.parse(candidate);
+			const bubbles = Array.isArray(parsed?.bubbles)
+				? parsed.bubbles.map((x) => String(x || "").trim()).filter(Boolean).slice(0, 3)
+				: [];
+			if (bubbles.length) return bubbles;
+		} catch {}
+	}
+	return raw ? [raw.slice(0, 4000)] : ["…"];
+}
+
+// -------------------- API: AI personas --------------------
+app.get("/api/personas", requireAuth, async (req, res) => {
+	try {
+		const { rows } = await pool.query(
+			`SELECT id, name, metadata, owner_user_id, avatar_object_key
+			 FROM ysong_ai_rule_sets
+			 WHERE kind='persona' AND is_active=TRUE
+			   AND (owner_user_id IS NULL OR owner_user_id=$1)
+			 ORDER BY COALESCE((metadata->>'sortOrder')::int, 999), lower(COALESCE(metadata->>'displayName', name))`,
+			[req.user.id]
+		);
+		return res.json({ personas: rows.map(publicPersona), defaultPersonaId: DEFAULT_PERSONA_ID });
+	} catch (e) {
+		console.error("GET /api/personas ERROR", e);
+		return res.status(500).json({ error: "persona_list_failed" });
+	}
+});
+
+app.get("/api/personas/:id/avatar", requireAuth, async (req, res) => {
+	try {
+		const persona = await getPersonaRowForUser(req.user.id, req.params.id);
+		if (!persona || String(persona.id) !== String(req.params.id)) return res.status(404).json({ error: "persona_not_found" });
+		if (!persona.avatar_object_key) return res.json({ url: publicPersona(persona).avatarPath || "" });
+		const key = assertOwnedObjectKey(req.user.id, String(persona.avatar_object_key));
+		await fs.promises.access(objectPath(key), fs.constants.R_OK);
+		const expiresAt = Date.now() + 2 * 60 * 60 * 1000;
+		const sig = makeLocalFileSignature(key, "play", expiresAt);
+		const base = `${req.protocol}://${req.get("host")}`;
+		return res.json({
+			url: `${base}/api/uploads/file?objectKey=${encodeURIComponent(key)}&mode=play&expires=${expiresAt}&sig=${sig}`,
+			expiresAt,
 		});
-		const data = await response.json().catch(() => ({}));
-		if (!response.ok) {
-			const message = data?.error?.message || `OpenAI HTTP ${response.status}`;
-			throw new Error(message);
+	} catch (e) {
+		console.error("GET /api/personas/:id/avatar ERROR", e);
+		return res.status(e?.statusCode === 403 ? 403 : 500).json({ error: "persona_avatar_failed" });
+	}
+});
+
+app.post("/api/personas/custom", requireAuth, async (req, res) => {
+	try {
+		const name = String(req.body?.name || "").trim().slice(0, 80);
+		const description = String(req.body?.description || "").trim().slice(0, 500);
+		const specialty = String(req.body?.specialty || "").trim().slice(0, 500);
+		const humorStyle = String(req.body?.humorStyle || "").trim().slice(0, 300);
+		const instructions = String(req.body?.instructions || "").trim().slice(0, 8000);
+		const socialEnergy = Math.max(0, Math.min(1, Number(req.body?.socialEnergy ?? 0.6) || 0.6));
+		const critiqueLevel = Math.max(0, Math.min(1, Number(req.body?.critiqueLevel ?? 0.6) || 0.6));
+		if (!name) return res.status(400).json({ error: "persona_name_required" });
+		if (!instructions) return res.status(400).json({ error: "persona_instructions_required" });
+		let avatarObjectKey = null;
+		if (req.body?.avatarObjectKey) avatarObjectKey = assertOwnedObjectKey(req.user.id, String(req.body.avatarObjectKey), { uploadOnly: true });
+		const id = `persona_custom_${crypto.randomUUID().replace(/-/g, "")}`;
+		const content = `\nIDENTITY & VIBE\n- You are ${name}.\n- Stay in character while obeying all universal YSong rules.\n${description ? `- Core vibe: ${description}\n` : ""}${specialty ? `- Musical specialty: ${specialty}\n` : ""}${humorStyle ? `- Humor style: ${humorStyle}\n` : ""}\nCREATOR NOTES\n${instructions}\n`;
+		const metadata = { displayName: name, description, specialty, humorStyle, socialEnergy, critiqueLevel, builtIn: false, sortOrder: 500 };
+		const { rows } = await pool.query(
+			`INSERT INTO ysong_ai_rule_sets
+			 (id, kind, name, version, is_active, content, owner_user_id, metadata, avatar_object_key, created_at, updated_at)
+			 VALUES ($1, 'persona', $2, 1, TRUE, $3, $4, $5::jsonb, $6, now(), now())
+			 RETURNING id, name, metadata, owner_user_id, avatar_object_key`,
+			[id, `${name} Persona`, content, req.user.id, JSON.stringify(metadata), avatarObjectKey]
+		);
+		return res.status(201).json({ persona: publicPersona(rows[0]) });
+	} catch (e) {
+		console.error("POST /api/personas/custom ERROR", e);
+		return res.status(e?.statusCode === 403 ? 403 : 500).json({ error: "persona_create_failed" });
+	}
+});
+
+app.post("/api/personas/:id/delete", requireAuth, async (req, res) => {
+	try {
+		const result = await pool.query(
+			`DELETE FROM ysong_ai_rule_sets WHERE id=$1 AND kind='persona' AND owner_user_id=$2 RETURNING id`,
+			[String(req.params.id), req.user.id]
+		);
+		if (!result.rows[0]) return res.status(404).json({ error: "custom_persona_not_found" });
+		return res.json({ ok: true });
+	} catch (e) {
+		console.error("POST /api/personas/:id/delete ERROR", e);
+		return res.status(500).json({ error: "persona_delete_failed" });
+	}
+});
+
+app.get("/api/chats/:id/persona", requireAuth, async (req, res) => {
+	try {
+		const { rows } = await pool.query(`SELECT persona_id FROM chats WHERE id=$1 AND user_id=$2 LIMIT 1`, [String(req.params.id), req.user.id]);
+		if (!rows[0]) return res.status(404).json({ error: "chat_not_found" });
+		const persona = await getPersonaRowForUser(req.user.id, rows[0].persona_id || DEFAULT_PERSONA_ID);
+		return res.json({ persona: persona ? publicPersona(persona) : null, personaId: persona?.id || DEFAULT_PERSONA_ID });
+	} catch (e) {
+		console.error("GET /api/chats/:id/persona ERROR", e);
+		return res.status(500).json({ error: "chat_persona_failed" });
+	}
+});
+
+app.post("/api/chats/:id/persona", requireAuth, async (req, res) => {
+	try {
+		const chatId = String(req.params.id);
+		const requested = String(req.body?.personaId || DEFAULT_PERSONA_ID);
+		const persona = await getPersonaRowForUser(req.user.id, requested);
+		if (!persona || String(persona.id) !== requested) return res.status(404).json({ error: "persona_not_found" });
+		const updated = await pool.query(`UPDATE chats SET persona_id=$3, updated_at=now() WHERE id=$1 AND user_id=$2 RETURNING id`, [chatId, req.user.id, requested]);
+		if (!updated.rows[0]) {
+			await pool.query(
+				`INSERT INTO chats (id, user_id, title, pinned, is_cloud_saved, persona_id) VALUES ($1,$2,'',FALSE,TRUE,$3)`,
+				[chatId, req.user.id, requested]
+			);
 		}
-		const reply = Array.isArray(data?.output)
-			? data.output
-					.flatMap((item) => (item?.type === "message" && Array.isArray(item.content) ? item.content : []))
-					.filter((part) => part?.type === "output_text" && typeof part.text === "string")
-					.map((part) => part.text)
-					.join("")
-			: "";
-		return res.json({ reply: reply || "…" });
+		return res.json({ ok: true, persona: publicPersona(persona) });
+	} catch (e) {
+		console.error("POST /api/chats/:id/persona ERROR", e);
+		return res.status(500).json({ error: "chat_persona_update_failed" });
+	}
+});
+
+// Main one-on-one chat. Persona and universal rules are now resolved server-side
+// from Neon instead of trusting a hardcoded browser system prompt.
+app.post("/chat", requireAuth, async (req, res) => {
+	try {
+		const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
+		const personaId = String(req.body?.personaId || DEFAULT_PERSONA_ID);
+		const bundle = await loadPersonaBundle(req.user.id, personaId);
+		if (!bundle.persona) return res.status(503).json({ error: "persona_unavailable" });
+		const input = [
+			{ role: "developer", content: bundle.universal },
+			{ role: "developer", content: bundle.personaContent },
+			...messages
+				.filter((m) => m && typeof m.content === "string")
+				.map((m) => ({
+					role: m.role === "system" ? "developer" : (m.role === "assistant" ? "assistant" : "user"),
+					content: m.content,
+				})),
+		];
+		if (input.length <= 2) return res.status(400).json({ error: "messages_required" });
+		const answer = await callOpenAI(input);
+		return res.json({ reply: answer.text, local: !!answer.local, persona: publicPersona(bundle.persona) });
 	} catch (e) {
 		console.error("POST /chat ERROR", e);
-		return res.status(500).json({ error: "ai_failed", message: e?.message });
+		return res.status(e?.statusCode || 500).json({ error: e?.message === "openai_key_missing" ? "openai_key_missing" : "ai_failed", message: e?.message });
+	}
+});
+
+// -------------------- API: Rooms --------------------
+async function roomAccess(roomId, userId, { allowPublic = false } = {}) {
+	const { rows } = await pool.query(
+		`SELECT r.*, rm.role AS member_role
+		 FROM ysong_rooms r
+		 LEFT JOIN ysong_room_members rm ON rm.room_id=r.id AND rm.user_id=$2
+		 WHERE r.id=$1 LIMIT 1`,
+		[roomId, userId]
+	);
+	const room = rows[0];
+	if (!room) return null;
+	if (!room.member_role && !(allowPublic && room.visibility === "public")) return null;
+	return room;
+}
+
+function roomSummary(row) {
+	return {
+		id: row.id,
+		name: row.name,
+		description: row.description || "",
+		visibility: row.visibility,
+		ownerUserId: row.owner_user_id,
+		role: row.member_role || null,
+		joined: !!row.member_role,
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
+	};
+}
+
+function roomMessagePublic(row) {
+	const personaMeta = row.persona_metadata && typeof row.persona_metadata === "object" ? row.persona_metadata : {};
+	return {
+		id: row.id,
+		roomId: row.room_id,
+		senderKind: row.sender_kind,
+		senderUserId: row.sender_user_id,
+		senderPersonaId: row.sender_persona_id,
+		senderName: row.sender_kind === "persona"
+			? String(personaMeta.displayName || row.persona_name || "AI Persona")
+			: String(row.user_name || (row.sender_kind === "system" ? "YSong" : "Member")),
+		personaAvatarPath: row.sender_kind === "persona" ? String(personaMeta.avatarPath || "") : "",
+		content: row.content,
+		replyToMessageId: row.reply_to_message_id,
+		metadata: row.metadata || {},
+		createdAt: row.created_at,
+	};
+}
+
+async function fetchRoomMessages(roomId, limit = 100) {
+	const { rows } = await pool.query(
+		`SELECT m.*, u.display_name AS user_name, p.name AS persona_name, p.metadata AS persona_metadata
+		 FROM ysong_room_messages m
+		 LEFT JOIN users u ON u.id=m.sender_user_id
+		 LEFT JOIN ysong_ai_rule_sets p ON p.id=m.sender_persona_id
+		 WHERE m.room_id=$1
+		 ORDER BY m.created_at DESC
+		 LIMIT $2`,
+		[roomId, Math.min(200, Math.max(1, Number(limit) || 100))]
+	);
+	return rows.reverse().map(roomMessagePublic);
+}
+
+app.get("/api/rooms", requireAuth, async (req, res) => {
+	try {
+		const { rows } = await pool.query(
+			`SELECT r.*, rm.role AS member_role
+			 FROM ysong_rooms r
+			 LEFT JOIN ysong_room_members rm ON rm.room_id=r.id AND rm.user_id=$1
+			 WHERE rm.user_id=$1 OR r.visibility='public'
+			 ORDER BY (rm.user_id IS NOT NULL) DESC, r.updated_at DESC`,
+			[req.user.id]
+		);
+		return res.json({ rooms: rows.map(roomSummary) });
+	} catch (e) {
+		console.error("GET /api/rooms ERROR", e);
+		return res.status(500).json({ error: "rooms_list_failed" });
+	}
+});
+
+app.post("/api/rooms", requireAuth, async (req, res) => {
+	const client = await pool.connect();
+	try {
+		const name = String(req.body?.name || "").trim().slice(0, 100);
+		const description = String(req.body?.description || "").trim().slice(0, 800);
+		const visibility = req.body?.visibility === "public" ? "public" : "private";
+		if (!name) return res.status(400).json({ error: "room_name_required" });
+		const id = crypto.randomUUID();
+		await client.query("BEGIN");
+		const { rows } = await client.query(
+			`INSERT INTO ysong_rooms (id, owner_user_id, name, description, visibility)
+			 VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+			[id, req.user.id, name, description, visibility]
+		);
+		await client.query(`INSERT INTO ysong_room_members (room_id,user_id,role) VALUES ($1,$2,'owner')`, [id, req.user.id]);
+		await client.query("COMMIT");
+		return res.status(201).json({ room: roomSummary({ ...rows[0], member_role: "owner" }) });
+	} catch (e) {
+		await client.query("ROLLBACK").catch(() => {});
+		console.error("POST /api/rooms ERROR", e);
+		return res.status(500).json({ error: "room_create_failed" });
+	} finally { client.release(); }
+});
+
+app.get("/api/rooms/:id", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id, { allowPublic: true });
+		if (!room) return res.status(404).json({ error: "room_not_found" });
+		const [memberRows, personaRows, messages] = await Promise.all([
+			pool.query(
+				`SELECT rm.user_id, rm.role, rm.joined_at, u.display_name
+				 FROM ysong_room_members rm JOIN users u ON u.id=rm.user_id
+				 WHERE rm.room_id=$1 ORDER BY CASE rm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, lower(u.display_name)`,
+				[room.id]
+			),
+			pool.query(
+				`SELECT rp.persona_id, rp.participation_mode, rp.added_at, p.name, p.metadata, p.owner_user_id, p.avatar_object_key
+				 FROM ysong_room_personas rp JOIN ysong_ai_rule_sets p ON p.id=rp.persona_id
+				 WHERE rp.room_id=$1 AND p.is_active=TRUE ORDER BY COALESCE((p.metadata->>'sortOrder')::int,999), lower(p.name)`,
+				[room.id]
+			),
+			fetchRoomMessages(room.id, 120),
+		]);
+		return res.json({
+			room: roomSummary(room),
+			members: memberRows.rows.map((m) => ({ userId: m.user_id, name: m.display_name || "Member", role: m.role, joinedAt: m.joined_at })),
+			personas: personaRows.rows.map((p) => ({ ...publicPersona(p), participationMode: p.participation_mode, addedAt: p.added_at })),
+			messages,
+		});
+	} catch (e) {
+		console.error("GET /api/rooms/:id ERROR", e);
+		return res.status(500).json({ error: "room_load_failed" });
+	}
+});
+
+app.post("/api/rooms/:id/join", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id, { allowPublic: true });
+		if (!room || room.visibility !== "public") return res.status(404).json({ error: "public_room_not_found" });
+		await pool.query(`INSERT INTO ysong_room_members (room_id,user_id,role) VALUES ($1,$2,'member') ON CONFLICT DO NOTHING`, [room.id, req.user.id]);
+		return res.json({ ok: true });
+	} catch (e) { console.error("POST /api/rooms/:id/join ERROR", e); return res.status(500).json({ error: "room_join_failed" }); }
+});
+
+app.post("/api/rooms/:id/leave", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room) return res.status(404).json({ error: "room_not_found" });
+		if (room.member_role === "owner") return res.status(400).json({ error: "owner_must_delete_room" });
+		await pool.query(`DELETE FROM ysong_room_members WHERE room_id=$1 AND user_id=$2`, [room.id, req.user.id]);
+		return res.json({ ok: true });
+	} catch (e) { console.error("POST /api/rooms/:id/leave ERROR", e); return res.status(500).json({ error: "room_leave_failed" }); }
+});
+
+app.post("/api/rooms/:id/settings", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room || !["owner","admin"].includes(room.member_role)) return res.status(403).json({ error: "room_admin_required" });
+		const name = req.body?.name == null ? room.name : String(req.body.name).trim().slice(0,100);
+		const description = req.body?.description == null ? room.description : String(req.body.description).trim().slice(0,800);
+		const visibility = req.body?.visibility == null ? room.visibility : (req.body.visibility === "public" ? "public" : "private");
+		if (!name) return res.status(400).json({ error: "room_name_required" });
+		const { rows } = await pool.query(`UPDATE ysong_rooms SET name=$2,description=$3,visibility=$4,updated_at=now() WHERE id=$1 RETURNING *`, [room.id,name,description,visibility]);
+		return res.json({ room: roomSummary({ ...rows[0], member_role: room.member_role }) });
+	} catch (e) { console.error("POST /api/rooms/:id/settings ERROR", e); return res.status(500).json({ error: "room_update_failed" }); }
+});
+
+app.post("/api/rooms/:id/delete", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room || room.member_role !== "owner") return res.status(403).json({ error: "room_owner_required" });
+		await pool.query(`DELETE FROM ysong_rooms WHERE id=$1`, [room.id]);
+		return res.json({ ok: true });
+	} catch (e) { console.error("POST /api/rooms/:id/delete ERROR", e); return res.status(500).json({ error: "room_delete_failed" }); }
+});
+
+app.post("/api/rooms/:id/members/invite", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room || !["owner","admin"].includes(room.member_role)) return res.status(403).json({ error: "room_admin_required" });
+		const displayName = String(req.body?.displayName || "").trim().slice(0,80);
+		if (!displayName) return res.status(400).json({ error: "display_name_required" });
+		const { rows } = await pool.query(`SELECT id,display_name FROM users WHERE lower(display_name)=lower($1) LIMIT 1`, [displayName]);
+		if (!rows[0]) return res.status(404).json({ error: "user_not_found" });
+		await pool.query(`INSERT INTO ysong_room_members (room_id,user_id,role) VALUES ($1,$2,'member') ON CONFLICT DO NOTHING`, [room.id, rows[0].id]);
+		return res.json({ ok: true, member: { userId: rows[0].id, name: rows[0].display_name, role: "member" } });
+	} catch (e) { console.error("POST /api/rooms/:id/members/invite ERROR", e); return res.status(500).json({ error: "room_invite_failed" }); }
+});
+
+app.post("/api/rooms/:id/personas", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room) return res.status(403).json({ error: "room_membership_required" });
+		const personaId = String(req.body?.personaId || "");
+		const persona = await getPersonaRowForUser(req.user.id, personaId);
+		if (!persona || String(persona.id) !== personaId) return res.status(404).json({ error: "persona_not_found" });
+		const mode = ["active","listening","mention_only","muted"].includes(req.body?.participationMode) ? req.body.participationMode : "active";
+		await pool.query(
+			`INSERT INTO ysong_room_personas (room_id,persona_id,added_by_user_id,participation_mode)
+			 VALUES ($1,$2,$3,$4)
+			 ON CONFLICT (room_id,persona_id) DO UPDATE SET participation_mode=EXCLUDED.participation_mode`,
+			[room.id, personaId, req.user.id, mode]
+		);
+		return res.json({ ok: true, persona: { ...publicPersona(persona), participationMode: mode } });
+	} catch (e) { console.error("POST /api/rooms/:id/personas ERROR", e); return res.status(500).json({ error: "room_persona_add_failed" }); }
+});
+
+app.post("/api/rooms/:id/personas/remove", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room) return res.status(403).json({ error: "room_membership_required" });
+		await pool.query(`DELETE FROM ysong_room_personas WHERE room_id=$1 AND persona_id=$2`, [room.id, String(req.body?.personaId || "")]);
+		return res.json({ ok: true });
+	} catch (e) { console.error("POST /api/rooms/:id/personas/remove ERROR", e); return res.status(500).json({ error: "room_persona_remove_failed" }); }
+});
+
+app.post("/api/rooms/:id/personas/mode", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room) return res.status(403).json({ error: "room_membership_required" });
+		const mode = String(req.body?.participationMode || "");
+		if (!["active","listening","mention_only","muted"].includes(mode)) return res.status(400).json({ error: "invalid_participation_mode" });
+		await pool.query(`UPDATE ysong_room_personas SET participation_mode=$3 WHERE room_id=$1 AND persona_id=$2`, [room.id, String(req.body?.personaId || ""), mode]);
+		return res.json({ ok: true });
+	} catch (e) { console.error("POST /api/rooms/:id/personas/mode ERROR", e); return res.status(500).json({ error: "room_persona_mode_failed" }); }
+});
+
+app.post("/api/rooms/:id/messages", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room) return res.status(403).json({ error: "room_membership_required" });
+		const content = String(req.body?.content || "").trim().slice(0,8000);
+		if (!content) return res.status(400).json({ error: "message_required" });
+		const id = crypto.randomUUID();
+		await pool.query(
+			`INSERT INTO ysong_room_messages (id,room_id,sender_kind,sender_user_id,content,reply_to_message_id)
+			 VALUES ($1,$2,'user',$3,$4,$5)`,
+			[id, room.id, req.user.id, content, req.body?.replyToMessageId || null]
+		);
+		await pool.query(`UPDATE ysong_rooms SET updated_at=now() WHERE id=$1`, [room.id]);
+		const messages = await fetchRoomMessages(room.id, 1);
+		return res.status(201).json({ message: messages[messages.length-1] });
+	} catch (e) { console.error("POST /api/rooms/:id/messages ERROR", e); return res.status(500).json({ error: "room_message_failed" }); }
+});
+
+function normalizeMentionName(name) {
+	return String(name || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function chooseRoomPersonas(personas, triggerText) {
+	const text = String(triggerText || "");
+	const lower = text.toLowerCase();
+	const explicitAll = /@(band|room|everyone|all)\b/i.test(text);
+	const directlyMentioned = personas.filter((p) => {
+		const name = String(p.metadata?.displayName || p.name || "");
+		const compact = normalizeMentionName(name);
+		const compactText = lower.replace(/[^a-z0-9@]+/g, "");
+		return lower.includes(`@${name.toLowerCase()}`) || (compact && compactText.includes(`@${compact}`));
+	});
+	if (directlyMentioned.length) return directlyMentioned.filter((p) => p.participation_mode !== "muted").slice(0,3);
+	if (explicitAll) return personas.filter((p) => ["active","listening"].includes(p.participation_mode)).slice(0,3);
+	const active = personas.filter((p) => p.participation_mode === "active");
+	if (!active.length) return [];
+	const first = active[Math.abs([...text].reduce((a,c) => a + c.charCodeAt(0), 0)) % active.length];
+	const picked = [first];
+	if (active.length > 1) {
+		const remaining = active.filter((p) => p.id !== first.id);
+		const candidate = remaining[0];
+		const energy = Number(candidate?.metadata?.socialEnergy ?? 0.6);
+		if (candidate && Math.random() < Math.min(0.6, Math.max(0.15, energy * 0.5))) picked.push(candidate);
+	}
+	return picked;
+}
+
+app.post("/api/rooms/:id/ai/respond", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room) return res.status(403).json({ error: "room_membership_required" });
+		const latestHumanText = String(req.body?.triggerText || "").slice(0,8000);
+		const { rows: personaRows } = await pool.query(
+			`SELECT p.id,p.name,p.content,p.metadata,p.owner_user_id,p.avatar_object_key,rp.participation_mode
+			 FROM ysong_room_personas rp JOIN ysong_ai_rule_sets p ON p.id=rp.persona_id
+			 WHERE rp.room_id=$1 AND p.is_active=TRUE
+			 ORDER BY COALESCE((p.metadata->>'sortOrder')::int,999), lower(p.name)`,
+			[room.id]
+		);
+		const selected = chooseRoomPersonas(personaRows, latestHumanText);
+		if (!selected.length) return res.json({ messages: [], selectedPersonaIds: [] });
+		const universalResult = await pool.query(`SELECT content FROM ysong_ai_rule_sets WHERE id=$1 AND kind='universal' AND is_active=TRUE LIMIT 1`, [UNIVERSAL_RULE_ID]);
+		const universal = renderRuleContent(universalResult.rows[0]?.content || UNIVERSAL_RULE_SEED.content);
+		const inserted = [];
+		const turnGroupId = crypto.randomUUID();
+
+		for (const persona of selected) {
+			const history = await fetchRoomMessages(room.id, 32);
+			const personaName = String(persona.metadata?.displayName || persona.name || "AI Persona");
+			const roomGuide = `You are participating in a live YSong Room named "${room.name}" with multiple humans and AI personas.\nOther personas are independent participants, not alternate names for you. You may respond to a human or to another persona when it is natural. Do not answer every message just to prove you are present. Keep the rhythm conversational.\nReturn JSON only in this exact shape: {"bubbles":["first short chat bubble","optional follow-up","optional final thought"]}. Use 1 to 3 bubbles. Most turns should use 1 or 2. Each bubble should read like a natural chat message, not a numbered list. Never mention this JSON instruction.`;
+			const transcript = history.map((m) => {
+				const mine = m.senderKind === "persona" && m.senderPersonaId === persona.id;
+				return {
+					role: mine ? "assistant" : "user",
+					content: mine ? m.content : `[${m.senderName}]: ${m.content}`,
+				};
+			});
+			const answer = await callOpenAI([
+				{ role: "developer", content: universal },
+				{ role: "developer", content: renderRuleContent(persona.content) },
+				{ role: "developer", content: roomGuide },
+				...transcript,
+			], { maxOutputTokens: 500 });
+			const bubbles = parsePersonaBubblePlan(answer.text);
+			for (let i=0;i<bubbles.length;i++) {
+				const id = crypto.randomUUID();
+				await pool.query(
+					`INSERT INTO ysong_room_messages (id,room_id,sender_kind,sender_persona_id,content,metadata)
+					 VALUES ($1,$2,'persona',$3,$4,$5::jsonb)`,
+					[id, room.id, persona.id, bubbles[i], JSON.stringify({ turnGroupId, bubbleIndex:i, bubbleCount:bubbles.length, personaName })]
+				);
+				const current = await pool.query(
+					`SELECT m.*, NULL::text AS user_name, p.name AS persona_name, p.metadata AS persona_metadata
+					 FROM ysong_room_messages m LEFT JOIN ysong_ai_rule_sets p ON p.id=m.sender_persona_id WHERE m.id=$1`,
+					[id]
+				);
+				inserted.push(roomMessagePublic(current.rows[0]));
+			}
+		}
+		await pool.query(`UPDATE ysong_rooms SET updated_at=now() WHERE id=$1`, [room.id]);
+		return res.json({ messages: inserted, selectedPersonaIds: selected.map((p) => p.id) });
+	} catch (e) {
+		console.error("POST /api/rooms/:id/ai/respond ERROR", e);
+		return res.status(e?.statusCode || 500).json({ error: "room_ai_failed", message: e?.message || "AI room reply failed" });
 	}
 });
 
@@ -2262,7 +2895,7 @@ app.get("/api/chats", requireAuth, async (req, res) => {
 		const userId = req.user.id;
 		const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
 		const { rows } = await pool.query(
-			`SELECT id, title, pinned, is_cloud_saved, created_at, updated_at
+			`SELECT id, title, pinned, is_cloud_saved, persona_id, created_at, updated_at
 			FROM chats
 			WHERE user_id = $1
 			ORDER BY created_at DESC
@@ -2274,6 +2907,7 @@ app.get("/api/chats", requireAuth, async (req, res) => {
 			title: r.title || "",
 			pinned: r.pinned,
 			isCloudSaved: r.is_cloud_saved,
+			personaId: r.persona_id || DEFAULT_PERSONA_ID,
 			createdAt: r.created_at,
 			updatedAt: r.updated_at,
 		}));
@@ -2299,7 +2933,7 @@ app.get("/api/chats/:id/messages", requireAuth, async (req, res) => {
 		}
 
 		const { rows } = await pool.query(
-			`SELECT id, role, content, attachments_json, created_at
+			`SELECT id, role, content, attachments_json, persona_id, created_at
        FROM messages
        WHERE chat_id = $1
        ORDER BY created_at ASC`,
@@ -2311,6 +2945,7 @@ app.get("/api/chats/:id/messages", requireAuth, async (req, res) => {
 			role: r.role,
 			content: r.content,
 			attachments: r.attachments_json,
+			personaId: r.persona_id || null,
 			createdAt: r.created_at,
 		}));
 
@@ -2328,7 +2963,7 @@ app.post("/api/chats/:id/messages", requireAuth, async (req, res) => {
 
 		console.log("DEBUG /api/chats/:id/messages body:", req.body);
 
-		const { role, content, attachments } = req.body ?? {};
+		const { role, content, attachments, personaId } = req.body ?? {};
 		const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
 		const hasContent = typeof content === "string" && content.length > 0;
 
@@ -2366,17 +3001,24 @@ app.post("/api/chats/:id/messages", requireAuth, async (req, res) => {
 		if (chatRows.length === 0) {
 			console.log("DEBUG -> creating chat shell for id", chatId);
 			await pool.query(
-				`INSERT INTO chats (id, user_id, title, pinned, is_cloud_saved)
-         VALUES ($1, $2, $3, FALSE, TRUE)`,
-				[chatId, userId, ""]
+				`INSERT INTO chats (id, user_id, title, pinned, is_cloud_saved, persona_id)
+         VALUES ($1, $2, $3, FALSE, TRUE, $4)`,
+				[chatId, userId, "", String(personaId || DEFAULT_PERSONA_ID)]
 			);
 		}
 
+		let safePersonaId = null;
+		if (role === "assistant") {
+			const requestedPersonaId = String(personaId || DEFAULT_PERSONA_ID);
+			const persona = await getPersonaRowForUser(userId, requestedPersonaId);
+			safePersonaId = persona?.id || DEFAULT_PERSONA_ID;
+		}
+
 		const { rows } = await pool.query(
-			`INSERT INTO messages (chat_id, role, content, attachments_json)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, role, content, attachments_json, created_at`,
-			[chatId, role, safeContent, attachmentsJson]
+			`INSERT INTO messages (chat_id, role, content, attachments_json, persona_id)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, role, content, attachments_json, persona_id, created_at`,
+			[chatId, role, safeContent, attachmentsJson, safePersonaId]
 		);
 
 		const m = rows[0];
@@ -2388,6 +3030,7 @@ app.post("/api/chats/:id/messages", requireAuth, async (req, res) => {
 			role: m.role,
 			content: m.content,
 			attachments: m.attachments_json,
+			personaId: m.persona_id || null,
 			createdAt: m.created_at,
 		});
 	} catch (e) {
@@ -3015,6 +3658,7 @@ const port = process.env.PORT || 8081;
 
 async function startServer() {
 	await ensureWorldSchema();
+	await ensureAiRuleSeeds();
 	await initializeAchievementBaselines();
 	app.listen(port, () => console.log(`YSong API listening on ${port}`));
 }

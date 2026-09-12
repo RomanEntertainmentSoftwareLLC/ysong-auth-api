@@ -13,6 +13,14 @@ import path from "path";
 import os from "os";
 import { spawn } from "child_process";
 import { UNIVERSAL_RULE_SEED, BUILTIN_PERSONA_SEEDS } from "./aiPersonaSeeds.js";
+import { registerMusicSeoRoutes } from "./musicSeo/routes.mjs";
+import { registerPromotionRoutes } from "./promotion/routes.mjs";
+import { ensurePromotionSchema } from "./promotion/schema.mjs";
+import { registerCuratorRoutes } from "./curators/routes.mjs";
+import { ensureCuratorSchema } from "./curators/schema.mjs";
+import { registerComposerRoutes } from "./composer/routes.mjs";
+import { registerSoundDesignerRoutes } from "./soundDesigner/routes.mjs";
+import { registerStemComposerRoutes } from "./stemComposer/routes.mjs";
 
 const app = express();
 
@@ -147,6 +155,20 @@ app.use((_, res, next) => {
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
 app.use(express.json());
+
+// -------------------- YSong Tools: SEO Intelligence --------------------
+registerMusicSeoRoutes(app, { requireAuth });
+
+// -------------------- YSong Tools: Promotion Center --------------------
+registerPromotionRoutes(app, { requireAuth, objectPath, readObjectMetadata, writeObjectMetadata, assertOwnedObjectKey });
+
+// -------------------- YSong Tools: Curator Marketplace --------------------
+registerCuratorRoutes(app, { requireAuth });
+
+// -------------------- YSong DAW: AI Composer Foundation --------------------
+registerComposerRoutes(app, { requireAuth, callOpenAI });
+registerSoundDesignerRoutes(app, { requireAuth, callOpenAI });
+registerStemComposerRoutes(app, { requireAuth, callOpenAI, objectPath, writeObjectMetadata, assertOwnedObjectKey });
 
 // -------------------- Helpers --------------------
 const SignupSchema = z.object({
@@ -806,6 +828,83 @@ async function ensureWorldSchema() {
 		);
 		CREATE INDEX IF NOT EXISTS ysong_room_reactions_message_idx ON ysong_room_reactions(message_id, created_at ASC);
 
+		-- Phase 14 live venues. The room remains the social container while this
+		-- state describes an optional synchronized listening/radio/performance stage.
+		CREATE TABLE IF NOT EXISTS ysong_room_venue_state (
+			room_id uuid PRIMARY KEY REFERENCES ysong_rooms(id) ON DELETE CASCADE,
+			active boolean NOT NULL DEFAULT false,
+			host_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+			mode text NOT NULL DEFAULT 'listening' CHECK (mode IN ('listening','radio','visual','performance')),
+			stage_title text NOT NULL DEFAULT '',
+			stage_subtitle text NOT NULL DEFAULT '',
+			stream_mode text NOT NULL DEFAULT 'none',
+			stream_url text NOT NULL DEFAULT '',
+			stream_label text NOT NULL DEFAULT '',
+			requests_enabled boolean NOT NULL DEFAULT true,
+			votes_enabled boolean NOT NULL DEFAULT true,
+			audience_effects_enabled boolean NOT NULL DEFAULT true,
+			effect_cooldown_seconds integer NOT NULL DEFAULT 12 CHECK (effect_cooldown_seconds BETWEEN 1 AND 600),
+			transport jsonb NOT NULL DEFAULT '{}'::jsonb,
+			started_at timestamptz,
+			updated_at timestamptz NOT NULL DEFAULT now()
+		);
+
+		ALTER TABLE ysong_room_venue_state ADD COLUMN IF NOT EXISTS stream_mode text NOT NULL DEFAULT 'none';
+		ALTER TABLE ysong_room_venue_state ADD COLUMN IF NOT EXISTS stream_url text NOT NULL DEFAULT '';
+		ALTER TABLE ysong_room_venue_state ADD COLUMN IF NOT EXISTS stream_label text NOT NULL DEFAULT '';
+
+		CREATE TABLE IF NOT EXISTS ysong_room_audience_events (
+			id uuid PRIMARY KEY,
+			room_id uuid NOT NULL REFERENCES ysong_rooms(id) ON DELETE CASCADE,
+			actor_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+			kind text NOT NULL CHECK (kind IN ('reaction','effect','system')),
+			payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+			created_at timestamptz NOT NULL DEFAULT now()
+		);
+		CREATE INDEX IF NOT EXISTS ysong_room_audience_events_room_idx ON ysong_room_audience_events(room_id, created_at DESC);
+		CREATE INDEX IF NOT EXISTS ysong_room_audience_effect_cooldown_idx ON ysong_room_audience_events(room_id, actor_user_id, created_at DESC) WHERE kind='effect';
+
+		CREATE TABLE IF NOT EXISTS ysong_room_track_requests (
+			id uuid PRIMARY KEY,
+			room_id uuid NOT NULL REFERENCES ysong_rooms(id) ON DELETE CASCADE,
+			requester_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			track_id text,
+			title text NOT NULL,
+			artist text NOT NULL DEFAULT '',
+			status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected','played')),
+			created_at timestamptz NOT NULL DEFAULT now(),
+			updated_at timestamptz NOT NULL DEFAULT now()
+		);
+		CREATE INDEX IF NOT EXISTS ysong_room_track_requests_room_idx ON ysong_room_track_requests(room_id, status, created_at DESC);
+
+		CREATE TABLE IF NOT EXISTS ysong_room_request_votes (
+			request_id uuid NOT NULL REFERENCES ysong_room_track_requests(id) ON DELETE CASCADE,
+			user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			created_at timestamptz NOT NULL DEFAULT now(),
+			PRIMARY KEY (request_id, user_id)
+		);
+
+		CREATE TABLE IF NOT EXISTS ysong_room_polls (
+			id uuid PRIMARY KEY,
+			room_id uuid NOT NULL REFERENCES ysong_rooms(id) ON DELETE CASCADE,
+			created_by_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			question text NOT NULL,
+			options jsonb NOT NULL DEFAULT '[]'::jsonb,
+			status text NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
+			closes_at timestamptz,
+			created_at timestamptz NOT NULL DEFAULT now(),
+			updated_at timestamptz NOT NULL DEFAULT now()
+		);
+		CREATE INDEX IF NOT EXISTS ysong_room_polls_room_idx ON ysong_room_polls(room_id, status, created_at DESC);
+
+		CREATE TABLE IF NOT EXISTS ysong_room_poll_votes (
+			poll_id uuid NOT NULL REFERENCES ysong_room_polls(id) ON DELETE CASCADE,
+			user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			option_id text NOT NULL,
+			created_at timestamptz NOT NULL DEFAULT now(),
+			PRIMARY KEY (poll_id, user_id)
+		);
+
 		CREATE TABLE IF NOT EXISTS artists (
 			id uuid PRIMARY KEY,
 			owner_user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1003,6 +1102,7 @@ async function ensureWorldSchema() {
 		CREATE INDEX IF NOT EXISTS world_play_events_owner_time_idx ON world_play_events(owner_user_id, occurred_at DESC);
 		CREATE INDEX IF NOT EXISTS world_play_events_track_time_idx ON world_play_events(track_id, occurred_at DESC);
 		CREATE INDEX IF NOT EXISTS world_play_events_synthetic_idx ON world_play_events(owner_user_id, synthetic);
+		CREATE INDEX IF NOT EXISTS world_play_events_listener_time_idx ON world_play_events(listener_user_id, occurred_at DESC) WHERE listener_user_id IS NOT NULL;
 
 		CREATE TABLE IF NOT EXISTS ysong_notifications (
 			id uuid PRIMARY KEY,
@@ -1438,10 +1538,32 @@ app.post("/api/world/tracks/:id/play", async (req, res) => {
 		const authUser = verifyTokenString(authFromHeader(req));
 		let profile = null;
 		if (authUser?.id) { const q=await pool.query(`SELECT gender,country,region,city FROM users WHERE id=$1`,[authUser.id]); profile=q.rows[0]||null; }
-		await pool.query(`INSERT INTO world_play_events (id,track_id,owner_user_id,listener_user_id,listener_key,gender,country,region,city,source,listen_seconds,completed,synthetic) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,false)`,[crypto.randomUUID(),String(req.params.id||""),rows[0].owner_user_id,authUser?.id||null,authUser?.id?`u:${authUser.id}`:null,profile?.gender||null,profile?.country||null,profile?.region||null,profile?.city||null,String(req.body?.source||"ysong_world").slice(0,80),Number.isFinite(Number(req.body?.listenSeconds))?Number(req.body.listenSeconds):null,req.body?.completed===true]);
+		const playEventId = crypto.randomUUID();
+		await pool.query(`INSERT INTO world_play_events (id,track_id,owner_user_id,listener_user_id,listener_key,gender,country,region,city,source,listen_seconds,completed,synthetic) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,false)`,[playEventId,String(req.params.id||""),rows[0].owner_user_id,authUser?.id||null,authUser?.id?`u:${authUser.id}`:null,profile?.gender||null,profile?.country||null,profile?.region||null,profile?.city||null,String(req.body?.source||"ysong_world").slice(0,80),Number.isFinite(Number(req.body?.listenSeconds))?Number(req.body.listenSeconds):null,req.body?.completed===true]);
 		syncAchievementsForUser(rows[0].owner_user_id).catch(() => {});
-		return res.json({ ok: true, playCount: Number(rows[0].play_count || 0) });
+		return res.json({ ok: true, playCount: Number(rows[0].play_count || 0), playEventId: authUser?.id ? playEventId : null });
 	} catch (e) { console.error("POST /api/world/tracks/:id/play ERROR", e); return res.status(500).json({ error: "play_count_failed" }); }
+});
+
+app.post("/api/world/play-events/:id/progress", requireAuth, async (req, res) => {
+	try {
+		const secondsRaw = Number(req.body?.listenSeconds);
+		const listenSeconds = Number.isFinite(secondsRaw) ? Math.max(0, Math.min(24 * 60 * 60, secondsRaw)) : 0;
+		const completed = req.body?.completed === true;
+		const { rows } = await pool.query(
+			`UPDATE world_play_events
+			 SET listen_seconds = GREATEST(COALESCE(listen_seconds, 0), $3),
+			     completed = completed OR $4
+			 WHERE id=$1 AND listener_user_id=$2 AND synthetic=false
+			 RETURNING id, listen_seconds, completed`,
+			[String(req.params.id || ""), req.user.id, listenSeconds, completed]
+		);
+		if (!rows[0]) return res.status(404).json({ error: "play_event_not_found" });
+		return res.json({ ok: true, playEventId: rows[0].id, listenSeconds: Number(rows[0].listen_seconds || 0), completed: !!rows[0].completed });
+	} catch (e) {
+		console.error("POST /api/world/play-events/:id/progress ERROR", e);
+		return res.status(500).json({ error: "play_progress_failed" });
+	}
 });
 
 
@@ -1470,6 +1592,151 @@ app.post("/api/analytics/dev/seed", requireAuth, async (req,res)=>{
 	}catch(e){console.error("POST /api/analytics/dev/seed ERROR",e);return res.status(500).json({error:"analytics_seed_failed"});}
 });
 app.post("/api/analytics/dev/reset", requireAuth, async (req,res)=>{try{if(!LOCAL_MODE&&process.env.ALLOW_SYNTHETIC_ANALYTICS!=="1")return res.status(403).json({error:"dev_analytics_disabled"});const r=await pool.query(`DELETE FROM world_play_events WHERE owner_user_id=$1 AND synthetic=true`,[req.user.id]);return res.json({ok:true,deleted:r.rowCount||0});}catch(e){return res.status(500).json({error:"analytics_reset_failed"});}});
+
+
+// -------------------- Listener Flashback / recaps --------------------
+function flashbackWindow(periodRaw, yearRaw) {
+	const now = new Date();
+	const period = periodRaw === "week" || periodRaw === "month" || periodRaw === "year" ? periodRaw : "year";
+	if (period === "week" || period === "month") {
+		const days = period === "week" ? 7 : 30;
+		return {
+			period,
+			label: period === "week" ? "Last 7 days" : "Last 30 days",
+			start: new Date(now.getTime() - days * 24 * 60 * 60 * 1000),
+			end: now,
+			year: now.getUTCFullYear(),
+		};
+	}
+	const currentYear = now.getUTCFullYear();
+	const requested = Number(yearRaw);
+	const year = Number.isInteger(requested) && requested >= 2000 && requested <= currentYear ? requested : currentYear;
+	const start = new Date(Date.UTC(year, 0, 1));
+	const end = year === currentYear ? now : new Date(Date.UTC(year + 1, 0, 1));
+	return { period: "year", label: `${year} Flashback`, start, end, year };
+}
+
+function flashbackLongestStreak(dayStrings) {
+	const unique = Array.from(new Set((dayStrings || []).map((d) => String(d)))).sort();
+	let longest = 0;
+	let current = 0;
+	let previous = null;
+	for (const raw of unique) {
+		const value = new Date(`${raw}T00:00:00Z`).getTime();
+		if (!Number.isFinite(value)) continue;
+		if (previous == null || value - previous === 86400000) current += 1;
+		else current = 1;
+		longest = Math.max(longest, current);
+		previous = value;
+	}
+	return longest;
+}
+
+app.get("/api/flashback", requireAuth, async (req, res) => {
+	try {
+		const window = flashbackWindow(String(req.query.period || "year"), req.query.year);
+		const params = [req.user.id, window.start.toISOString(), window.end.toISOString()];
+		const secondsExpr = `CASE
+			WHEN e.listen_seconds IS NOT NULL AND e.listen_seconds > 0 THEN e.listen_seconds
+			WHEN e.completed THEN COALESCE(t.duration_seconds, 0)
+			ELSE LEAST(COALESCE(t.duration_seconds, 30), 30)
+		END`;
+
+		const totals = await pool.query(`
+			SELECT count(*)::int AS plays,
+			       count(DISTINCT e.track_id)::int AS unique_tracks,
+			       count(DISTINCT (r.owner_user_id::text || ':' || r.artist_name))::int AS unique_artists,
+			       COALESCE(sum(${secondsExpr}),0)::double precision AS listen_seconds,
+			       count(*) FILTER (WHERE e.listen_seconds IS NOT NULL AND e.listen_seconds > 0)::int AS tracked_events
+			FROM world_play_events e
+			JOIN world_tracks t ON t.id=e.track_id
+			JOIN world_releases r ON r.id=t.release_id
+			WHERE e.listener_user_id=$1 AND e.synthetic=false AND e.occurred_at >= $2::timestamptz AND e.occurred_at < $3::timestamptz`, params);
+
+		const topTracks = await pool.query(`
+			SELECT t.id, t.title, r.artist_name, COALESCE(NULLIF(t.genre,''),'Other') AS genre,
+			       count(*)::int AS plays, COALESCE(sum(${secondsExpr}),0)::double precision AS listen_seconds
+			FROM world_play_events e
+			JOIN world_tracks t ON t.id=e.track_id
+			JOIN world_releases r ON r.id=t.release_id
+			WHERE e.listener_user_id=$1 AND e.synthetic=false AND e.occurred_at >= $2::timestamptz AND e.occurred_at < $3::timestamptz
+			GROUP BY t.id,t.title,r.artist_name,t.genre
+			ORDER BY plays DESC, listen_seconds DESC, t.title ASC LIMIT 10`, params);
+
+		const topArtists = await pool.query(`
+			SELECT r.owner_user_id, r.artist_name AS name, count(*)::int AS plays,
+			       count(DISTINCT e.track_id)::int AS tracks, COALESCE(sum(${secondsExpr}),0)::double precision AS listen_seconds
+			FROM world_play_events e
+			JOIN world_tracks t ON t.id=e.track_id
+			JOIN world_releases r ON r.id=t.release_id
+			WHERE e.listener_user_id=$1 AND e.synthetic=false AND e.occurred_at >= $2::timestamptz AND e.occurred_at < $3::timestamptz
+			GROUP BY r.owner_user_id,r.artist_name
+			ORDER BY plays DESC, listen_seconds DESC, name ASC LIMIT 10`, params);
+
+		const topGenres = await pool.query(`
+			SELECT COALESCE(NULLIF(t.genre,''),'Other') AS name, count(*)::int AS plays,
+			       count(DISTINCT e.track_id)::int AS tracks, COALESCE(sum(${secondsExpr}),0)::double precision AS listen_seconds
+			FROM world_play_events e
+			JOIN world_tracks t ON t.id=e.track_id
+			WHERE e.listener_user_id=$1 AND e.synthetic=false AND e.occurred_at >= $2::timestamptz AND e.occurred_at < $3::timestamptz
+			GROUP BY COALESCE(NULLIF(t.genre,''),'Other')
+			ORDER BY plays DESC, listen_seconds DESC, name ASC LIMIT 10`, params);
+
+		const days = await pool.query(`
+			SELECT to_char((e.occurred_at AT TIME ZONE 'UTC')::date,'YYYY-MM-DD') AS day,
+			       count(*)::int AS plays, COALESCE(sum(${secondsExpr}),0)::double precision AS listen_seconds
+			FROM world_play_events e JOIN world_tracks t ON t.id=e.track_id
+			WHERE e.listener_user_id=$1 AND e.synthetic=false AND e.occurred_at >= $2::timestamptz AND e.occurred_at < $3::timestamptz
+			GROUP BY 1 ORDER BY 1`, params);
+
+		const discoveries = await pool.query(`
+			WITH first_tracks AS (
+				SELECT e.track_id, min(e.occurred_at) AS first_at
+				FROM world_play_events e WHERE e.listener_user_id=$1 AND e.synthetic=false GROUP BY e.track_id
+			), first_artists AS (
+				SELECT r.owner_user_id, r.artist_name, min(e.occurred_at) AS first_at
+				FROM world_play_events e
+				JOIN world_tracks t ON t.id=e.track_id JOIN world_releases r ON r.id=t.release_id
+				WHERE e.listener_user_id=$1 AND e.synthetic=false GROUP BY r.owner_user_id,r.artist_name
+			)
+			SELECT
+				(SELECT count(*)::int FROM first_tracks WHERE first_at >= $2::timestamptz AND first_at < $3::timestamptz) AS tracks,
+				(SELECT count(*)::int FROM first_artists WHERE first_at >= $2::timestamptz AND first_at < $3::timestamptz) AS artists`, params);
+
+		const years = await pool.query(`SELECT DISTINCT extract(year from occurred_at)::int AS year FROM world_play_events WHERE listener_user_id=$1 AND synthetic=false ORDER BY year DESC`, [req.user.id]);
+
+		const total = totals.rows[0] || {};
+		const playCount = Number(total.plays || 0);
+		const tracked = Number(total.tracked_events || 0);
+		const daily = days.rows.map((row) => ({ day: row.day, plays: Number(row.plays || 0), listenSeconds: Number(row.listen_seconds || 0) }));
+		return res.json({
+			period: window.period,
+			label: window.label,
+			year: window.year,
+			start: window.start.toISOString(),
+			end: window.end.toISOString(),
+			availableYears: years.rows.map((row) => Number(row.year)).filter(Number.isFinite),
+			totals: {
+				plays: playCount,
+				uniqueTracks: Number(total.unique_tracks || 0),
+				uniqueArtists: Number(total.unique_artists || 0),
+				listenSeconds: Number(total.listen_seconds || 0),
+				trackedEvents: tracked,
+				trackingCoverage: playCount ? tracked / playCount : 1,
+				listeningDays: daily.length,
+				longestStreakDays: flashbackLongestStreak(daily.map((row) => row.day)),
+			},
+			discoveries: { tracks: Number(discoveries.rows[0]?.tracks || 0), artists: Number(discoveries.rows[0]?.artists || 0) },
+			topTracks: topTracks.rows.map((row) => ({ id: row.id, title: row.title, artistName: row.artist_name, genre: row.genre, plays: Number(row.plays || 0), listenSeconds: Number(row.listen_seconds || 0) })),
+			topArtists: topArtists.rows.map((row) => ({ name: row.name, plays: Number(row.plays || 0), tracks: Number(row.tracks || 0), listenSeconds: Number(row.listen_seconds || 0) })),
+			topGenres: topGenres.rows.map((row) => ({ name: row.name, plays: Number(row.plays || 0), tracks: Number(row.tracks || 0), listenSeconds: Number(row.listen_seconds || 0) })),
+			daily,
+		});
+	} catch (e) {
+		console.error("GET /api/flashback ERROR", e);
+		return res.status(500).json({ error: "flashback_failed" });
+	}
+});
 
 // -------------------- YSong World social / library / playlists --------------------
 app.post("/api/world/tracks/:id/save", requireAuth, async (req, res) => {
@@ -2582,6 +2849,7 @@ function roomSummary(row) {
 		joined: !!row.member_role,
 		createdAt: row.created_at,
 		updatedAt: row.updated_at,
+		liveActive: !!row.live_active,
 	};
 }
 
@@ -2618,12 +2886,164 @@ async function fetchRoomMessages(roomId, limit = 100) {
 	return rows.reverse().map(roomMessagePublic);
 }
 
+
+function roomVenuePublic(row) {
+	const transport = row?.transport && typeof row.transport === "object" && Object.keys(row.transport).length ? row.transport : null;
+	return {
+		roomId: row.room_id,
+		active: !!row.active,
+		hostUserId: row.host_user_id || null,
+		hostName: String(row.host_name || ""),
+		mode: ["listening","radio","visual","performance"].includes(row.mode) ? row.mode : "listening",
+		stageTitle: String(row.stage_title || ""),
+		stageSubtitle: String(row.stage_subtitle || ""),
+		streamMode: row.stream_mode === "embed" ? "embed" : "none",
+		streamUrl: String(row.stream_url || ""),
+		streamLabel: String(row.stream_label || ""),
+		requestsEnabled: row.requests_enabled !== false,
+		votesEnabled: row.votes_enabled !== false,
+		audienceEffectsEnabled: row.audience_effects_enabled !== false,
+		effectCooldownSeconds: Math.max(1, Number(row.effect_cooldown_seconds) || 12),
+		transport,
+		startedAt: row.started_at || null,
+		updatedAt: row.updated_at,
+	};
+}
+
+async function ensureRoomVenueState(roomId) {
+	await pool.query(`INSERT INTO ysong_room_venue_state (room_id) VALUES ($1) ON CONFLICT (room_id) DO NOTHING`, [roomId]);
+	const { rows } = await pool.query(
+		`SELECT v.*, u.display_name AS host_name
+		 FROM ysong_room_venue_state v
+		 LEFT JOIN users u ON u.id=v.host_user_id
+		 WHERE v.room_id=$1 LIMIT 1`,
+		[roomId]
+	);
+	return rows[0] || null;
+}
+
+function roomAudienceEventPublic(row) {
+	return {
+		id: row.id,
+		roomId: row.room_id,
+		actorUserId: row.actor_user_id || null,
+		actorName: String(row.actor_name || "Audience"),
+		kind: row.kind,
+		payload: row.payload && typeof row.payload === "object" ? row.payload : {},
+		createdAt: row.created_at,
+	};
+}
+
+async function fetchRoomAudienceEvents(roomId, since) {
+	const params = [roomId];
+	let where = `e.room_id=$1`;
+	if (since) { params.push(since); where += ` AND e.created_at > $2::timestamptz`; }
+	const { rows } = await pool.query(
+		`SELECT e.*, u.display_name AS actor_name
+		 FROM ysong_room_audience_events e
+		 LEFT JOIN users u ON u.id=e.actor_user_id
+		 WHERE ${where}
+		 ORDER BY e.created_at DESC
+		 LIMIT 80`,
+		params
+	);
+	return rows.reverse().map(roomAudienceEventPublic);
+}
+
+async function fetchRoomTrackRequests(roomId, userId) {
+	const { rows } = await pool.query(
+		`SELECT r.*, u.display_name AS requester_name,
+		        count(v.user_id)::int AS votes,
+		        bool_or(v.user_id=$2::uuid) AS my_vote
+		 FROM ysong_room_track_requests r
+		 JOIN users u ON u.id=r.requester_user_id
+		 LEFT JOIN ysong_room_request_votes v ON v.request_id=r.id
+		 WHERE r.room_id=$1 AND r.status IN ('pending','approved')
+		 GROUP BY r.id,u.display_name
+		 ORDER BY CASE r.status WHEN 'approved' THEN 0 ELSE 1 END, count(v.user_id) DESC, r.created_at ASC
+		 LIMIT 100`,
+		[roomId,userId]
+	);
+	return rows.map((r) => ({
+		id:r.id, roomId:r.room_id, requesterUserId:r.requester_user_id, requesterName:r.requester_name || "Member",
+		trackId:r.track_id || null, title:r.title, artist:r.artist || "", status:r.status,
+		votes:Number(r.votes||0), myVote:!!r.my_vote, createdAt:r.created_at, updatedAt:r.updated_at,
+	}));
+}
+
+async function fetchRoomOpenPoll(roomId, userId) {
+	const { rows } = await pool.query(
+		`SELECT p.*, u.display_name AS created_by_name
+		 FROM ysong_room_polls p JOIN users u ON u.id=p.created_by_user_id
+		 WHERE p.room_id=$1 AND p.status='open'
+		 ORDER BY p.created_at DESC LIMIT 1`,
+		[roomId]
+	);
+	const poll = rows[0];
+	if (!poll) return null;
+	if (poll.closes_at && new Date(poll.closes_at).getTime() <= Date.now()) {
+		await pool.query(`UPDATE ysong_room_polls SET status='closed',updated_at=now() WHERE id=$1`, [poll.id]);
+		return null;
+	}
+	const voteRows = await pool.query(`SELECT option_id,count(*)::int AS votes FROM ysong_room_poll_votes WHERE poll_id=$1 GROUP BY option_id`, [poll.id]);
+	const mine = await pool.query(`SELECT option_id FROM ysong_room_poll_votes WHERE poll_id=$1 AND user_id=$2 LIMIT 1`, [poll.id,userId]);
+	const counts = new Map(voteRows.rows.map((r) => [String(r.option_id), Number(r.votes||0)]));
+	const options = Array.isArray(poll.options) ? poll.options : [];
+	return {
+		id:poll.id, roomId:poll.room_id, question:poll.question,
+		options:options.map((o) => ({ id:String(o.id||""), label:String(o.label||""), votes:counts.get(String(o.id||""))||0 })),
+		myOptionId:mine.rows[0]?.option_id || null, status:"open", createdByUserId:poll.created_by_user_id,
+		createdByName:poll.created_by_name || "Host", closesAt:poll.closes_at || null, createdAt:poll.created_at,
+	};
+}
+
+async function insertRoomAudienceEvent(roomId, actorUserId, kind, payload) {
+	const id = crypto.randomUUID();
+	const { rows } = await pool.query(
+		`WITH inserted AS (
+		   INSERT INTO ysong_room_audience_events (id,room_id,actor_user_id,kind,payload)
+		   VALUES ($1,$2,$3,$4,$5::jsonb) RETURNING *
+		 )
+		 SELECT inserted.*, u.display_name AS actor_name FROM inserted LEFT JOIN users u ON u.id=inserted.actor_user_id`,
+		[id,roomId,actorUserId,kind,JSON.stringify(payload||{})]
+	);
+	return roomAudienceEventPublic(rows[0]);
+}
+
+function sanitizeVenueTransport(raw) {
+	const source = ["world","daw","none"].includes(raw?.source) ? raw.source : "none";
+	const kind = ["playlist","radio","ad-hoc"].includes(raw?.broadcastKind) ? raw.broadcastKind : undefined;
+	const result = {
+		source,
+		playing:!!raw?.playing,
+		positionSeconds:Math.max(0,Number(raw?.positionSeconds)||0),
+		durationSeconds:Math.max(0,Number(raw?.durationSeconds)||0),
+		updatedAt:Number(raw?.updatedAt)||Date.now(),
+	};
+	for (const key of ["trackId","title","artist","album","broadcastProgramId","broadcastProgramName","visualSceneId","visualSceneName","nextTrackId","nextTitle","nextArtist"]) {
+		if (raw?.[key] != null) result[key] = String(raw[key]).slice(0,240);
+	}
+	if (kind) result.broadcastKind = kind;
+	if (raw?.adBreakActive != null) result.adBreakActive = !!raw.adBreakActive;
+	return result;
+}
+
+function sanitizeEmbedUrl(value) {
+	const raw = String(value || "").trim().slice(0,2000);
+	if (!raw) return "";
+	try {
+		const url = new URL(raw);
+		return ["http:","https:"].includes(url.protocol) ? url.toString() : "";
+	} catch { return ""; }
+}
+
 app.get("/api/rooms", requireAuth, async (req, res) => {
 	try {
 		const { rows } = await pool.query(
-			`SELECT r.*, rm.role AS member_role
+			`SELECT r.*, rm.role AS member_role, COALESCE(v.active,FALSE) AS live_active
 			 FROM ysong_rooms r
 			 LEFT JOIN ysong_room_members rm ON rm.room_id=r.id AND rm.user_id=$1
+			 LEFT JOIN ysong_room_venue_state v ON v.room_id=r.id
 			 WHERE rm.user_id=$1 OR r.visibility='public'
 			 ORDER BY (rm.user_id IS NOT NULL) DESC, r.updated_at DESC`,
 			[req.user.id]
@@ -2804,36 +3224,250 @@ function normalizeMentionName(name) {
 	return String(name || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
 
-function chooseRoomPersonas(personas, triggerText) {
+function personaDisplayName(persona) {
+	return String(persona?.metadata?.displayName || persona?.name || "AI Persona");
+}
+
+function textDirectlyMentionsPersona(text, persona) {
+	const source = String(text || "");
+	const lower = source.toLowerCase();
+	const name = personaDisplayName(persona);
+	const compact = normalizeMentionName(name);
+	const compactText = lower.replace(/[^a-z0-9@]+/g, "");
+	return lower.includes(`@${name.toLowerCase()}`) || (compact && compactText.includes(`@${compact}`));
+}
+
+function textNaturallyNamesPersona(text, persona) {
+	const lower = String(text || "").toLowerCase();
+	const name = personaDisplayName(persona).toLowerCase().trim();
+	if (!name || name.length < 3) return false;
+	if (lower.includes(name)) return true;
+	const compact = normalizeMentionName(name);
+	const compactText = lower.replace(/[^a-z0-9]+/g, "");
+	return compact.length >= 4 && compactText.includes(compact);
+}
+
+function chooseRoomPersonas(personas, triggerText, preferredPersonaIds = []) {
 	const text = String(triggerText || "");
-	const lower = text.toLowerCase();
-	const explicitAll = /@(band|room|everyone|all)\b/i.test(text);
-	const directlyMentioned = personas.filter((p) => {
-		const name = String(p.metadata?.displayName || p.name || "");
-		const compact = normalizeMentionName(name);
-		const compactText = lower.replace(/[^a-z0-9@]+/g, "");
-		return lower.includes(`@${name.toLowerCase()}`) || (compact && compactText.includes(`@${compact}`));
-	});
-	if (directlyMentioned.length) return directlyMentioned.filter((p) => p.participation_mode !== "muted").slice(0,3);
-	if (explicitAll) return personas.filter((p) => ["active","listening"].includes(p.participation_mode)).slice(0,3);
+	const eligible = personas.filter((p) => p.participation_mode !== "muted");
+	const preferred = new Set((Array.isArray(preferredPersonaIds) ? preferredPersonaIds : []).map(String));
+	const selectedById = eligible.filter((p) => preferred.has(String(p.id)));
+	if (selectedById.length) return selectedById.slice(0,3);
+
+	const directlyMentioned = eligible.filter((p) => textDirectlyMentionsPersona(text, p));
+	if (directlyMentioned.length) return directlyMentioned.slice(0,3);
+
+	// A human should not have to know the exact @ token to wake a persona. Saying
+	// "Pop Princess in the house" is enough to put Pop Princess first in line.
+	const naturallyNamed = eligible.filter((p) => textNaturallyNamesPersona(text, p));
+	if (naturallyNamed.length) return naturallyNamed.slice(0,3);
+
+	const explicitAll = /@(band|room|everyone|all|personas)\b/i.test(text);
+	if (explicitAll) return eligible.filter((p) => ["active","listening"].includes(p.participation_mode)).slice(0,3);
+
 	const active = personas.filter((p) => p.participation_mode === "active");
 	if (!active.length) return [];
-	const first = active[Math.abs([...text].reduce((a,c) => a + c.charCodeAt(0), 0)) % active.length];
+	const seed = Math.abs([...text].reduce((a,c) => a + c.charCodeAt(0), 0));
+	const firstIndex = seed % active.length;
+	const first = active[firstIndex];
 	const picked = [first];
 	if (active.length > 1) {
-		const remaining = active.filter((p) => p.id !== first.id);
-		const candidate = remaining[0];
+		// Rotate around the active list instead of always choosing remaining[0]. This
+		// prevents the same two loud personas from starving everyone else.
+		const candidate = active[(firstIndex + 1) % active.length];
 		const energy = Number(candidate?.metadata?.socialEnergy ?? 0.6);
-		if (candidate && Math.random() < Math.min(0.6, Math.max(0.15, energy * 0.5))) picked.push(candidate);
+		if (candidate && Math.random() < Math.min(0.65, Math.max(0.15, energy * 0.55))) picked.push(candidate);
 	}
 	return picked;
 }
+
+function discoverRoomPersonaFollowups(personas, generatedText, speakerId, spokeCounts, queuedIds) {
+	const text = String(generatedText || "").trim();
+	if (!text) return [];
+	const eligible = personas.filter((p) => p.participation_mode !== "muted" && String(p.id) !== String(speakerId));
+
+	// Explicitly naming another persona is the strongest baton pass.
+	const named = eligible.filter((p) => textDirectlyMentionsPersona(text, p) || textNaturallyNamesPersona(text, p));
+	if (named.length) {
+		return named.filter((p) => (spokeCounts.get(String(p.id)) || 0) < 2 && !queuedIds.has(String(p.id))).slice(0,2);
+	}
+
+	// Natural chat sometimes ends by handing the floor to somebody else without
+	// using their exact name. Permit one active, unspoken persona to answer, but
+	// keep a strict turn budget in the caller so the AIs cannot talk forever.
+	const invitesReply = /\?\s*$|\byour move\b|\bwhat do you think\b|\bthoughts\b|\bany thoughts\b|\bwhat say you\b/i.test(text);
+	if (!invitesReply) return [];
+	const candidates = eligible
+		.filter((p) => p.participation_mode === "active" && (spokeCounts.get(String(p.id)) || 0) === 0 && !queuedIds.has(String(p.id)))
+		.sort((a,b) => Number(b?.metadata?.socialEnergy ?? 0.5) - Number(a?.metadata?.socialEnergy ?? 0.5));
+	if (!candidates.length) return [];
+	const candidate = candidates[0];
+	const energy = Number(candidate?.metadata?.socialEnergy ?? 0.6);
+	return Math.random() < Math.min(0.8, Math.max(0.35, energy * 0.8)) ? [candidate] : [];
+}
+
+
+// -------------------- Phase 14: live Room venues --------------------
+app.get("/api/rooms/:id/venue", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id, { allowPublic:true });
+		if (!room) return res.status(404).json({ error:"room_not_found" });
+		const venueRow = await ensureRoomVenueState(room.id);
+		const since = String(req.query?.since || "").trim();
+		const [events,requests,poll] = await Promise.all([
+			fetchRoomAudienceEvents(room.id, since || null),
+			room.member_role ? fetchRoomTrackRequests(room.id, req.user.id) : Promise.resolve([]),
+			room.member_role ? fetchRoomOpenPoll(room.id, req.user.id) : Promise.resolve(null),
+		]);
+		return res.json({ venue:roomVenuePublic(venueRow), events, requests, poll, serverNow:Date.now() });
+	} catch (e) { console.error("GET /api/rooms/:id/venue ERROR",e); return res.status(500).json({error:"room_venue_load_failed"}); }
+});
+
+app.post("/api/rooms/:id/venue/settings", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room || !["owner","admin"].includes(room.member_role)) return res.status(403).json({error:"room_admin_required"});
+		const previous = await ensureRoomVenueState(room.id);
+		const body = req.body || {};
+		const active = body.active == null ? !!previous.active : !!body.active;
+		const mode = ["listening","radio","visual","performance"].includes(body.mode) ? body.mode : previous.mode;
+		const stageTitle = body.stageTitle == null ? previous.stage_title : String(body.stageTitle||"").trim().slice(0,120);
+		const stageSubtitle = body.stageSubtitle == null ? previous.stage_subtitle : String(body.stageSubtitle||"").trim().slice(0,240);
+		const streamMode = body.streamMode == null ? previous.stream_mode : (body.streamMode === "embed" ? "embed" : "none");
+		const streamUrl = body.streamUrl == null ? previous.stream_url : sanitizeEmbedUrl(body.streamUrl);
+		const streamLabel = body.streamLabel == null ? previous.stream_label : String(body.streamLabel||"").trim().slice(0,120);
+		const requestsEnabled = body.requestsEnabled == null ? previous.requests_enabled !== false : !!body.requestsEnabled;
+		const votesEnabled = body.votesEnabled == null ? previous.votes_enabled !== false : !!body.votesEnabled;
+		const audienceEffectsEnabled = body.audienceEffectsEnabled == null ? previous.audience_effects_enabled !== false : !!body.audienceEffectsEnabled;
+		const effectCooldownSeconds = body.effectCooldownSeconds == null ? Number(previous.effect_cooldown_seconds)||12 : Math.max(1,Math.min(600,Math.round(Number(body.effectCooldownSeconds)||12)));
+		const startedNow = active && !previous.active;
+		const { rows } = await pool.query(
+			`UPDATE ysong_room_venue_state SET active=$2,host_user_id=CASE WHEN $2 THEN $3 ELSE host_user_id END,mode=$4,stage_title=$5,stage_subtitle=$6,
+			 stream_mode=$7,stream_url=$8,stream_label=$9,requests_enabled=$10,votes_enabled=$11,audience_effects_enabled=$12,effect_cooldown_seconds=$13,
+			 started_at=CASE WHEN $14 THEN now() WHEN NOT $2 THEN NULL ELSE started_at END,transport=CASE WHEN NOT $2 THEN '{}'::jsonb ELSE transport END,updated_at=now()
+			 WHERE room_id=$1 RETURNING *`,
+			[room.id,active,req.user.id,mode,stageTitle,stageSubtitle,streamMode,streamUrl,streamLabel,requestsEnabled,votesEnabled,audienceEffectsEnabled,effectCooldownSeconds,startedNow]
+		);
+		if (startedNow) await insertRoomAudienceEvent(room.id,req.user.id,"system",{type:"venue-started",mode,stageTitle});
+		if (!active && previous.active) await insertRoomAudienceEvent(room.id,req.user.id,"system",{type:"venue-ended"});
+		const withHost = await pool.query(`SELECT v.*,u.display_name AS host_name FROM ysong_room_venue_state v LEFT JOIN users u ON u.id=v.host_user_id WHERE v.room_id=$1`,[room.id]);
+		return res.json({venue:roomVenuePublic(withHost.rows[0]||rows[0])});
+	} catch (e) { console.error("POST /api/rooms/:id/venue/settings ERROR",e); return res.status(500).json({error:"room_venue_update_failed"}); }
+});
+
+app.post("/api/rooms/:id/venue/transport", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room) return res.status(403).json({error:"room_membership_required"});
+		const venue = await ensureRoomVenueState(room.id);
+		if (!venue.active) return res.status(409).json({error:"room_venue_not_live"});
+		const canPublish = String(venue.host_user_id||"") === String(req.user.id) || ["owner","admin"].includes(room.member_role);
+		if (!canPublish) return res.status(403).json({error:"room_host_required"});
+		const transport = sanitizeVenueTransport(req.body?.transport || {});
+		await pool.query(`UPDATE ysong_room_venue_state SET transport=$2::jsonb,updated_at=now() WHERE room_id=$1`,[room.id,JSON.stringify(transport)]);
+		const next = await ensureRoomVenueState(room.id);
+		return res.json({ok:true,venue:roomVenuePublic(next)});
+	} catch (e) { console.error("POST /api/rooms/:id/venue/transport ERROR",e); return res.status(500).json({error:"room_transport_publish_failed"}); }
+});
+
+app.post("/api/rooms/:id/venue/reaction", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room) return res.status(403).json({error:"room_membership_required"});
+		const venue = await ensureRoomVenueState(room.id); if (!venue.active) return res.status(409).json({error:"room_venue_not_live"});
+		const emoji = String(req.body?.emoji||"").trim().slice(0,16); if (!emoji) return res.status(400).json({error:"emoji_required"});
+		const event = await insertRoomAudienceEvent(room.id,req.user.id,"reaction",{emoji});
+		return res.json({event});
+	} catch (e) { console.error("POST /api/rooms/:id/venue/reaction ERROR",e); return res.status(500).json({error:"room_reaction_failed"}); }
+});
+
+app.post("/api/rooms/:id/venue/effect", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room) return res.status(403).json({error:"room_membership_required"});
+		const venue = await ensureRoomVenueState(room.id); if (!venue.active) return res.status(409).json({error:"room_venue_not_live"});
+		if (!venue.audience_effects_enabled) return res.status(403).json({error:"audience_effects_disabled"});
+		const allowed = new Set(["applause","hearts","confetti","lightning","fire","snow","camera-shake","strobe"]);
+		const effectId = String(req.body?.effectId||""); if (!allowed.has(effectId)) return res.status(400).json({error:"invalid_effect"});
+		const recent = await pool.query(`SELECT created_at FROM ysong_room_audience_events WHERE room_id=$1 AND actor_user_id=$2 AND kind='effect' ORDER BY created_at DESC LIMIT 1`,[room.id,req.user.id]);
+		const lastMs = recent.rows[0]?.created_at ? new Date(recent.rows[0].created_at).getTime() : 0;
+		const cooldownMs = Math.max(1000,(Number(venue.effect_cooldown_seconds)||12)*1000);
+		const remaining = Math.max(0,cooldownMs-(Date.now()-lastMs));
+		if (remaining > 0) return res.status(429).json({error:"effect_cooldown",cooldownRemainingSeconds:Math.ceil(remaining/1000)});
+		const event = await insertRoomAudienceEvent(room.id,req.user.id,"effect",{effectId});
+		return res.json({event,cooldownRemainingSeconds:Number(venue.effect_cooldown_seconds)||12});
+	} catch (e) { console.error("POST /api/rooms/:id/venue/effect ERROR",e); return res.status(500).json({error:"room_effect_failed"}); }
+});
+
+app.post("/api/rooms/:id/venue/requests", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id); if (!room) return res.status(403).json({error:"room_membership_required"});
+		const venue = await ensureRoomVenueState(room.id); if (!venue.active || !venue.requests_enabled) return res.status(403).json({error:"room_requests_disabled"});
+		const title=String(req.body?.title||"").trim().slice(0,160); const artist=String(req.body?.artist||"").trim().slice(0,160); const trackId=req.body?.trackId?String(req.body.trackId).slice(0,160):null;
+		if (!title) return res.status(400).json({error:"request_title_required"});
+		const id=crypto.randomUUID();
+		const {rows}=await pool.query(`INSERT INTO ysong_room_track_requests (id,room_id,requester_user_id,track_id,title,artist) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,[id,room.id,req.user.id,trackId,title,artist]);
+		const requesterName=await publicNameForUserId(req.user.id);
+		const request={id,roomId:room.id,requesterUserId:req.user.id,requesterName:requesterName||"Member",trackId,title,artist,status:"pending",votes:0,myVote:false,createdAt:rows[0].created_at,updatedAt:rows[0].updated_at};
+		await insertRoomAudienceEvent(room.id,req.user.id,"system",{type:"track-request",requestId:id,title,artist});
+		return res.status(201).json({request});
+	} catch (e) { console.error("POST /api/rooms/:id/venue/requests ERROR",e); return res.status(500).json({error:"room_request_failed"}); }
+});
+
+app.post("/api/rooms/:id/venue/requests/:requestId/vote", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id); if (!room) return res.status(403).json({error:"room_membership_required"});
+		const venue = await ensureRoomVenueState(room.id); if (!venue.active || !venue.votes_enabled) return res.status(403).json({error:"room_votes_disabled"});
+		const requestId=String(req.params.requestId); const exists=await pool.query(`SELECT id FROM ysong_room_track_requests WHERE id=$1 AND room_id=$2 AND status IN ('pending','approved')`,[requestId,room.id]); if(!exists.rows[0])return res.status(404).json({error:"request_not_found"});
+		const mine=await pool.query(`SELECT 1 FROM ysong_room_request_votes WHERE request_id=$1 AND user_id=$2`,[requestId,req.user.id]);
+		if(mine.rows[0]) await pool.query(`DELETE FROM ysong_room_request_votes WHERE request_id=$1 AND user_id=$2`,[requestId,req.user.id]); else await pool.query(`INSERT INTO ysong_room_request_votes (request_id,user_id) VALUES ($1,$2)`,[requestId,req.user.id]);
+		const requests=await fetchRoomTrackRequests(room.id,req.user.id); const request=requests.find((r)=>r.id===requestId); return res.json({request});
+	} catch (e) { console.error("POST room request vote ERROR",e); return res.status(500).json({error:"room_request_vote_failed"}); }
+});
+
+app.post("/api/rooms/:id/venue/requests/:requestId/status", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id); if(!room||!["owner","admin"].includes(room.member_role))return res.status(403).json({error:"room_admin_required"});
+		const status=["pending","approved","rejected","played"].includes(req.body?.status)?req.body.status:null; if(!status)return res.status(400).json({error:"invalid_request_status"});
+		const requestId=String(req.params.requestId); const updated=await pool.query(`UPDATE ysong_room_track_requests SET status=$3,updated_at=now() WHERE id=$1 AND room_id=$2 RETURNING *`,[requestId,room.id,status]); if(!updated.rows[0])return res.status(404).json({error:"request_not_found"});
+		const requests=await fetchRoomTrackRequests(room.id,req.user.id); const request=requests.find((r)=>r.id===requestId)||{...updated.rows[0],id:requestId,roomId:room.id}; return res.json({request});
+	} catch (e) { console.error("POST room request status ERROR",e); return res.status(500).json({error:"room_request_moderation_failed"}); }
+});
+
+app.post("/api/rooms/:id/venue/polls", requireAuth, async (req, res) => {
+	try {
+		const room=await roomAccess(String(req.params.id),req.user.id); if(!room||!["owner","admin"].includes(room.member_role))return res.status(403).json({error:"room_admin_required"});
+		const venue=await ensureRoomVenueState(room.id); if(!venue.active||!venue.votes_enabled)return res.status(403).json({error:"room_votes_disabled"});
+		const question=String(req.body?.question||"").trim().slice(0,240); const labels=(Array.isArray(req.body?.options)?req.body.options:[]).map((x)=>String(x||"").trim().slice(0,120)).filter(Boolean).slice(0,8); if(!question||labels.length<2)return res.status(400).json({error:"poll_question_and_options_required"});
+		await pool.query(`UPDATE ysong_room_polls SET status='closed',updated_at=now() WHERE room_id=$1 AND status='open'`,[room.id]);
+		const options=labels.map((label,index)=>({id:`option-${index+1}`,label})); const duration=Math.max(0,Math.min(86400,Number(req.body?.durationSeconds)||0)); const closesAt=duration>0?new Date(Date.now()+duration*1000):null; const id=crypto.randomUUID();
+		await pool.query(`INSERT INTO ysong_room_polls (id,room_id,created_by_user_id,question,options,closes_at) VALUES ($1,$2,$3,$4,$5::jsonb,$6)`,[id,room.id,req.user.id,question,JSON.stringify(options),closesAt]);
+		const poll=await fetchRoomOpenPoll(room.id,req.user.id); await insertRoomAudienceEvent(room.id,req.user.id,"system",{type:"poll-started",pollId:id,question}); return res.status(201).json({poll});
+	} catch (e) { console.error("POST room poll ERROR",e); return res.status(500).json({error:"room_poll_create_failed"}); }
+});
+
+app.post("/api/rooms/:id/venue/polls/:pollId/vote", requireAuth, async (req, res) => {
+	try {
+		const room=await roomAccess(String(req.params.id),req.user.id); if(!room)return res.status(403).json({error:"room_membership_required"}); const venue=await ensureRoomVenueState(room.id); if(!venue.active||!venue.votes_enabled)return res.status(403).json({error:"room_votes_disabled"});
+		const pollId=String(req.params.pollId); const poll=await pool.query(`SELECT * FROM ysong_room_polls WHERE id=$1 AND room_id=$2 AND status='open' LIMIT 1`,[pollId,room.id]); if(!poll.rows[0])return res.status(404).json({error:"poll_not_found"}); const options=Array.isArray(poll.rows[0].options)?poll.rows[0].options:[]; const optionId=String(req.body?.optionId||""); if(!options.some((o)=>String(o.id)===optionId))return res.status(400).json({error:"invalid_poll_option"});
+		await pool.query(`INSERT INTO ysong_room_poll_votes (poll_id,user_id,option_id) VALUES ($1,$2,$3) ON CONFLICT (poll_id,user_id) DO UPDATE SET option_id=EXCLUDED.option_id,created_at=now()`,[pollId,req.user.id,optionId]); return res.json({poll:await fetchRoomOpenPoll(room.id,req.user.id)});
+	} catch (e) { console.error("POST room poll vote ERROR",e); return res.status(500).json({error:"room_poll_vote_failed"}); }
+});
+
+app.post("/api/rooms/:id/venue/polls/:pollId/close", requireAuth, async (req, res) => {
+	try {
+		const room=await roomAccess(String(req.params.id),req.user.id); if(!room||!["owner","admin"].includes(room.member_role))return res.status(403).json({error:"room_admin_required"}); const pollId=String(req.params.pollId); await pool.query(`UPDATE ysong_room_polls SET status='closed',updated_at=now() WHERE id=$1 AND room_id=$2`,[pollId,room.id]); await insertRoomAudienceEvent(room.id,req.user.id,"system",{type:"poll-closed",pollId}); return res.json({poll:null});
+	} catch (e) { console.error("POST room poll close ERROR",e); return res.status(500).json({error:"room_poll_close_failed"}); }
+});
 
 app.post("/api/rooms/:id/ai/respond", requireAuth, async (req, res) => {
 	try {
 		const room = await roomAccess(String(req.params.id), req.user.id);
 		if (!room) return res.status(403).json({ error: "room_membership_required" });
 		const latestHumanText = String(req.body?.triggerText || "").slice(0,8000);
+		const mentionedPersonaIds = Array.isArray(req.body?.mentionedPersonaIds)
+			? req.body.mentionedPersonaIds.map(String).filter(Boolean).slice(0,10)
+			: [];
 		const { rows: personaRows } = await pool.query(
 			`SELECT p.id,p.name,p.content,p.metadata,p.owner_user_id,p.avatar_object_key,rp.participation_mode
 			 FROM ysong_room_personas rp JOIN ysong_ai_rule_sets p ON p.id=rp.persona_id
@@ -2841,17 +3475,34 @@ app.post("/api/rooms/:id/ai/respond", requireAuth, async (req, res) => {
 			 ORDER BY COALESCE((p.metadata->>'sortOrder')::int,999), lower(p.name)`,
 			[room.id]
 		);
-		const selected = chooseRoomPersonas(personaRows, latestHumanText);
+		const selected = chooseRoomPersonas(personaRows, latestHumanText, mentionedPersonaIds);
 		if (!selected.length) return res.json({ messages: [], selectedPersonaIds: [] });
 		const universalResult = await pool.query(`SELECT content FROM ysong_ai_rule_sets WHERE id=$1 AND kind='universal' AND is_active=TRUE LIMIT 1`, [UNIVERSAL_RULE_ID]);
 		const universal = renderRuleContent(universalResult.rows[0]?.content || UNIVERSAL_RULE_SEED.content);
 		const inserted = [];
+		const venueContextRow = await ensureRoomVenueState(room.id).catch(()=>null);
+		const venueContext = venueContextRow?.active ? roomVenuePublic(venueContextRow) : null;
 		const turnGroupId = crypto.randomUUID();
+		const queue = [...selected];
+		const queuedIds = new Set(queue.map((p) => String(p.id)));
+		const spokeCounts = new Map();
+		const participantIds = [];
+		const MAX_PERSONA_TURNS = 4;
+		let personaTurns = 0;
 
-		for (const persona of selected) {
+		while (queue.length && personaTurns < MAX_PERSONA_TURNS) {
+			const persona = queue.shift();
+			if (!persona || persona.participation_mode === "muted") continue;
+			queuedIds.delete(String(persona.id));
+			const alreadySpoke = spokeCounts.get(String(persona.id)) || 0;
+			if (alreadySpoke >= 2) continue;
+			personaTurns += 1;
+			spokeCounts.set(String(persona.id), alreadySpoke + 1);
+			if (!participantIds.includes(String(persona.id))) participantIds.push(String(persona.id));
+
 			const history = await fetchRoomMessages(room.id, 32);
-			const personaName = String(persona.metadata?.displayName || persona.name || "AI Persona");
-			const roomGuide = `You are participating in a live YSong Room named "${room.name}" with multiple humans and AI personas.\nOther personas are independent participants, not alternate names for you. You may respond to a human or to another persona when it is natural. Do not answer every message just to prove you are present. Keep the rhythm conversational.\nReturn JSON only in this exact shape: {"bubbles":["first short chat bubble","optional follow-up","optional final thought"]}. Use 1 to 3 bubbles. Most turns should use 1 or 2. Each bubble should read like a natural chat message, not a numbered list. Never mention this JSON instruction.`;
+			const personaName = personaDisplayName(persona);
+			const roomGuide = `You are participating in a live YSong Room named "${room.name}" with multiple humans and AI personas.\nOther personas are independent participants, not alternate names for you. You may respond to a human or to another persona when it is natural. If another persona directly addresses you or asks you something, respond naturally. You may directly address another persona by name when it fits. Do not answer every message just to prove you are present. Keep the rhythm conversational.\nReturn JSON only in this exact shape: {"bubbles":["first short chat bubble","optional follow-up","optional final thought"]}. Use 1 to 3 bubbles. Most turns should use 1 or 2. Each bubble should read like a natural chat message, not a numbered list. Never mention this JSON instruction.`;
 			const transcript = history.map((m) => {
 				const mine = m.senderKind === "persona" && m.senderPersonaId === persona.id;
 				return {
@@ -2871,7 +3522,7 @@ app.post("/api/rooms/:id/ai/respond", requireAuth, async (req, res) => {
 				await pool.query(
 					`INSERT INTO ysong_room_messages (id,room_id,sender_kind,sender_persona_id,content,metadata)
 					 VALUES ($1,$2,'persona',$3,$4,$5::jsonb)`,
-					[id, room.id, persona.id, bubbles[i], JSON.stringify({ turnGroupId, bubbleIndex:i, bubbleCount:bubbles.length, personaName })]
+					[id, room.id, persona.id, bubbles[i], JSON.stringify({ turnGroupId, bubbleIndex:i, bubbleCount:bubbles.length, personaName, personaTurn:personaTurns })]
 				);
 				const current = await pool.query(
 					`SELECT m.*, NULL::text AS user_name, p.name AS persona_name, p.metadata AS persona_metadata
@@ -2880,9 +3531,18 @@ app.post("/api/rooms/:id/ai/respond", requireAuth, async (req, res) => {
 				);
 				inserted.push(roomMessagePublic(current.rows[0]));
 			}
+
+			if (personaTurns < MAX_PERSONA_TURNS && bubbles.length) {
+				const followups = discoverRoomPersonaFollowups(personaRows, bubbles.join("\n"), persona.id, spokeCounts, queuedIds);
+				for (const nextPersona of followups) {
+					if (personaTurns + queue.length >= MAX_PERSONA_TURNS) break;
+					queue.push(nextPersona);
+					queuedIds.add(String(nextPersona.id));
+				}
+			}
 		}
 		await pool.query(`UPDATE ysong_rooms SET updated_at=now() WHERE id=$1`, [room.id]);
-		return res.json({ messages: inserted, selectedPersonaIds: selected.map((p) => p.id) });
+		return res.json({ messages: inserted, selectedPersonaIds: participantIds });
 	} catch (e) {
 		console.error("POST /api/rooms/:id/ai/respond ERROR", e);
 		return res.status(e?.statusCode || 500).json({ error: "room_ai_failed", message: e?.message || "AI room reply failed" });
@@ -3658,6 +4318,8 @@ const port = process.env.PORT || 8081;
 
 async function startServer() {
 	await ensureWorldSchema();
+	await ensurePromotionSchema();
+	await ensureCuratorSchema();
 	await ensureAiRuleSeeds();
 	await initializeAchievementBaselines();
 	app.listen(port, () => console.log(`YSong API listening on ${port}`));

@@ -74,7 +74,7 @@ jobs:
           SSH_OPTS="-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o HostbasedAuthentication=no -o PubkeyAuthentication=yes -o PubkeyAcceptedKeyTypes=+ssh-ed25519"
           ssh -i "$KEY_FILE" $SSH_OPTS "$VM_USER@$VM_HOST" \
             "sudo apt-get update &&
-             sudo apt-get install -y rsync &&
+             sudo apt-get install -y rsync ffmpeg &&
              sudo mkdir -p /opt/ysong-auth &&
              sudo chown -R \$(whoami):\$(whoami) /opt/ysong-auth"
 

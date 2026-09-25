@@ -156,6 +156,155 @@ app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
 app.use(express.json());
 
+// -------------------- Artwork Studio: server-side image generation --------------------
+function artworkProvider() {
+	const requested = String(process.env.ARTWORK_AI_PROVIDER || "").trim().toLowerCase();
+	if (requested === "openai" || requested === "xai") return requested;
+	if (String(process.env.OPENAI_API_KEY || "").trim()) return "openai";
+	if (String(process.env.XAI_API_KEY || "").trim()) return "xai";
+	return "none";
+}
+
+function artworkCanvasDescription(width, height) {
+	const ratio = width / Math.max(1, height);
+	const orientation = ratio > 1.15 ? "landscape" : ratio < 0.87 ? "portrait" : "square";
+	return { ratio, orientation };
+}
+
+function openAiArtworkSize(width, height) {
+	const { ratio } = artworkCanvasDescription(width, height);
+	if (ratio > 1.15) return "1536x1024";
+	if (ratio < 0.87) return "1024x1536";
+	return "1024x1024";
+}
+
+async function generateArtworkWithOpenAI({ prompt, width, height }) {
+	const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+	if (!apiKey) {
+		const error = new Error("artwork_generation_not_configured");
+		error.code = "artwork_generation_not_configured";
+		throw error;
+	}
+	const { orientation } = artworkCanvasDescription(width, height);
+	const model = String(process.env.OPENAI_IMAGE_MODEL || "gpt-image-2.5-sunburst").trim();
+	const configuredQuality = String(process.env.OPENAI_IMAGE_QUALITY || "auto").trim().toLowerCase();
+	const quality = ["low", "medium", "high", "xhigh", "max", "auto"].includes(configuredQuality) ? configuredQuality : "auto";
+	const size = openAiArtworkSize(width, height);
+	const fullPrompt = `${prompt}\n\nYSong Artwork Studio canvas: ${Math.round(width)}x${Math.round(height)} (${orientation}). Compose for this ${orientation} release-art canvas and leave intentional safe space for any requested typography. Do not add unrelated text.`;
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), Math.max(15000, Number(process.env.OPENAI_IMAGE_TIMEOUT_MS || 120000)));
+	try {
+		const response = await fetch("https://api.openai.com/v1/images/generations", {
+			method: "POST",
+			signal: controller.signal,
+			headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+			body: JSON.stringify({ model, prompt: fullPrompt, n: 1, size, quality, output_format: "png", background: "opaque" }),
+		});
+		const payload = await response.json().catch(() => ({}));
+		if (!response.ok) {
+			console.error("Artwork generation OpenAI error", response.status, payload?.error || payload);
+			const error = new Error(payload?.error?.message || `OpenAI ${response.status}`);
+			error.code = "artwork_generation_failed";
+			throw error;
+		}
+		const item = Array.isArray(payload?.data) ? payload.data[0] : null;
+		const base64 = String(item?.b64_json || "");
+		if (!base64) {
+			const error = new Error("OpenAI returned no image data.");
+			error.code = "artwork_generation_empty";
+			throw error;
+		}
+		return { base64, mimeType: "image/png", model: payload?.model || model, provider: "openai" };
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+async function generateArtworkWithXai({ prompt, width, height }) {
+	const apiKey = String(process.env.XAI_API_KEY || "").trim();
+	if (!apiKey) {
+		const error = new Error("artwork_generation_not_configured");
+		error.code = "artwork_generation_not_configured";
+		throw error;
+	}
+	const { ratio, orientation } = artworkCanvasDescription(width, height);
+	const supportedRatios = [
+		["1:1", 1], ["16:9", 16 / 9], ["9:16", 9 / 16], ["4:3", 4 / 3], ["3:4", 3 / 4],
+		["3:2", 3 / 2], ["2:3", 2 / 3], ["2:1", 2], ["1:2", 1 / 2], ["19.5:9", 19.5 / 9],
+		["9:19.5", 9 / 19.5], ["20:9", 20 / 9], ["9:20", 9 / 20], ["21:9", 21 / 9], ["5:2", 5 / 2],
+	];
+	const aspectRatio = supportedRatios.reduce((best, candidate) =>
+		Math.abs(Math.log(ratio / candidate[1])) < Math.abs(Math.log(ratio / best[1])) ? candidate : best
+	)[0];
+	const resolution = Math.max(width, height) > 1200 ? "2k" : "1k";
+	const qualitySetting = String(process.env.XAI_IMAGE_QUALITY || "auto").trim().toLowerCase();
+	const quality = ["low", "medium", "auto"].includes(qualitySetting) ? qualitySetting : "auto";
+	const model = String(process.env.XAI_IMAGE_MODEL || "grok-imagine-image-2.0").trim();
+	const fullPrompt = `${prompt}\n\nYSong Artwork Studio canvas: ${Math.round(width)}x${Math.round(height)} (${orientation}). Compose for that aspect/orientation and leave intentional safe space for any requested typography.`;
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), Math.max(15000, Number(process.env.XAI_IMAGE_TIMEOUT_MS || 120000)));
+	try {
+		const response = await fetch("https://api.x.ai/v1/images/generations", {
+			method: "POST", signal: controller.signal,
+			headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+			body: JSON.stringify({ model, prompt: fullPrompt, n: 1, aspect_ratio: aspectRatio, resolution, quality, response_format: "b64_json" }),
+		});
+		const payload = await response.json().catch(() => ({}));
+		if (!response.ok) {
+			console.error("Artwork generation xAI error", response.status, payload?.error || payload);
+			const error = new Error(payload?.error?.message || payload?.error || `xAI ${response.status}`);
+			error.code = "artwork_generation_failed";
+			throw error;
+		}
+		const item = Array.isArray(payload?.data) ? payload.data[0] : null;
+		let mimeType = String(item?.mime_type || "image/png");
+		let base64 = String(item?.b64_json || "");
+		if (!base64 && item?.url) {
+			const imageResponse = await fetch(String(item.url));
+			if (!imageResponse.ok) {
+				const error = new Error("Could not fetch generated xAI image.");
+				error.code = "artwork_image_fetch_failed";
+				throw error;
+			}
+			mimeType = imageResponse.headers.get("content-type") || mimeType;
+			base64 = Buffer.from(await imageResponse.arrayBuffer()).toString("base64");
+		}
+		if (!base64) {
+			const error = new Error("xAI returned no image data.");
+			error.code = "artwork_generation_empty";
+			throw error;
+		}
+		return { base64, mimeType, model: payload?.model || model, provider: "xai" };
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+app.post("/api/artwork/generate", requireAuth, async (req, res) => {
+	const prompt = String(req.body?.prompt || "").trim().slice(0, 12000);
+	if (!prompt) return res.status(400).json({ error: "artwork_prompt_required" });
+	const width = Math.max(256, Math.min(4096, Number(req.body?.width) || 1000));
+	const height = Math.max(256, Math.min(4096, Number(req.body?.height) || 1000));
+	const provider = artworkProvider();
+	if (provider === "none") return res.status(503).json({ error: "artwork_generation_not_configured" });
+	try {
+		const result = provider === "xai"
+			? await generateArtworkWithXai({ prompt, width, height })
+			: await generateArtworkWithOpenAI({ prompt, width, height });
+		return res.json({
+			imageDataUrl: `data:${result.mimeType};base64,${result.base64}`,
+			mimeType: result.mimeType,
+			model: result.model,
+			provider: result.provider,
+		});
+	} catch (error) {
+		console.error("Artwork generation failed", error);
+		const code = error?.code || (error?.name === "AbortError" ? "artwork_generation_timeout" : "artwork_generation_failed");
+		const status = code === "artwork_generation_not_configured" ? 503 : 502;
+		return res.status(status).json({ error: code });
+	}
+});
+
 // -------------------- YSong Tools: SEO Intelligence --------------------
 registerMusicSeoRoutes(app, { requireAuth });
 
@@ -207,7 +356,7 @@ function minutesFromNow(mins) {
 function signToken(user) {
 	return jwt.sign({ uid: user.id, email: user.email }, process.env.JWT_SECRET, {
 		algorithm: "HS256",
-		expiresIn: "7d",
+		expiresIn: process.env.AUTH_TOKEN_TTL || "30d",
 	});
 }
 function authFromHeader(req) {
@@ -2664,6 +2813,56 @@ async function callOpenAI(input, { maxOutputTokens } = {}) {
 		: "";
 	return { text: text || "…", local: false };
 }
+
+
+function parseJsonObjectLoose(text) {
+	const raw = String(text || "").trim();
+	const candidates = [raw, raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")];
+	const match = raw.match(/\{[\s\S]*\}/);
+	if (match) candidates.push(match[0]);
+	for (const candidate of candidates) {
+		try { const parsed = JSON.parse(candidate); if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed; } catch {}
+	}
+	return null;
+}
+
+app.post("/api/critique/ai-summary", requireAuth, async (req, res) => {
+	try {
+		const report = req.body?.report;
+		if (!report || typeof report !== "object") return res.status(400).json({ error: "critique_report_required" });
+		const findings = Array.isArray(report.findings) ? report.findings.slice(0, 24).map((row) => ({
+			severity: String(row?.severity || "info"), category: String(row?.category || ""), title: String(row?.title || ""),
+			detail: String(row?.detail || "").slice(0, 700), recommendation: String(row?.recommendation || "").slice(0, 700),
+			start_seconds: Number.isFinite(Number(row?.start_seconds)) ? Number(row.start_seconds) : null,
+			frequency_low_hz: Number.isFinite(Number(row?.frequency_low_hz)) ? Number(row.frequency_low_hz) : null,
+			frequency_high_hz: Number.isFinite(Number(row?.frequency_high_hz)) ? Number(row.frequency_high_hz) : null,
+			confidence: Number.isFinite(Number(row?.confidence)) ? Number(row.confidence) : null,
+		})) : [];
+		const evidence = {
+			engine: String(report.engine || "YSong Ears"), technical_score: Number(report.technical_score || 0), verdict: String(report.verdict || ""),
+			finding_counts: report.finding_counts || {}, category_scores: report.category_scores || {}, metrics: report.metrics || {}, findings,
+			limitations: Array.isArray(report.limitations) ? report.limitations.slice(0, 12).map((x) => String(x).slice(0, 500)) : [],
+		};
+		const answer = await callOpenAI([
+			{ role: "developer", content: `You are YSong AI Critic, a candid but useful mix-review assistant. You are given deterministic technical evidence from YSong Ears. Interpret ONLY that evidence; never claim you literally heard the audio and never invent defects, instruments, genre, emotional quality, songwriting quality, or aesthetic judgments that the evidence does not support. Be direct and artist-friendly. If the technical evidence is clean, say so instead of manufacturing criticism. Tempo can be octave-ambiguous, so honor estimated_bpm, alternate_bpm, and interpretation when present. Return JSON only with exactly: {"headline":string,"summary":string,"readiness_score":number|null,"strengths":string[],"priorities":string[],"caveats":string[]}. readiness_score is a 0-100 technical/mix-readiness interpretation grounded in the supplied technical score and findings, not a songwriting score. strengths max 4, priorities max 5, caveats max 3.` },
+			{ role: "user", content: JSON.stringify(evidence) },
+		], { maxOutputTokens: 1100 });
+		const parsed = parseJsonObjectLoose(answer.text);
+		if (!parsed) throw Object.assign(new Error("AI critic returned an unreadable response."), { statusCode: 502 });
+		const list = (value, max) => Array.isArray(value) ? value.map((x) => String(x || "").trim()).filter(Boolean).slice(0, max) : [];
+		const scoreValue = Number(parsed.readiness_score);
+		return res.json({
+			headline: String(parsed.headline || "YSong AI Critic").slice(0, 180),
+			summary: String(parsed.summary || "No additional AI summary was returned.").slice(0, 2400),
+			readiness_score: Number.isFinite(scoreValue) ? Math.max(0, Math.min(100, scoreValue)) : null,
+			strengths: list(parsed.strengths, 4), priorities: list(parsed.priorities, 5), caveats: list(parsed.caveats, 3),
+			model: process.env.OPENAI_MODEL || "gpt-5.6",
+		});
+	} catch (e) {
+		console.error("POST /api/critique/ai-summary ERROR", e);
+		return res.status(e?.statusCode || 500).json({ error: e?.message === "openai_key_missing" ? "openai_key_missing" : "ai_critique_failed", message: e?.message || "AI critique failed." });
+	}
+});
 
 function parsePersonaBubblePlan(text) {
 	const raw = String(text || "").trim();

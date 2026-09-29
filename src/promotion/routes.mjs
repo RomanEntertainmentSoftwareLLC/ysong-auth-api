@@ -9,6 +9,7 @@ import { inspectPromotionRenderRuntime, probeMedia, renderPromotionCreative } fr
 import { ALL_COUNTRY_CODES, COUNTRY_TIERS, PROMOTION_PLATFORM_CATALOG, describeCountries } from "./catalog.mjs";
 import { stockProviderStatus, searchStockVideos, resolveStockVideoForImport, downloadStockFile } from "./stock.mjs";
 import { buildPromotionIntelligence } from "./intelligence.mjs";
+import { AdsDraftSchema, draftToStorage, storageToDraft, projectAdsCampaign } from "./ads-contract.mjs";
 import {
   META_GRAPH_VERSION,
   completeMetaOAuth,
@@ -266,6 +267,15 @@ function mapSnippet(row) { return { id:String(row.id), adCampaignId:String(row.a
 function mapBackground(row) { return { id:String(row.id), libraryId:row.library_id?String(row.library_id):null, objectKey:row.object_key, originalName:row.original_name, durationSeconds:row.duration_seconds==null?null:Number(row.duration_seconds), width:row.width==null?null:Number(row.width), height:row.height==null?null:Number(row.height), metadata:row.metadata||{}, createdAt:row.created_at }; }
 function mapCreative(row) { return { id:String(row.id), adCampaignId:String(row.ad_campaign_id), libraryId:row.library_id?String(row.library_id):null, audioSnippetId:String(row.audio_snippet_id), backgroundVideoId:String(row.background_video_id), status:row.status, selected:!!row.selected, objectKey916:row.object_key_916, objectKey43:row.object_key_43, durationSeconds:row.duration_seconds==null?null:Number(row.duration_seconds), renderError:row.render_error, metaVideoId916:row.meta_video_id_916, metaVideoId43:row.meta_video_id_43, metaAdIds:row.meta_ad_ids||[], metadata:row.metadata||{}, createdAt:row.created_at, updatedAt:row.updated_at }; }
 async function adCampaignOwned(id,userId){ const {rows}=await pool.query(`SELECT * FROM promotion_ad_campaigns WHERE id=$1 AND owner_user_id=$2 LIMIT 1`,[id,userId]); return rows[0]||null; }
+async function adsContractFor(ad,userId){
+  const [smart,destinations,creatives,snippets]=await Promise.all([
+    campaignOwned(ad.campaign_id,userId),
+    pool.query(`SELECT * FROM promotion_destinations WHERE campaign_id=$1 ORDER BY position ASC,created_at ASC`,[ad.campaign_id]),
+    pool.query(`SELECT id,status,selected,audio_snippet_id FROM promotion_ad_creatives WHERE ad_campaign_id=$1 ORDER BY created_at ASC`,[ad.id]),
+    pool.query(`SELECT id FROM promotion_audio_snippets WHERE ad_campaign_id=$1 ORDER BY created_at ASC`,[ad.id]),
+  ]);
+  return projectAdsCampaign(ad,{smartLink:smart,destinations:destinations.rows,creatives:creatives.rows,snippets:snippets.rows});
+}
 async function loadPaidAnalyticsEnvelope(ad,userId,query={}){
   const range=analyticsRange(ad,query||{}); const ysong=await ysongPaidAttribution(ad,range.since,range.until);
   let meta={summary:{},daily:[],adSets:[],ads:[],placements:[],countries:[],warnings:[]}; let capturedAt=null; let stale=false; const warnings=[];
@@ -432,6 +442,57 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
       },
       creativeLimits:{audioSnippets:3,backgroundVideosPerBatch:5,maxGeneratedPerBatch:15,maxSnippetSeconds:60,maxBackgroundSeconds:60},
     });
+  });
+
+  // Stable Ads surface over Promotion's existing campaign and creative owners.
+  app.get(`${ROOT}/ads/campaigns`, requireAuth, async (req,res)=>{
+    const {rows}=await pool.query(`SELECT * FROM promotion_ad_campaigns WHERE owner_user_id=$1 ORDER BY updated_at DESC`,[req.user.id]);
+    res.json({campaigns:await Promise.all(rows.map(row=>adsContractFor(row,req.user.id)))});
+  });
+  app.get(`${ROOT}/ads/campaigns/:id`, requireAuth, async (req,res)=>{
+    const ad=await adCampaignOwned(req.params.id,req.user.id);
+    if(!ad)return res.status(404).json({error:"ad_campaign_not_found"});
+    res.json({campaign:await adsContractFor(ad,req.user.id)});
+  });
+  app.post(`${ROOT}/ads/campaigns`, requireAuth, async (req,res)=>{
+    try{
+      const input=draftToStorage(AdsDraftSchema.parse(req.body||{}));
+      const smart=await campaignOwned(input.campaignId,req.user.id);
+      if(!smart)return res.status(404).json({error:"campaign_not_found"});
+      if(input.sourceTrackId){
+        const {rows}=await pool.query(`SELECT id FROM world_tracks WHERE id=$1 AND owner_user_id=$2 LIMIT 1`,[input.sourceTrackId,req.user.id]);
+        if(!rows[0])return res.status(404).json({error:"source_track_not_found"});
+      }
+      const {rows}=await pool.query(`INSERT INTO promotion_ad_campaigns(
+        id,owner_user_id,campaign_id,source_track_id,name,goal,genre,genre_source,daily_budget_minor,currency,schedule_start,schedule_end,timezone,placements,targeting,ad_text,ad_headline,language,cover_art_object_key
+      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15::jsonb,$16,$17,$18,$19) RETURNING *`,[
+        crypto.randomUUID(),req.user.id,input.campaignId,input.sourceTrackId,input.name,input.goal,input.genre||smart.genre||"",input.genreSource,input.dailyBudgetMinor,input.currency,
+        input.scheduleStart?new Date(input.scheduleStart):null,input.scheduleEnd?new Date(input.scheduleEnd):null,input.timezone,JSON.stringify(input.placements),JSON.stringify(input.targeting),input.adText,input.adHeadline,input.language,smart.artwork_object_key||null,
+      ]);
+      res.status(201).json({campaign:await adsContractFor(rows[0],req.user.id)});
+    }catch(e){if(e instanceof z.ZodError)return res.status(400).json({error:"invalid_ads_draft",issues:e.issues});console.error("ads draft create",e);res.status(500).json({error:"ads_draft_create_failed"});}
+  });
+  app.patch(`${ROOT}/ads/campaigns/:id`, requireAuth, async (req,res)=>{
+    const current=await adCampaignOwned(req.params.id,req.user.id);
+    if(!current)return res.status(404).json({error:"ad_campaign_not_found"});
+    if(current.meta_campaign_id||!["draft","ready","failed"].includes(current.status))return res.status(409).json({error:"ads_draft_locked"});
+    try{
+      const prior=storageToDraft(current);
+      const body=req.body||{};
+      const merged={...prior,...body,dailyBudget:{...prior.dailyBudget,...body.dailyBudget},schedule:{...prior.schedule,...body.schedule},audience:{...prior.audience,...body.audience},copy:{...prior.copy,...body.copy}};
+      const input=draftToStorage(AdsDraftSchema.parse(merged));
+      input.targeting={...(current.targeting||{}),...input.targeting};
+      if(input.campaignId!==String(current.campaign_id))return res.status(409).json({error:"smart_link_change_not_supported"});
+      if(input.sourceTrackId){
+        const {rows}=await pool.query(`SELECT id FROM world_tracks WHERE id=$1 AND owner_user_id=$2 LIMIT 1`,[input.sourceTrackId,req.user.id]);
+        if(!rows[0])return res.status(404).json({error:"source_track_not_found"});
+      }
+      const {rows}=await pool.query(`UPDATE promotion_ad_campaigns SET source_track_id=$3,name=$4,goal=$5,genre=$6,genre_source=$7,daily_budget_minor=$8,currency=$9,schedule_start=$10,schedule_end=$11,timezone=$12,placements=$13::jsonb,targeting=$14::jsonb,ad_text=$15,ad_headline=$16,language=$17,updated_at=now() WHERE id=$1 AND owner_user_id=$2 AND meta_campaign_id='' AND status IN ('draft','ready','failed') RETURNING *`,[
+        current.id,req.user.id,input.sourceTrackId,input.name,input.goal,input.genre,input.genreSource,input.dailyBudgetMinor,input.currency,input.scheduleStart?new Date(input.scheduleStart):null,input.scheduleEnd?new Date(input.scheduleEnd):null,input.timezone,JSON.stringify(input.placements),JSON.stringify(input.targeting),input.adText,input.adHeadline,input.language,
+      ]);
+      if(!rows[0])return res.status(409).json({error:"ads_draft_locked"});
+      res.json({campaign:await adsContractFor(rows[0],req.user.id)});
+    }catch(e){if(e instanceof z.ZodError)return res.status(400).json({error:"invalid_ads_draft",issues:e.issues});console.error("ads draft update",e);res.status(500).json({error:"ads_draft_update_failed"});}
   });
 
   app.get(`${ROOT}/ad-campaigns`, requireAuth, async (req,res)=>{

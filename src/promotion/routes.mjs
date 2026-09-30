@@ -690,9 +690,23 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
       if(!probe.video) throw new Error("video_stream_required");
       const duration=Number(probe.video.duration||probe.duration||resolved.video.durationSeconds||0);
       if(duration>60.25) throw new Error("background_video_too_long");
-      const provenance=resolved.video.provenance||{provider,providerId:resolved.video.id,sourceUrl:resolved.video.pageUrl,attribution:stockProviderStatus()[provider] ? {label:`Videos provided by ${stockProviderStatus()[provider].label}`,url:stockProviderStatus()[provider].attributionUrl} : null,contributor:resolved.video.contributor};
-      await writeObjectMetadata(key,{userId:String(req.user.id),originalName,contentType:downloaded.contentType||"video/mp4",size:downloaded.bytes,createdAt:new Date().toISOString(),source:"stock",stockProvider:provider,stockId:resolved.video.id,stockPageUrl:provenance.sourceUrl,contributor:provenance.contributor});
-      const metadata={source:"stock",provider,stockId:resolved.video.id,pageUrl:provenance.sourceUrl,previewImage:resolved.video.previewImage,contributor:provenance.contributor,selectedFile:resolved.selectedFile,provenance,attribution:provenance.attribution};
+      const providerProvenance=resolved.video.provenance||{};
+      const importedAt=new Date().toISOString();
+      const canonicalSourceReference=providerProvenance.canonicalSourceReference||providerProvenance.sourceUrl||resolved.video.pageUrl||null;
+      const creator=providerProvenance.creator??providerProvenance.contributor??null;
+      // License and attribution are recorded only when the provider's asset response supplies them.
+      const provenance={
+        provider:providerProvenance.provider||provider,
+        providerAssetId:String(providerProvenance.providerAssetId||providerProvenance.providerId||resolved.video.id),
+        creator,
+        canonicalSourceReference,
+        importedAt,
+        ...(providerProvenance.attribution!=null?{attribution:providerProvenance.attribution}:{}),
+        ...(providerProvenance.license!=null?{license:providerProvenance.license}:{}),
+        ...(providerProvenance.licenseUrl!=null?{licenseUrl:providerProvenance.licenseUrl}:{}),
+      };
+      await writeObjectMetadata(key,{userId:String(req.user.id),originalName,contentType:downloaded.contentType||"video/mp4",size:downloaded.bytes,createdAt:importedAt,source:"stock",stockProvider:provenance.provider,stockId:provenance.providerAssetId,stockPageUrl:canonicalSourceReference,contributor:creator,provenance});
+      const metadata={source:"stock",provider:provenance.provider,providerAssetId:provenance.providerAssetId,stockId:provenance.providerAssetId,pageUrl:canonicalSourceReference,previewImage:resolved.video.previewImage,creator,contributor:creator,selectedFile:resolved.selectedFile,importedAt,provenance,...(provenance.attribution!=null?{attribution:provenance.attribution}:{}),...(provenance.license!=null?{license:provenance.license}:{}),...(provenance.licenseUrl!=null?{licenseUrl:provenance.licenseUrl}:{})};
       const {rows}=await pool.query(`INSERT INTO promotion_background_videos(id,owner_user_id,library_id,object_key,original_name,duration_seconds,width,height,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) RETURNING *`,[crypto.randomUUID(),req.user.id,libraryId,key,originalName,duration||null,probe.video.width||resolved.selectedFile.width||null,probe.video.height||resolved.selectedFile.height||null,JSON.stringify(metadata)]);
       res.status(201).json({backgroundVideo:mapBackground(rows[0])});
     }catch(e){

@@ -92,10 +92,13 @@ function normalizePexelsVideo(video) {
       id: String(file?.id || ""), quality: String(file?.quality || ""), fileType: String(file?.file_type || ""),
       width: Number(file?.width || 0), height: Number(file?.height || 0), fps: Number(file?.fps || 0),
     })),
+    // Keep asset-level provenance separate from provider-wide search guidance.
+    // Pexels video responses do not currently include asset license/attribution fields.
     provenance: {
-      provider: "pexels", providerId: id, sourceUrl: pageUrl,
-      attribution: { label: "Videos provided by Pexels", url: "https://www.pexels.com/" },
-      contributor,
+      provider: "pexels", providerAssetId: id, canonicalSourceReference: pageUrl,
+      creator: video?.user && (video.user.id != null || video.user.name || video.user.url)
+        ? { id: video.user.id == null ? null : String(video.user.id), name: video.user.name == null ? null : String(video.user.name), url: video.user.url == null ? null : String(video.user.url) }
+        : null,
     },
   };
 }

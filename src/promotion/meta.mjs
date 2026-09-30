@@ -6,6 +6,7 @@ import { decryptSecret, encryptSecret, promotionSecretsConfigured } from "./cryp
 import { fetchMetaInterests, parseMetaInterestSearch } from "./meta-interests.mjs";
 import { fetchMetaReachEstimate } from "./meta-reach.mjs";
 import { metaDeliveryState } from "./meta-delivery.mjs";
+import { fanLeadEvent, postMetaEvent } from "./meta-conversions.mjs";
 
 export const META_GRAPH_VERSION = String(process.env.META_GRAPH_VERSION || "v26.0").replace(/^([^v])/, "v$1");
 const GRAPH = `https://graph.facebook.com/${META_GRAPH_VERSION}`;
@@ -147,6 +148,11 @@ export async function listMetaPixels(userId, adAccountId, connectionId = "") {
   const { token } = await marketingToken(userId, connectionId);
   const rows = await graphCollection(`${GRAPH}/${actId(adAccountId)}/adspixels`, { fields: "id,name,last_fired_time,is_created_by_business", limit: "200", access_token: token });
   return rows.map((r) => ({ id: String(r.id || ""), name: r.name || "Pixel", lastFiredTime: r.last_fired_time || null }));
+}
+export async function sendMetaFanLead({ userId, connectionId, pixelId, email, eventId, eventSourceUrl, consent }) {
+  const event = fanLeadEvent({ consent, email, eventId, eventSourceUrl });
+  const { token } = await marketingToken(userId, connectionId);
+  return postMetaEvent({ graphBase: GRAPH, pixelId, token, event });
 }
 async function graphCollection(endpoint, params) {
   const rows = [];

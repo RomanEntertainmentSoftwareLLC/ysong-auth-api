@@ -26,6 +26,7 @@ import {
   selectMetaConnection,
   listMetaAdAccounts,
   listMetaPixels,
+  sendMetaFanLead,
   searchMetaInterests,
   estimateMetaReach,
   createMetaPaidCampaign,
@@ -61,6 +62,7 @@ const EventSchema = z.object({
 const FanSchema = z.object({
   email: z.string().email().max(320),
   consent: z.literal(true),
+  metaTrackingConsent: z.boolean().optional().default(false),
   source: z.string().max(80).optional().default("landing_page"),
   provider: z.string().max(80).optional().default(""),
   visitorId: z.string().max(160).optional().default(""),
@@ -965,6 +967,24 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
   app.get(`/api/promotion/public/:slug/artwork`, async (req,res)=>{ try{const row=await campaignPublic(String(req.params.slug||"")); if(!row||!row.artwork_object_key)return res.status(404).end(); const file=objectPath(row.artwork_object_key); const meta=await readObjectMetadata(row.artwork_object_key); await fs.promises.access(file,fs.constants.R_OK); res.setHeader("Content-Type",meta.contentType||"application/octet-stream"); res.setHeader("Cache-Control","public, max-age=3600"); fs.createReadStream(file).pipe(res);}catch{return res.status(404).end();} });
   app.get(`/api/promotion/public/:slug/qr.svg`, async (req,res)=>{ const row=await campaignPublic(String(req.params.slug||"")); if(!row)return res.status(404).end(); try{const svg=qrSvg(landingUrl(row.slug));res.setHeader("Content-Type","image/svg+xml; charset=utf-8");res.setHeader("Cache-Control","public, max-age=3600");res.send(svg);}catch(e){res.status(500).json({error:"qr_generation_failed",message:e.message});} });
   app.post(`/api/promotion/public/:slug/events`, async (req,res)=>{ try{const row=await campaignPublic(String(req.params.slug||"")); if(!row)return res.status(404).json({error:"campaign_not_found"}); const input=EventSchema.parse(req.body||{}); const attribution=await verifiedAttribution(pool.query.bind(pool),row.id,input.metadata); await recordEvent(row.id,input.eventType,req,{destinationId:input.destinationId||null,visitorId:input.visitorId,metadata:eventMetadataWithAttribution(input.metadata,attribution)}); res.status(202).json({ok:true});}catch(e){if(e instanceof z.ZodError)return res.status(400).json({error:"invalid_event"});res.status(500).json({error:"event_failed"});} });
-  app.post(`/api/promotion/public/:slug/fans`, async (req,res)=>{ try{const row=await campaignPublic(String(req.params.slug||"")); if(!row)return res.status(404).json({error:"campaign_not_found"}); const input=FanSchema.parse(req.body||{}); const attribution=await verifiedAttribution(pool.query.bind(pool),row.id,input); await pool.query(`INSERT INTO promotion_fans(id,campaign_id,email,consent,source,provider,metadata) VALUES($1,$2,$3,true,$4,$5,$6::jsonb) ON CONFLICT (campaign_id, (lower(email))) DO UPDATE SET consent=true,source=EXCLUDED.source,provider=EXCLUDED.provider,metadata=promotion_fans.metadata||EXCLUDED.metadata`,[crypto.randomUUID(),row.id,input.email.trim().toLowerCase(),input.source,input.provider,JSON.stringify({visitorId:input.visitorId,...attribution})]); await recordEvent(row.id,"email_capture",req,{visitorId:input.visitorId,metadata:{provider:input.provider,...attribution}}); res.status(201).json({ok:true});}catch(e){if(e instanceof z.ZodError)return res.status(400).json({error:"invalid_fan_capture"});console.error("fan capture",e);res.status(500).json({error:"fan_capture_failed"});} });
+  app.post(`/api/promotion/public/:slug/fans`, async (req,res)=>{ try{
+    const row=await campaignPublic(String(req.params.slug||""));
+    if(!row)return res.status(404).json({error:"campaign_not_found"});
+    const input=FanSchema.parse(req.body||{});
+    const attribution=await verifiedAttribution(pool.query.bind(pool),row.id,input);
+    const fanId=crypto.randomUUID();
+    const email=input.email.trim().toLowerCase();
+    const inserted=await pool.query(`INSERT INTO promotion_fans(id,campaign_id,email,consent,source,provider,metadata) VALUES($1,$2,$3,true,$4,$5,$6::jsonb) ON CONFLICT (campaign_id, (lower(email))) DO NOTHING RETURNING id`,[fanId,row.id,email,input.source,input.provider,JSON.stringify({visitorId:input.visitorId,...attribution})]);
+    if(!inserted.rowCount) await pool.query(`UPDATE promotion_fans SET consent=true,source=$3,provider=$4,metadata=metadata||$5::jsonb WHERE campaign_id=$1 AND lower(email)=$2`,[row.id,email,input.source,input.provider,JSON.stringify({visitorId:input.visitorId,...attribution})]);
+    await recordEvent(row.id,"email_capture",req,{visitorId:input.visitorId,metadata:{provider:input.provider,...attribution}});
+    if(inserted.rowCount && input.metaTrackingConsent && attribution.adCampaignId && isPublicHttpUrl(landingUrl(row.slug))) {
+      try {
+        const {rows}=await pool.query(`SELECT a.meta_pixel_id,a.meta_connection_id,a.owner_user_id FROM promotion_ad_campaigns a JOIN promotion_meta_profiles p ON p.owner_user_id=a.owner_user_id AND p.selected_connection_id=a.meta_connection_id AND p.selected_pixel_id=a.meta_pixel_id WHERE a.id=$1 AND a.campaign_id=$2 AND a.meta_campaign_id<>'' AND a.meta_pixel_id<>'' AND a.meta_connection_id IS NOT NULL LIMIT 1`,[attribution.adCampaignId,row.id]);
+        const ad=rows[0];
+        if(ad) await sendMetaFanLead({userId:ad.owner_user_id,connectionId:ad.meta_connection_id,pixelId:ad.meta_pixel_id,email,eventId:fanId,eventSourceUrl:landingUrl(row.slug),consent:true});
+      } catch(e) { console.error("Meta fan lead submission failed",e?.message||"unknown error"); }
+    }
+    res.status(201).json({ok:true});
+  }catch(e){if(e instanceof z.ZodError)return res.status(400).json({error:"invalid_fan_capture"});console.error("fan capture",e);res.status(500).json({error:"fan_capture_failed"});} });
   app.get(`/api/promotion/r/:slug/:destinationId`, async (req,res)=>{ const row=await campaignPublic(String(req.params.slug||"")); if(!row)return res.status(404).send("Campaign not found"); const {rows}=await pool.query(`SELECT * FROM promotion_destinations WHERE id=$1 AND campaign_id=$2 AND enabled=true LIMIT 1`,[req.params.destinationId,row.id]); const d=rows[0]; if(!d)return res.status(404).send("Destination not found"); const attribution=await verifiedAttribution(pool.query.bind(pool),row.id,req.query); await recordEvent(row.id,"click",req,{destinationId:d.id,visitorId:String(req.query.v||""),metadata:attribution}); if(d.destination_kind==="presave") await recordEvent(row.id,"presave_intent",req,{destinationId:d.id,visitorId:String(req.query.v||""),metadata:attribution}); res.redirect(302,d.url); });
 }

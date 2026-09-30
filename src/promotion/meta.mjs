@@ -51,7 +51,9 @@ export async function createMetaOAuthUrl(userId, req) {
   const state = crypto.randomBytes(32).toString("base64url");
   await pool.query(`DELETE FROM promotion_oauth_states WHERE expires_at < now()`);
   await pool.query(`INSERT INTO promotion_oauth_states(state_hash,owner_user_id,expires_at) VALUES($1,$2,now()+interval '10 minutes')`, [stateHash(state), userId]);
-  const params = new URLSearchParams({ client_id: process.env.META_APP_ID, redirect_uri: metaRedirectUri(req), state, response_type: "code", scope: META_SCOPES.join(",") });
+  const params = new URLSearchParams({ client_id: process.env.META_APP_ID, redirect_uri: metaRedirectUri(req), state, response_type: "code" });
+  if (process.env.META_BUSINESS_LOGIN_CONFIG_ID) params.set("config_id", process.env.META_BUSINESS_LOGIN_CONFIG_ID);
+  else params.set("scope", META_SCOPES.join(","));
   return `${FACEBOOK}/dialog/oauth?${params.toString()}`;
 }
 async function consumeState(state) {
@@ -72,8 +74,7 @@ export async function completeMetaOAuth({ code, state, req }) {
     if (long.access_token) userToken = String(long.access_token);
   } catch {}
   const me = await jsonFetch(`${GRAPH}/me?${new URLSearchParams({ fields: "id,name", access_token: userToken }).toString()}`).catch(() => ({}));
-  const accounts = await jsonFetch(`${GRAPH}/me/accounts?${new URLSearchParams({ fields: "id,name,access_token,tasks,instagram_business_account{id,username,name}", access_token: userToken }).toString()}`);
-  const rows = Array.isArray(accounts.data) ? accounts.data : [];
+  const rows = await graphCollection(`${GRAPH}/me/accounts`, { fields: "id,name,access_token,tasks,instagram_business_account{id,username,name}", limit: "200", access_token: userToken });
   if (!rows.length) throw new Error("meta_no_managed_pages");
   const existing = await pool.query(`SELECT page_id FROM promotion_meta_connections WHERE owner_user_id=$1 AND is_active=true LIMIT 1`, [userId]);
   const alreadyActive = existing.rows[0]?.page_id || "";
@@ -107,6 +108,8 @@ export async function selectMetaConnection(userId, id) {
 export async function disconnectMeta(userId, id = null) {
   if (id) await pool.query(`DELETE FROM promotion_meta_connections WHERE owner_user_id=$1 AND id=$2`, [userId, id]);
   else await pool.query(`DELETE FROM promotion_meta_connections WHERE owner_user_id=$1`, [userId]);
+  if (id) await pool.query(`DELETE FROM promotion_meta_profiles WHERE owner_user_id=$1 AND selected_connection_id=$2`, [userId, id]);
+  else await pool.query(`DELETE FROM promotion_meta_profiles WHERE owner_user_id=$1`, [userId]);
 }
 async function activeConnection(userId, connectionId = "") {
   const params = connectionId ? [userId, connectionId] : [userId];
@@ -129,8 +132,8 @@ export const META_DSA_COUNTRIES = Object.freeze([
 export async function listMetaAdAccounts(userId, connectionId = "") {
   const { token } = await marketingToken(userId, connectionId);
   const fields = "id,account_id,name,account_status,currency,timezone_name,disable_reason,business{id,name},amount_spent,balance,spend_cap,default_dsa_beneficiary,default_dsa_payor";
-  const data = await jsonFetch(`${GRAPH}/me/adaccounts?${new URLSearchParams({ fields, limit: "200", access_token: token }).toString()}`);
-  return (data.data || []).map((r) => ({
+  const rows = await graphCollection(`${GRAPH}/me/adaccounts`, { fields, limit: "200", access_token: token });
+  return rows.map((r) => ({
     id: plainAdAccountId(r.account_id || r.id), graphId: actId(r.account_id || r.id), name: r.name || "Ad account",
     accountStatus: Number(r.account_status || 0), currency: r.currency || "", timezone: r.timezone_name || "", disableReason: Number(r.disable_reason || 0), business: r.business || null,
     amountSpentMinor: Number(r.amount_spent || 0), balanceMinor: Number(r.balance || 0), spendCapMinor: Number(r.spend_cap || 0),
@@ -139,8 +142,25 @@ export async function listMetaAdAccounts(userId, connectionId = "") {
 }
 export async function listMetaPixels(userId, adAccountId, connectionId = "") {
   const { token } = await marketingToken(userId, connectionId);
-  const data = await jsonFetch(`${GRAPH}/${actId(adAccountId)}/adspixels?${new URLSearchParams({ fields: "id,name,last_fired_time,is_created_by_business", limit: "200", access_token: token }).toString()}`);
-  return (data.data || []).map((r) => ({ id: String(r.id || ""), name: r.name || "Pixel", lastFiredTime: r.last_fired_time || null }));
+  const rows = await graphCollection(`${GRAPH}/${actId(adAccountId)}/adspixels`, { fields: "id,name,last_fired_time,is_created_by_business", limit: "200", access_token: token });
+  return rows.map((r) => ({ id: String(r.id || ""), name: r.name || "Pixel", lastFiredTime: r.last_fired_time || null }));
+}
+async function graphCollection(endpoint, params) {
+  const rows = [];
+  const seen = new Set();
+  let after = "";
+  for (let page = 0; page < 50; page++) {
+    const query = new URLSearchParams(params);
+    if (after) query.set("after", after);
+    const data = await jsonFetch(`${endpoint}?${query.toString()}`);
+    rows.push(...(Array.isArray(data.data) ? data.data : []));
+    const next = String(data.paging?.cursors?.after || "");
+    if (!data.paging?.next || !next) return rows;
+    if (seen.has(next)) throw new Error("meta_pagination_loop");
+    seen.add(next);
+    after = next;
+  }
+  throw new Error("meta_pagination_limit");
 }
 export async function searchMetaInterests(userId, query, limit = 20, connectionId = "") {
   const { token } = await marketingToken(userId, connectionId);

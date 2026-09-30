@@ -95,6 +95,10 @@ export async function ensurePromotionSchema() {
       selected_pixel_id text NOT NULL DEFAULT '',
       updated_at timestamptz NOT NULL DEFAULT now()
     );
+    ALTER TABLE promotion_meta_profiles ADD COLUMN IF NOT EXISTS selected_connection_id uuid;
+    ALTER TABLE promotion_meta_profiles ADD COLUMN IF NOT EXISTS selected_business_id text NOT NULL DEFAULT '';
+    ALTER TABLE promotion_meta_profiles ADD COLUMN IF NOT EXISTS selected_page_id text NOT NULL DEFAULT '';
+    ALTER TABLE promotion_meta_profiles ADD COLUMN IF NOT EXISTS selected_instagram_user_id text NOT NULL DEFAULT '';
 
     CREATE TABLE IF NOT EXISTS promotion_oauth_states (
       state_hash text PRIMARY KEY,

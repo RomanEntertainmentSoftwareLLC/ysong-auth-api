@@ -12,6 +12,7 @@ import { eventMetadataWithAttribution, verifiedAttribution } from "./attribution
 import { stockProviderStatus, searchStockVideos, resolveStockVideoForImport, downloadStockFile } from "./stock.mjs";
 import { buildPromotionIntelligence } from "./intelligence.mjs";
 import { AdsDraftSchema, draftToStorage, storageToDraft, projectAdsCampaign } from "./ads-contract.mjs";
+import { assertMetaAssetSelection, metaAssetInventory } from "./meta-assets.mjs";
 import {
   META_GRAPH_VERSION,
   completeMetaOAuth,
@@ -338,6 +339,10 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
     else if(Number(account.accountStatus)!==1)errors.push({code:'meta_ad_account_inactive',message:`The selected Meta Ad Account is not active (status ${account.accountStatus}).`});
     if(account?.currency&&ad.currency&&String(account.currency).toUpperCase()!==String(ad.currency).toUpperCase())errors.push({code:'meta_currency_mismatch',message:`Draft budget currency is ${ad.currency}, but the Meta Ad Account bills in ${account.currency}. Save the campaign using the ad account currency before publishing.`});
     if(needsInstagram&&!connection?.instagramUserId)errors.push({code:'meta_instagram_required',message:'Instagram placements were selected, but this Page has no linked Instagram professional account.'});
+    if(ad.meta_pixel_id&&account){
+      try{const pixels=await listMetaPixels(userId,account.id,String(ad.meta_connection_id||''));if(!pixels.some(p=>String(p.id)===String(ad.meta_pixel_id)))errors.push({code:'meta_pixel_unavailable',message:'The selected Pixel is not available to this Ad Account.'});}
+      catch(e){errors.push({code:'meta_pixel_lookup_failed',message:e?.message||'The selected Pixel could not be verified.'});}
+    }
     if(!countries.length)errors.push({code:'target_countries_required',message:'Choose at least one audience country. YSong will not silently default a paid campaign to the United States.'});
     if(!placementTargets.length)errors.push({code:'placements_required',message:'Choose at least one Facebook or Instagram placement.'});
     if(Number(ad.daily_budget_minor||0)<100)errors.push({code:'budget_too_low',message:'Daily budget must be at least 1.00 in the ad account currency.'});
@@ -346,7 +351,7 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
     for(const c of creatives){if(needsVertical&&!c.object_key_916)errors.push({code:'vertical_asset_missing',message:`Creative ${String(c.id).slice(0,8)} is missing its 9:16 render.`});if(needsFeed&&!c.object_key_43)errors.push({code:'feed_asset_missing',message:`Creative ${String(c.id).slice(0,8)} is missing its 4:3 render.`});}
     if(needsDsa&&(!effectiveDsaBeneficiary||!effectiveDsaPayor))errors.push({code:'dsa_disclosure_required',message:'This audience includes EU/EEA countries. Meta requires beneficiary and payor disclosure information for the ad set.'});
     if(!Array.isArray(targeting.interests)||!targeting.interests.length)warnings.push({code:'broad_interest_targeting',message:'No Meta interests are selected. The campaign will rely on demographics, geography, and placements only.'});
-    const fpPayload={ad:{id:String(ad.id),updatedAt:new Date(ad.updated_at).toISOString(),name:ad.name,dailyBudgetMinor:Number(ad.daily_budget_minor),currency:ad.currency,scheduleStart:ad.schedule_start||null,scheduleEnd:ad.schedule_end||null,timezone:ad.timezone,targeting,adText:ad.ad_text,adHeadline:ad.ad_headline,language:ad.language,metaConnectionId:ad.meta_connection_id?String(ad.meta_connection_id):null,metaAdAccountId:ad.meta_ad_account_id,metaPixelId:ad.meta_pixel_id,dsaBeneficiary:effectiveDsaBeneficiary,dsaPayor:effectiveDsaPayor},smart:smart?{id:String(smart.id),slug:smart.slug,status:smart.status,updatedAt:new Date(smart.updated_at).toISOString()}:null,destinations:destinations.map(d=>({id:d.id,platform:d.platform,url:d.url,enabled:d.enabled})).sort((a,b)=>String(a.id).localeCompare(String(b.id))),creatives:creatives.map(c=>({id:String(c.id),objectKey916:c.object_key_916,objectKey43:c.object_key_43})).sort((a,b)=>a.id.localeCompare(b.id))};
+    const fpPayload={ad:{id:String(ad.id),updatedAt:new Date(ad.updated_at).toISOString(),name:ad.name,dailyBudgetMinor:Number(ad.daily_budget_minor),currency:ad.currency,scheduleStart:ad.schedule_start||null,scheduleEnd:ad.schedule_end||null,timezone:ad.timezone,targeting,adText:ad.ad_text,adHeadline:ad.ad_headline,language:ad.language,metaConnectionId:ad.meta_connection_id?String(ad.meta_connection_id):null,metaAdAccountId:ad.meta_ad_account_id,metaPixelId:ad.meta_pixel_id,dsaBeneficiary:effectiveDsaBeneficiary,dsaPayor:effectiveDsaPayor},metaAssets:{pageId:connection?.pageId||'',instagramUserId:connection?.instagramUserId||'',adAccountId:account?.id||'',businessId:account?.business?.id||'',accountStatus:account?.accountStatus||0,currency:account?.currency||''},smart:smart?{id:String(smart.id),slug:smart.slug,status:smart.status,updatedAt:new Date(smart.updated_at).toISOString()}:null,destinations:destinations.map(d=>({id:d.id,platform:d.platform,url:d.url,enabled:d.enabled})).sort((a,b)=>String(a.id).localeCompare(String(b.id))),creatives:creatives.map(c=>({id:String(c.id),objectKey916:c.object_key_916,objectKey43:c.object_key_43})).sort((a,b)=>a.id.localeCompare(b.id))};
     const fingerprint=crypto.createHash('sha256').update(JSON.stringify(fpPayload)).digest('hex');
     return {ready:errors.length===0,errors,warnings,fingerprint,requiresSmartLinkActivation,smartLink:smart?{id:String(smart.id),status:smart.status,publicUrl:landingUrl(smart.slug),slug:smart.slug,destinationCount:destinations.length}:null,account,connection,effectiveDsa:{required:needsDsa,beneficiary:effectiveDsaBeneficiary,payor:effectiveDsaPayor},summary:{selectedCreativeCount:creatives.length,countries:countries.length,placements:placementTargets.length,dailyBudgetMinor:Number(ad.daily_budget_minor||0),currency:ad.currency,estimatedMaxDailySpendMinor:Number(ad.daily_budget_minor||0)},creatives};
   }
@@ -721,6 +726,33 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
 
   app.get(`${ROOT}/meta/ad-accounts`, requireAuth, async (req,res)=>{try{const connectionId=String(req.query.connectionId||"");res.json({adAccounts:await listMetaAdAccounts(req.user.id,connectionId)});}catch(e){res.status(502).json({error:e.message||"meta_ad_accounts_failed",meta:e.meta||undefined});}});
   app.get(`${ROOT}/meta/pixels`, requireAuth, async (req,res)=>{try{const adAccountId=String(req.query.adAccountId||"");const connectionId=String(req.query.connectionId||"");if(!adAccountId)return res.status(400).json({error:"ad_account_required"});res.json({pixels:await listMetaPixels(req.user.id,adAccountId,connectionId)});}catch(e){res.status(502).json({error:e.message||"meta_pixels_failed",meta:e.meta||undefined});}});
+  app.get(`${ROOT}/meta/assets`, requireAuth, async (req,res)=>{
+    try{
+      const connections=await listMetaConnections(req.user.id);
+      const connectionId=String(req.query.connectionId||connections.find(c=>c.active)?.id||'');
+      const connection=connections.find(c=>c.id===connectionId);
+      if(!connection)return res.status(404).json({error:'meta_connection_not_found'});
+      const adAccounts=await listMetaAdAccounts(req.user.id,connectionId);
+      const adAccountId=String(req.query.adAccountId||'');
+      if(adAccountId&&!adAccounts.some(a=>a.id===adAccountId))return res.status(400).json({error:'meta_ad_account_unavailable'});
+      const pixels=adAccountId?await listMetaPixels(req.user.id,adAccountId,connectionId):[];
+      const selected=(await pool.query(`SELECT selected_connection_id,selected_business_id,selected_ad_account_id,selected_page_id,selected_instagram_user_id,selected_pixel_id FROM promotion_meta_profiles WHERE owner_user_id=$1`,[req.user.id])).rows[0];
+      res.json({assets:metaAssetInventory({connections:[connection],adAccounts,pixels,selectedAdAccountId:adAccountId}),selection:selected?{connectionId:selected.selected_connection_id,businessId:selected.selected_business_id,adAccountId:selected.selected_ad_account_id,pageId:selected.selected_page_id,instagramUserId:selected.selected_instagram_user_id,pixelId:selected.selected_pixel_id,billingProvider:'meta'}:null});
+    }catch(e){res.status(502).json({error:e.message||'meta_assets_failed'});}
+  });
+  app.post(`${ROOT}/meta/assets/select`, requireAuth, async (req,res)=>{
+    try{
+      const input=z.object({connectionId:z.string().uuid(),adAccountId:z.string().regex(/^(?:act_)?[0-9]+$/),pixelId:z.string().regex(/^[0-9]+$/).optional().default('')}).strict().parse(req.body||{});
+      const connection=(await listMetaConnections(req.user.id)).find(c=>c.id===input.connectionId);
+      if(!connection)return res.status(404).json({error:'meta_connection_not_found'});
+      const account=(await listMetaAdAccounts(req.user.id,input.connectionId)).find(a=>a.id===input.adAccountId.replace(/^act_/,''));
+      if(!account)return res.status(409).json({error:'meta_ad_account_unavailable'});
+      const pixel=input.pixelId?(await listMetaPixels(req.user.id,account.id,input.connectionId)).find(p=>p.id===input.pixelId):null;
+      const selection=assertMetaAssetSelection({connection,account,pixel,adAccountId:input.adAccountId.replace(/^act_/,''),pixelId:input.pixelId});
+      await pool.query(`INSERT INTO promotion_meta_profiles(owner_user_id,selected_connection_id,selected_business_id,selected_ad_account_id,selected_page_id,selected_instagram_user_id,selected_pixel_id,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,now()) ON CONFLICT(owner_user_id) DO UPDATE SET selected_connection_id=EXCLUDED.selected_connection_id,selected_business_id=EXCLUDED.selected_business_id,selected_ad_account_id=EXCLUDED.selected_ad_account_id,selected_page_id=EXCLUDED.selected_page_id,selected_instagram_user_id=EXCLUDED.selected_instagram_user_id,selected_pixel_id=EXCLUDED.selected_pixel_id,updated_at=now()`,[req.user.id,selection.connectionId,selection.businessId,selection.adAccountId,selection.pageId,selection.instagramUserId,selection.pixelId]);
+      res.json({selection});
+    }catch(e){res.status(e instanceof z.ZodError?400:e.message==='meta_pixel_unavailable'||e.message==='meta_ad_account_unavailable'?409:502).json({error:e instanceof z.ZodError?'invalid_meta_asset_selection':e.message||'meta_asset_selection_failed'});}
+  });
   app.get(`${ROOT}/meta/interests`, requireAuth, async (req,res)=>{try{const q=String(req.query.q||"").trim();const connectionId=String(req.query.connectionId||"");if(q.length<2)return res.json({interests:[]});res.json({interests:await searchMetaInterests(req.user.id,q,Number(req.query.limit||20),connectionId)});}catch(e){res.status(502).json({error:e.message||"meta_interest_search_failed",meta:e.meta||undefined});}});
 
   app.post(`${ROOT}/ad-campaigns/:id/meta/preflight`, requireAuth, async (req,res)=>{

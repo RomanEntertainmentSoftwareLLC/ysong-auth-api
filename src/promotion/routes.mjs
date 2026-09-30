@@ -7,6 +7,7 @@ import { buildLiveIntel } from "../musicSeo/analyze.mjs";
 import { qrSvg } from "./qr.mjs";
 import { inspectPromotionRenderRuntime, probeMedia, renderPromotionCreative } from "./creative.mjs";
 import { ALL_COUNTRY_CODES, COUNTRY_TIERS, PROMOTION_PLATFORM_CATALOG, describeCountries } from "./catalog.mjs";
+import { DestinationSchema, saveDestinations } from "./destinations.mjs";
 import { stockProviderStatus, searchStockVideos, resolveStockVideoForImport, downloadStockFile } from "./stock.mjs";
 import { buildPromotionIntelligence } from "./intelligence.mjs";
 import { AdsDraftSchema, draftToStorage, storageToDraft, projectAdsCampaign } from "./ads-contract.mjs";
@@ -44,13 +45,7 @@ const CampaignSchema = z.object({
   ctaLabel: z.string().max(80).optional().default(""),
   accentColor: z.string().max(32).optional().default("#8b5cf6"),
   seoQuery: z.string().max(300).optional().default(""),
-  destinations: z.array(z.object({
-    platform: z.string().max(80).optional().default("link"),
-    label: z.string().min(1).max(120),
-    url: z.string().url().max(2000).refine((v) => /^https?:\/\//i.test(v), "HTTP(S) URL required"),
-    kind: z.enum(["stream","presave","social","store","other"]).optional().default("stream"),
-    enabled: z.boolean().optional().default(true),
-  })).max(100).optional().default([]),
+  destinations: z.array(DestinationSchema).max(100).optional().default([]),
 });
 const EventSchema = z.object({
   eventType: z.enum(["view","conversion","share","presave_intent","meta_referral","custom"]),
@@ -187,7 +182,6 @@ async function uniqueSlug(base, excludeId=null) {
   for(let i=0;i<30;i++){ const {rows}=await pool.query(`SELECT id FROM promotion_campaigns WHERE slug=$1 ${excludeId?"AND id<>$2":""} LIMIT 1`,excludeId?[candidate,excludeId]:[candidate]); if(!rows[0]) return candidate; candidate=`${stem}-${i+2}`.slice(0,96); }
   return `${stem}-${crypto.randomBytes(3).toString("hex")}`.slice(0,96);
 }
-async function replaceDestinations(client,campaignId,destinations){ await client.query(`DELETE FROM promotion_destinations WHERE campaign_id=$1`,[campaignId]); for(let i=0;i<destinations.length;i++){ const d=destinations[i]; await client.query(`INSERT INTO promotion_destinations(id,campaign_id,platform,label,url,destination_kind,position,enabled) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,[crypto.randomUUID(),campaignId,d.platform,d.label,d.url,d.kind,i,d.enabled]); } }
 async function releaseSeed(userId, releaseId){
   if(!releaseId) return null;
   const {rows}=await pool.query(`SELECT r.*, COALESCE(json_agg(json_build_object('id',t.id,'title',t.title,'genre',t.genre,'tags',t.tags,'explicit',t.explicit,'isrc',t.isrc,'trackNumber',t.track_number,'durationSeconds',t.duration_seconds,'audioObjectKey',t.audio_object_key) ORDER BY t.track_number) FILTER (WHERE t.id IS NOT NULL),'[]'::json) AS tracks FROM world_releases r LEFT JOIN world_tracks t ON t.release_id=r.id AND t.owner_user_id=$2 WHERE r.id=$1 AND r.owner_user_id=$2 GROUP BY r.id`,[releaseId,userId]);
@@ -814,9 +808,9 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
       const title=(input.title||seed?.title||"").trim(); const artist=(input.artistName||seed?.artist_name||"").trim(); if(!title) return res.status(400).json({error:"title_required"});
       const slug=await uniqueSlug(input.slug||`${artist}-${title}`); const id=crypto.randomUUID(); const genre=(input.genre||seed?.genre||"").trim();
       const metadata={source:"promotion_center",sourceReleaseTracks:seed?.tracks||[]};
-      const client=await pool.connect(); try{ await client.query("BEGIN"); await client.query(`INSERT INTO promotion_campaigns(id,owner_user_id,source_release_id,kind,slug,title,artist_name,description,genre,release_date,artwork_object_key,headline,cta_label,accent_color,seo_query,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb)`,[id,req.user.id,input.sourceReleaseId||null,input.kind,slug,title,artist,input.description,genre,input.releaseDate?new Date(input.releaseDate):null,seed?.artwork_object_key||null,input.headline,input.ctaLabel,input.accentColor,input.seoQuery||`${artist} ${title} ${genre}`.trim(),JSON.stringify(metadata)]); await replaceDestinations(client,id,input.destinations); await client.query("COMMIT"); }catch(e){await client.query("ROLLBACK");throw e;}finally{client.release();}
+      const client=await pool.connect(); try{ await client.query("BEGIN"); await client.query(`INSERT INTO promotion_campaigns(id,owner_user_id,source_release_id,kind,slug,title,artist_name,description,genre,release_date,artwork_object_key,headline,cta_label,accent_color,seo_query,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb)`,[id,req.user.id,input.sourceReleaseId||null,input.kind,slug,title,artist,input.description,genre,input.releaseDate?new Date(input.releaseDate):null,seed?.artwork_object_key||null,input.headline,input.ctaLabel,input.accentColor,input.seoQuery||`${artist} ${title} ${genre}`.trim(),JSON.stringify(metadata)]); await saveDestinations(client,id,input.destinations); await client.query("COMMIT"); }catch(e){await client.query("ROLLBACK");throw e;}finally{client.release();}
       const row=await campaignOwned(id,req.user.id); res.status(201).json({campaign:mapCampaign(row,await campaignDestinations(id))});
-    }catch(e){ if(e instanceof z.ZodError) return res.status(400).json({error:"invalid_campaign",issues:e.issues}); console.error("promotion create",e); res.status(500).json({error:"campaign_create_failed",message:e.message}); }
+    }catch(e){ if(e instanceof z.ZodError) return res.status(400).json({error:"invalid_campaign",issues:e.issues}); if(e.message==="invalid_destination_id")return res.status(400).json({error:e.message}); console.error("promotion create",e); res.status(500).json({error:"campaign_create_failed",message:e.message}); }
   });
 
   app.get(`${ROOT}/campaigns/:id`, requireAuth, async (req,res)=>{ const row=await campaignOwned(req.params.id,req.user.id); if(!row)return res.status(404).json({error:"campaign_not_found"}); res.json({campaign:mapCampaign(row,await campaignDestinations(row.id)),analytics:await analyticsFor(row.id)}); });
@@ -824,9 +818,9 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
   app.patch(`${ROOT}/campaigns/:id`, requireAuth, async (req,res)=>{
     try{ const current=await campaignOwned(req.params.id,req.user.id); if(!current)return res.status(404).json({error:"campaign_not_found"}); const input=CampaignSchema.partial().parse(req.body||{}); const slug=input.slug!==undefined?await uniqueSlug(input.slug,current.id):current.slug;
       const values={title:input.title??current.title,artist:input.artistName??current.artist_name,description:input.description??current.description,genre:input.genre??current.genre,releaseDate:input.releaseDate===undefined?current.release_date:(input.releaseDate?new Date(input.releaseDate):null),headline:input.headline??current.headline,cta:input.ctaLabel??current.cta_label,accent:input.accentColor??current.accent_color,seo:input.seoQuery??current.seo_query,kind:input.kind??current.kind};
-      const client=await pool.connect(); try{await client.query("BEGIN");await client.query(`UPDATE promotion_campaigns SET kind=$3,slug=$4,title=$5,artist_name=$6,description=$7,genre=$8,release_date=$9,headline=$10,cta_label=$11,accent_color=$12,seo_query=$13,updated_at=now() WHERE id=$1 AND owner_user_id=$2`,[current.id,req.user.id,values.kind,slug,values.title,values.artist,values.description,values.genre,values.releaseDate,values.headline,values.cta,values.accent,values.seo]); if(input.destinations) await replaceDestinations(client,current.id,input.destinations); await client.query("COMMIT");}catch(e){await client.query("ROLLBACK");throw e;}finally{client.release();}
+      const client=await pool.connect(); try{await client.query("BEGIN");await client.query(`UPDATE promotion_campaigns SET kind=$3,slug=$4,title=$5,artist_name=$6,description=$7,genre=$8,release_date=$9,headline=$10,cta_label=$11,accent_color=$12,seo_query=$13,updated_at=now() WHERE id=$1 AND owner_user_id=$2`,[current.id,req.user.id,values.kind,slug,values.title,values.artist,values.description,values.genre,values.releaseDate,values.headline,values.cta,values.accent,values.seo]); if(input.destinations) await saveDestinations(client,current.id,input.destinations); await client.query("COMMIT");}catch(e){await client.query("ROLLBACK");throw e;}finally{client.release();}
       const row=await campaignOwned(current.id,req.user.id); res.json({campaign:mapCampaign(row,await campaignDestinations(row.id))});
-    }catch(e){ if(e instanceof z.ZodError)return res.status(400).json({error:"invalid_campaign",issues:e.issues}); console.error("promotion patch",e);res.status(500).json({error:"campaign_update_failed",message:e.message}); }
+    }catch(e){ if(e instanceof z.ZodError)return res.status(400).json({error:"invalid_campaign",issues:e.issues}); if(e.message==="invalid_destination_id")return res.status(400).json({error:e.message}); console.error("promotion patch",e);res.status(500).json({error:"campaign_update_failed",message:e.message}); }
   });
 
   app.post(`${ROOT}/campaigns/:id/status`, requireAuth, async (req,res)=>{ const status=String(req.body?.status||""); if(!["draft","active","archived"].includes(status))return res.status(400).json({error:"invalid_status"}); const {rows}=await pool.query(`UPDATE promotion_campaigns SET status=$3,updated_at=now() WHERE id=$1 AND owner_user_id=$2 RETURNING *`,[req.params.id,req.user.id,status]); if(!rows[0])return res.status(404).json({error:"campaign_not_found"}); res.json({campaign:mapCampaign(rows[0],await campaignDestinations(rows[0].id))}); });

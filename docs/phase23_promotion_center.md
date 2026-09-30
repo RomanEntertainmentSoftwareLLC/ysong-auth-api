@@ -58,6 +58,8 @@ A paid ad's CTA is designed to point to the YSong Smart Link rather than one str
 
 The platform catalog is a convenience list, not a whitelist. Artists can enter custom providers.
 
+Smart Link destinations are an ordered array of `{ id, platform, label, url, kind, enabled, position }`. Campaign create and PATCH accept up to 100 destinations in display order; `position` is assigned from array order. For an existing destination, send its returned `id` when editing or moving it so the redirect URL and click attribution stay attached to the same destination. Omit an existing destination to remove it. New destinations omit `id`; `platform` accepts any nonempty service name and `url` must be HTTP(S). The catalog includes streaming and video services, vinyl/store, official site, and custom links without requiring any particular service.
+
 ## Honest pre-save behavior
 
 Promotion Center provides the pre-save campaign/funnel, fan capture, pre-save destination buttons, and `presave_intent` analytics. It does **not** claim to mutate a fan's Spotify/Apple library unless a provider-authorized save API is connected.

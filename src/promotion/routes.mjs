@@ -659,12 +659,14 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
       const provider=String(req.query.provider||"pexels");
       const query=String(req.query.q||"").trim();
       const orientation=String(req.query.orientation||"portrait");
+      const size=String(req.query.size||"medium");
       const page=Math.max(1,Number(req.query.page||1));
       const perPage=Math.max(1,Math.min(80,Number(req.query.perPage||30)));
       const locale=String(req.query.locale||"en-US");
-      res.json(await searchStockVideos({provider,query,orientation,page,perPage,locale}));
+      res.json(await searchStockVideos({provider,query,orientation,size,page,perPage,locale}));
     }catch(e){
       const status=e?.message==="pexels_not_configured"?503:(Number(e?.statusCode)||502);
+      if(e?.retryAfterSeconds)res.set("Retry-After",String(e.retryAfterSeconds));
       res.status(status).json({error:e?.message||"stock_video_search_failed"});
     }
   });
@@ -695,7 +697,8 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
       res.status(201).json({backgroundVideo:mapBackground(rows[0])});
     }catch(e){
       if(key){await fs.promises.unlink(objectPath(key)).catch(()=>{});}
-      const status=e?.message==="pexels_not_configured"?503:(e?.message==="stock_video_too_large"?413:502);
+      const status=e?.message==="pexels_not_configured"?503:(e?.message==="stock_video_too_large"?413:(Number(e?.statusCode)||502));
+      if(e?.retryAfterSeconds)res.set("Retry-After",String(e.retryAfterSeconds));
       console.error("promotion stock import",e);
       res.status(status).json({error:e?.message||"stock_video_import_failed"});
     }

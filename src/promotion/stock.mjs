@@ -8,6 +8,25 @@ const MAX_IMPORT_BYTES = Math.max(25 * 1024 * 1024, Number(process.env.PROMOTION
 const MAX_DURATION_SECONDS = 60;
 const searchCache = new Map();
 const SEARCH_CACHE_MS = 10 * 60 * 1000;
+let rateLimitedUntil = 0;
+
+function stockError(message, statusCode, retryAfterSeconds) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  if (retryAfterSeconds) error.retryAfterSeconds = retryAfterSeconds;
+  return error;
+}
+
+function retryDelay(headers) {
+  const retryAfter = headers.get("retry-after");
+  const seconds = Number(retryAfter);
+  const retryDate = retryAfter && !Number.isFinite(seconds) ? Date.parse(retryAfter) : NaN;
+  const reset = Number(headers.get("x-ratelimit-reset"));
+  const delay = Number.isFinite(seconds) && retryAfter !== null ? seconds
+    : Number.isFinite(retryDate) ? (retryDate - Date.now()) / 1000
+    : Number.isFinite(reset) && reset > 0 ? reset - Date.now() / 1000 : 60;
+  return Math.max(1, Math.min(3600, Math.ceil(delay)));
+}
 
 function pexelsKey() {
   const key = String(process.env.PEXELS_API_KEY || "").trim();
@@ -16,18 +35,27 @@ function pexelsKey() {
 }
 
 async function pexelsJson(url) {
+  const key = pexelsKey();
+  if (rateLimitedUntil > Date.now()) {
+    throw stockError("pexels_rate_limited", 429, Math.ceil((rateLimitedUntil - Date.now()) / 1000));
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 12_000);
   try {
-    const res = await fetch(url, { headers: { Authorization: pexelsKey() }, signal: controller.signal });
+    const res = await fetch(url, { headers: { Authorization: key }, signal: controller.signal });
     if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      const error = new Error(`pexels_http_${res.status}`);
-      error.statusCode = res.status;
-      error.detail = text.slice(0, 1000);
-      throw error;
+      if (res.status === 429) {
+        const delay = retryDelay(res.headers);
+        rateLimitedUntil = Date.now() + delay * 1000;
+        throw stockError("pexels_rate_limited", 429, delay);
+      }
+      throw stockError(`pexels_http_${res.status}`, 502);
     }
-    return await res.json();
+    try { return await res.json(); }
+    catch { throw stockError("pexels_invalid_response", 502); }
+  } catch (error) {
+    if (error?.statusCode) throw error;
+    throw stockError(error?.name === "AbortError" ? "pexels_timeout" : "pexels_unavailable", error?.name === "AbortError" ? 504 : 502);
   } finally {
     clearTimeout(timer);
   }
@@ -44,17 +72,23 @@ function normalizePexelsVideo(video) {
     name: String(video?.user?.name || "Pexels contributor"),
     url: String(video?.user?.url || ""),
   };
+  const width = Number(video?.width || 0);
+  const height = Number(video?.height || 0);
+  const orientation = width && height ? (height > width ? "portrait" : width > height ? "landscape" : "square") : "unknown";
   return {
     provider: "pexels",
     id,
-    width: Number(video?.width || 0),
-    height: Number(video?.height || 0),
+    width,
+    height,
+    orientation,
+    aspectRatio: width && height ? Number((width / height).toFixed(4)) : null,
+    socialFriendly: orientation === "portrait" && height >= 1280,
     durationSeconds: Number(video?.duration || 0),
     pageUrl,
     previewImage: String(video?.image || ""),
     previewVideoUrl: String(previewFile?.link || ""),
     contributor,
-    files: files.map((file) => ({
+    files: files.filter((file) => String(file?.file_type || "").toLowerCase() === "video/mp4" && /^https:\/\//i.test(String(file?.link || ""))).map((file) => ({
       id: String(file?.id || ""), quality: String(file?.quality || ""), fileType: String(file?.file_type || ""),
       width: Number(file?.width || 0), height: Number(file?.height || 0), fps: Number(file?.fps || 0),
     })),
@@ -72,7 +106,8 @@ function pickPexelsFile(video, preferredFileId = "") {
   if (!files.length) throw new Error("stock_video_mp4_unavailable");
   if (preferredFileId) {
     const exact = files.find((f) => String(f.id) === String(preferredFileId));
-    if (exact) return exact;
+    if (!exact) throw stockError("stock_video_file_not_found", 400);
+    return exact;
   }
   // Prefer portrait HD near 1080x1920 without pulling giant 4K originals.
   return files.map((f) => {
@@ -119,14 +154,15 @@ const pexelsAdapter = {
   attribution: { label: "Videos provided by Pexels", url: "https://www.pexels.com/" },
   free: true,
   configured: () => !!String(process.env.PEXELS_API_KEY || "").trim(),
-  async search({ query, orientation, page, perPage, locale }) {
+  async search({ query, orientation, size, page, perPage, locale }) {
     const params = new URLSearchParams({
-      query, orientation, size: "medium", locale, page: String(page), per_page: String(perPage),
+      query, orientation, size, locale, page: String(page), per_page: String(perPage),
     });
     const data = await pexelsJson(`${PEXELS_API}/search?${params.toString()}`);
     const videos = (Array.isArray(data?.videos) ? data.videos : [])
       .filter((v) => Number(v?.duration || 0) > 0 && Number(v?.duration || 0) <= MAX_DURATION_SECONDS)
-      .map(normalizePexelsVideo);
+      .map(normalizePexelsVideo)
+      .sort((a, b) => orientation === "portrait" ? Number(b.socialFriendly) - Number(a.socialFriendly) : 0);
     return {
       page: Number(data?.page || page), perPage: Number(data?.per_page || perPage),
       totalResults: Number(data?.total_results || 0), nextPage: data?.next_page ? Number(data?.page || page) + 1 : null,
@@ -134,8 +170,8 @@ const pexelsAdapter = {
     };
   },
   async resolve({ id, fileId }) {
-    const safeId = String(id || "").replace(/[^0-9]/g, "");
-    if (!safeId) throw new Error("invalid_stock_video_id");
+    const safeId = String(id || "");
+    if (!/^\d+$/.test(safeId)) throw stockError("invalid_stock_video_id", 400);
     const video = await pexelsJson(`${PEXELS_API}/videos/${safeId}`);
     const duration = Number(video?.duration || 0);
     if (!duration || duration > MAX_DURATION_SECONDS) {
@@ -158,14 +194,15 @@ export const stockProviders = createStockProviderRegistry([pexelsAdapter]);
 
 export function stockProviderStatus() { return stockProviders.status(); }
 
-export async function searchStockVideos({ provider = "pexels", query, orientation = "portrait", page = 1, perPage = 30, locale = "en-US" }) {
+export async function searchStockVideos({ provider = "pexels", query, orientation = "portrait", size = "medium", page = 1, perPage = 30, locale = "en-US" }) {
   const adapter = stockProviders.get(provider);
   const q = String(query || "").trim().slice(0, 160);
-  const safePage = Math.max(1, Math.floor(Number(page) || 1));
-  const safePerPage = Math.max(1, Math.min(80, Math.floor(Number(perPage) || 30)));
+  const safePage = Math.max(1, Math.min(10000, Math.floor(Number(page)) || 1));
+  const safePerPage = Math.max(1, Math.min(80, Math.floor(Number(perPage)) || 30));
   if (q.length < 2) return { provider: adapter.id, page: 1, perPage: safePerPage, totalResults: 0, nextPage: null, videos: [], attribution: adapter.attribution };
   const options = {
     query: q, orientation: ["portrait", "landscape", "square"].includes(orientation) ? orientation : "portrait",
+    size: ["small", "medium", "large"].includes(size) ? size : "medium",
     page: safePage, perPage: safePerPage, locale: String(locale || "en-US").slice(0, 12),
   };
   const cacheKey = `${adapter.id}|${JSON.stringify(options)}`;

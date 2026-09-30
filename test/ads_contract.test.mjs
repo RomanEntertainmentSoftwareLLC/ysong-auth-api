@@ -54,3 +54,37 @@ test("Ads draft rejects provider payloads, invalid ages, and duplicate placement
   assert.equal(AdsDraftSchema.safeParse({ ...draft, audience: { ageMin: 40, ageMax: 20 } }).success, false);
   assert.equal(AdsDraftSchema.safeParse({ ...draft, placements: [draft.placements[0], draft.placements[0]] }).success, false);
 });
+
+test("Ads wizard selections and audience snapshot survive storage without credentials", () => {
+  const wizard = AdsDraftSchema.parse({
+    smartLinkCampaignId: id,
+    selectedReleaseId: id, verifiedAudioReferenceId: id, creativeId: id, destinationId: id,
+    connectedAssets: { connectionId: id, businessId: "12", adAccountId: "34", pageId: "56", instagramUserId: "78", pixelId: "90" },
+    estimatedAudience: { source: "meta_reachestimate", kind: "modeled_audience_estimate", ready: true,
+      estimate: null, lower: 1000, upper: 5000, capturedAt: "2026-09-30T12:00:00.000Z" },
+    audience: { countries: ["US"], interestRefs: [{ id: "123", name: "Music" }] },
+  });
+  const stored = draftToStorage(wizard);
+  const row = { campaign_id: id, source_track_id: null, name: stored.name, goal: stored.goal,
+    daily_budget_minor: stored.dailyBudgetMinor, currency: stored.currency, placements: stored.placements,
+    targeting: stored.targeting, meta_connection_id: stored.metaConnectionId, meta_ad_account_id: stored.metaAdAccountId,
+    metadata: { adsDraft: stored.adsDraft } };
+  const recovered = storageToDraft(row);
+  assert.equal(AdsDraftSchema.safeParse(recovered).success, true);
+  assert.equal(recovered.selectedReleaseId, id);
+  assert.equal(recovered.verifiedAudioReferenceId, id);
+  assert.equal(recovered.creativeId, id);
+  assert.equal(recovered.destinationId, id);
+  assert.deepEqual(recovered.connectedAssets, wizard.connectedAssets);
+  assert.deepEqual(recovered.estimatedAudience, wizard.estimatedAudience);
+  assert.deepEqual(recovered.audience.interestRefs, wizard.audience.interestRefs);
+  assert.equal(recovered.dailyBudget.minor, 500);
+  assert.equal(storageToDraft({ ...row, targeting: { ...row.targeting, countries: ["CA"] } }).estimatedAudience, null);
+  assert.equal(JSON.stringify(projectAdsCampaign({ ...row, id, owner_user_id: id, status: "draft" })).includes("access_token"), false);
+});
+
+test("Ads draft rejects secrets and malformed snapshots in nested wizard fields", () => {
+  assert.equal(AdsDraftSchema.safeParse({ ...draft, connectedAssets: { connectionId: id, businessId: "", adAccountId: "34", pageId: "56", instagramUserId: "", pixelId: "", accessToken: "secret" } }).success, false);
+  assert.equal(AdsDraftSchema.safeParse({ ...draft, estimatedAudience: { source: "meta_reachestimate", kind: "modeled_audience_estimate", ready: true, estimate: null, lower: 5000, upper: 1000, capturedAt: "2026-09-30T12:00:00.000Z" } }).success, false);
+  assert.equal(AdsDraftSchema.safeParse({ smartLinkCampaignId: id }).success, true);
+});

@@ -5,6 +5,7 @@ import { pool } from "../db.js";
 import { decryptSecret, encryptSecret, promotionSecretsConfigured } from "./crypto.mjs";
 import { fetchMetaInterests, parseMetaInterestSearch } from "./meta-interests.mjs";
 import { fetchMetaReachEstimate } from "./meta-reach.mjs";
+import { metaDeliveryState } from "./meta-delivery.mjs";
 
 export const META_GRAPH_VERSION = String(process.env.META_GRAPH_VERSION || "v26.0").replace(/^([^v])/, "v$1");
 const GRAPH = `https://graph.facebook.com/${META_GRAPH_VERSION}`;
@@ -413,6 +414,8 @@ export async function setMetaPaidCampaignStatus(userId, connectionId, campaignId
   if (!["ACTIVE","PAUSED"].includes(normalized)) throw new Error("meta_status_invalid");
   const { token } = await marketingToken(userId, connectionId);
   const children = await fetchMetaPaidCampaignStatusWithToken(token, campaignId);
+  if (normalized === "ACTIVE" && ["rejected", "failed", "archived"].includes(metaDeliveryState(children).state))
+    throw new Error("meta_delivery_not_resumable");
   const adSetIds = (children.adSets || []).map((x) => String(x.id || "")).filter(Boolean);
   const adIds = (children.ads || []).map((x) => String(x.id || "")).filter(Boolean);
   // Meta's hierarchy is intentionally changed in a safe order. Activating children first
@@ -452,16 +455,7 @@ export async function fetchMetaPaidCampaignStatus(userId, connectionId, campaign
 }
 
 export function deriveLocalMetaStatus(remote) {
-  const campaign = String(remote?.campaign?.effective_status || remote?.campaign?.status || "").toUpperCase();
-  const ads = Array.isArray(remote?.ads) ? remote.ads : [];
-  const adStates = ads.map((a) => String(a.effective_status || a.status || "").toUpperCase());
-  const combined = [campaign, ...adStates];
-  if (combined.some((v) => ["DISAPPROVED","WITH_ISSUES","ERROR"].includes(v))) return "failed";
-  if (combined.some((v) => ["PENDING_REVIEW","PREAPPROVED"].includes(v))) return "in_review";
-  if (campaign === "PAUSED" || (adStates.length && adStates.every((v) => v === "PAUSED"))) return "paused";
-  if (campaign === "ACTIVE" && (!adStates.length || adStates.some((v) => v === "ACTIVE"))) return "active";
-  if (["ARCHIVED","DELETED"].includes(campaign)) return "archived";
-  return "in_review";
+  return metaDeliveryState(remote).state;
 }
 
 function actionValue(row, type) {

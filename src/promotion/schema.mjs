@@ -115,7 +115,7 @@ export async function ensurePromotionSchema() {
       source_track_id uuid REFERENCES world_tracks(id) ON DELETE SET NULL,
       name text NOT NULL,
       goal text NOT NULL DEFAULT 'song_growth',
-      status text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','rendering','ready','publishing','in_review','active','paused','completed','failed','archived')),
+      status text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','rendering','ready','publishing','submitted','in_review','active','paused','rejected','completed','failed','archived')),
       genre text NOT NULL DEFAULT '',
       genre_source text NOT NULL DEFAULT 'ysong',
       daily_budget_minor integer NOT NULL DEFAULT 500,
@@ -148,6 +148,8 @@ export async function ensurePromotionSchema() {
     ALTER TABLE promotion_ad_campaigns ADD COLUMN IF NOT EXISTS dsa_payor text NOT NULL DEFAULT '';
     ALTER TABLE promotion_ad_campaigns ADD COLUMN IF NOT EXISTS meta_published_at timestamptz;
     ALTER TABLE promotion_ad_campaigns ADD COLUMN IF NOT EXISTS meta_publish_fingerprint text NOT NULL DEFAULT '';
+    ALTER TABLE promotion_ad_campaigns DROP CONSTRAINT IF EXISTS promotion_ad_campaigns_status_check;
+    ALTER TABLE promotion_ad_campaigns ADD CONSTRAINT promotion_ad_campaigns_status_check CHECK (status IN ('draft','rendering','ready','publishing','submitted','in_review','active','paused','rejected','completed','failed','archived'));
     CREATE INDEX IF NOT EXISTS promotion_ad_campaigns_owner_idx ON promotion_ad_campaigns(owner_user_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS promotion_ad_campaigns_campaign_idx ON promotion_ad_campaigns(campaign_id, updated_at DESC);
 

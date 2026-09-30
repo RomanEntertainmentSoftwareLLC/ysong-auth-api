@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { metaDeliveryState, metaReviewState } from "./meta-delivery.mjs";
 
 const placement = z.object({
   channel: z.enum(["facebook", "instagram"]),
@@ -130,9 +131,19 @@ export function storageToDraft(ad) {
 
 export function projectAdsCampaign(ad, { smartLink = null, destinations = [], creatives = [], snippets = [] } = {}) {
   const draft = storageToDraft(ad);
-  const submissionState = ad.status === "failed" ? "failed" : ad.status === "publishing" ? "submitting" : ad.meta_campaign_id ? "submitted" : "not_submitted";
-  const reviewState = ["DISAPPROVED", "WITH_ISSUES"].includes(String(ad.meta_status).toUpperCase()) ? "rejected" :
-    ad.status === "in_review" ? "pending" : ["active", "completed"].includes(ad.status) ? "approved" :
+  const deliverySnapshot = ad.metadata?.metaDelivery;
+  const observed = deliverySnapshot?.remote ? metaDeliveryState(deliverySnapshot.remote) : null;
+  const deliveryState = ad.status === "publishing" ? "submitting" :
+    !ad.meta_campaign_id ? (ad.meta_publish_fingerprint ? "failed" : "not_submitted") :
+    !ad.meta_published_at && ad.meta_publish_fingerprint ? "failed" : observed?.state ||
+    (["DISAPPROVED", "WITH_ISSUES"].includes(String(ad.meta_status).toUpperCase()) ? "rejected" :
+    (["submitted", "in_review", "active", "paused", "rejected", "failed", "archived"].includes(ad.status) ? ad.status : "submitted"));
+  const submissionState = deliveryState === "submitting" ? "submitting" :
+    deliveryState === "failed" && !ad.meta_published_at ? "failed" :
+    ad.meta_campaign_id ? "submitted" : "not_submitted";
+  const reviewState = deliverySnapshot?.remote && ad.meta_published_at ? metaReviewState(deliverySnapshot.remote) :
+    deliveryState === "rejected" ? "rejected" :
+    deliveryState === "in_review" ? "pending" : deliveryState === "active" ? "approved" :
     ad.meta_campaign_id ? "unknown" : "not_requested";
   return {
     id: String(ad.id), ...draft, status: ad.status,
@@ -144,7 +155,11 @@ export function projectAdsCampaign(ad, { smartLink = null, destinations = [], cr
       url: d.url, kind: d.destination_kind, enabled: !!d.enabled, position: Number(d.position) })),
     metaSubmission: { state: submissionState, submittedAt: ad.meta_published_at || null,
       hasError: !!ad.meta_last_error?.message },
-    review: { state: reviewState, checkedAt: ad.metadata?.metaDelivery?.refreshedAt || null },
+    delivery: { state: deliveryState, providerStatus: observed?.providerStatus || ad.meta_status || null,
+      checkedAt: deliverySnapshot?.refreshedAt || null,
+      reasons: observed?.reasons || deliverySnapshot?.reasons || [],
+      error: ad.meta_last_error?.message ? { message: String(ad.meta_last_error.message), code: String(ad.meta_last_error.code || "") } : null },
+    review: { state: reviewState, checkedAt: deliverySnapshot?.refreshedAt || null },
     analytics: { href: `/api/tools/promotion/ad-campaigns/${ad.id}/analytics`,
       attributionCampaignId: String(ad.id), smartLinkCampaignId: String(ad.campaign_id) },
     provenance: { origin: "promotion", ownerUserId: String(ad.owner_user_id), genreSource: ad.genre_source || "ysong",

@@ -13,6 +13,7 @@ import { stockProviderStatus, searchStockVideos, resolveStockVideoForImport, dow
 import { buildPromotionIntelligence } from "./intelligence.mjs";
 import { AdsDraftSchema, draftToStorage, storageToDraft, projectAdsCampaign } from "./ads-contract.mjs";
 import { assertMetaAssetSelection, metaAssetInventory } from "./meta-assets.mjs";
+import { metaDeliveryState } from "./meta-delivery.mjs";
 import { parseMetaInterestSearch } from "./meta-interests.mjs";
 import {
   META_GRAPH_VERSION,
@@ -33,7 +34,6 @@ import {
   setMetaPaidCampaignStatus,
   pauseMetaPaidCampaignDelivery,
   deleteMetaPaidCampaign,
-  deriveLocalMetaStatus,
   META_DSA_COUNTRIES,
 } from "./meta.mjs";
 
@@ -272,6 +272,14 @@ function mapSnippet(row) { return { id:String(row.id), adCampaignId:String(row.a
 function mapBackground(row) { return { id:String(row.id), libraryId:row.library_id?String(row.library_id):null, objectKey:row.object_key, originalName:row.original_name, durationSeconds:row.duration_seconds==null?null:Number(row.duration_seconds), width:row.width==null?null:Number(row.width), height:row.height==null?null:Number(row.height), metadata:row.metadata||{}, createdAt:row.created_at }; }
 function mapCreative(row) { return { id:String(row.id), adCampaignId:String(row.ad_campaign_id), libraryId:row.library_id?String(row.library_id):null, audioSnippetId:String(row.audio_snippet_id), backgroundVideoId:String(row.background_video_id), status:row.status, selected:!!row.selected, objectKey916:row.object_key_916, objectKey43:row.object_key_43, durationSeconds:row.duration_seconds==null?null:Number(row.duration_seconds), renderError:row.render_error, metaVideoId916:row.meta_video_id_916, metaVideoId43:row.meta_video_id_43, metaAdIds:row.meta_ad_ids||[], metadata:row.metadata||{}, createdAt:row.created_at, updatedAt:row.updated_at }; }
 async function adCampaignOwned(id,userId){ const {rows}=await pool.query(`SELECT * FROM promotion_ad_campaigns WHERE id=$1 AND owner_user_id=$2 LIMIT 1`,[id,userId]); return rows[0]||null; }
+async function saveMetaDelivery(ad,userId,remote){
+  const delivery=metaDeliveryState(remote);
+  const status=ad.meta_published_at?delivery.state:'failed';
+  const metaStatus=ad.meta_published_at?delivery.providerStatus:'RECONCILIATION_REQUIRED';
+  const metadata={...(ad.metadata||{}),metaDelivery:{refreshedAt:new Date().toISOString(),remote,reasons:delivery.reasons}};
+  const {rows}=await pool.query(`UPDATE promotion_ad_campaigns SET status=$3,meta_status=$4,metadata=$5::jsonb,updated_at=now() WHERE id=$1 AND owner_user_id=$2 RETURNING *`,[ad.id,userId,status,metaStatus,JSON.stringify(metadata)]);
+  return rows[0];
+}
 async function adsContractFor(ad,userId){
   const [smart,destinations,creatives,snippets]=await Promise.all([
     campaignOwned(ad.campaign_id,userId),
@@ -850,8 +858,8 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
         if(next.ad?.localCreativeId)await pool.query(`UPDATE promotion_ad_creatives SET meta_ad_ids=$3::jsonb,updated_at=now() WHERE id=$1 AND ad_campaign_id=$2`,[next.ad.localCreativeId,ad.id,JSON.stringify([{adId:next.ad.adId,creativeId:next.ad.creativeId,linkUrl:next.ad.linkUrl}])]);
       };
       const remote=await createMetaPaidCampaign({userId:req.user.id,connectionId:String(ad.meta_connection_id||''),adAccountId:ad.meta_ad_account_id,name:ad.name,dailyBudgetMinor:Number(ad.daily_budget_minor),startTime:ad.schedule_start,endTime:ad.schedule_end,targeting:ad.targeting||{},message:ad.ad_text,headline:ad.ad_headline,creatives:creativeInputs,dsaBeneficiary:preflight.effectiveDsa.beneficiary,dsaPayor:preflight.effectiveDsa.payor,activate:input.mode==='active',onProgress});
-      const localStatus=input.mode==='active'?'in_review':'paused';
-      const metadata={...(ad.metadata||{}),metaPublish:{fingerprint:input.fingerprint,mode:input.mode,publishedAt:new Date().toISOString(),smartLinkActivated:preflight.requiresSmartLinkActivation,remoteAds:remote.ads.map(x=>({localCreativeId:x.localCreativeId,adId:x.adId,creativeId:x.creativeId}))}};
+      const localStatus=input.mode==='active'?'submitted':'paused';
+      const metadata={...(ad.metadata||{}),metaDelivery:null,metaPublish:{fingerprint:input.fingerprint,mode:input.mode,publishedAt:new Date().toISOString(),smartLinkActivated:preflight.requiresSmartLinkActivation,remoteAds:remote.ads.map(x=>({localCreativeId:x.localCreativeId,adId:x.adId,creativeId:x.creativeId}))}};
       const {rows}=await pool.query(`UPDATE promotion_ad_campaigns SET status=$3,meta_campaign_id=$4,meta_adset_id=$5,meta_status=$6,meta_published_at=now(),meta_publish_fingerprint=$7,meta_last_error='{}'::jsonb,metadata=$8::jsonb,updated_at=now() WHERE id=$1 AND owner_user_id=$2 RETURNING *`,[ad.id,req.user.id,localStatus,remote.campaignId,remote.adSetId,remote.status,input.fingerprint,JSON.stringify(metadata)]);
       await recordEvent(smart.id,'custom',req,{metadata:{kind:'meta_paid_campaign_published',adCampaignId:String(ad.id),metaCampaignId:remote.campaignId,mode:input.mode}}).catch(()=>{});
       res.status(201).json({adCampaign:mapAdCampaign(rows[0]),remote,preflight});
@@ -870,7 +878,7 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
 
   app.post(`${ROOT}/ad-campaigns/:id/meta/refresh`, requireAuth, async (req,res)=>{
     const ad=await adCampaignOwned(req.params.id,req.user.id);if(!ad)return res.status(404).json({error:'ad_campaign_not_found'});if(ad.status==='publishing')return res.status(409).json({error:'meta_submission_in_progress'});if(!ad.meta_campaign_id)return res.status(409).json({error:'meta_campaign_not_created'});
-    try{const remote=await fetchMetaPaidCampaignStatus(req.user.id,String(ad.meta_connection_id||''),ad.meta_campaign_id);const incomplete=!ad.meta_published_at;const localStatus=incomplete?'failed':deriveLocalMetaStatus(remote);const metaStatus=incomplete?'RECONCILIATION_REQUIRED':String(remote.campaign?.effective_status||remote.campaign?.status||'');const metadata={...(ad.metadata||{}),metaDelivery:{refreshedAt:new Date().toISOString(),remote}};const {rows}=await pool.query(`UPDATE promotion_ad_campaigns SET status=$3,meta_status=$4,metadata=$5::jsonb,updated_at=now() WHERE id=$1 AND owner_user_id=$2 RETURNING *`,[ad.id,req.user.id,localStatus,metaStatus,JSON.stringify(metadata)]);res.json({adCampaign:mapAdCampaign(rows[0]),remote});}catch(e){res.status(502).json({error:e.message||'meta_status_refresh_failed',meta:e.meta||undefined});}
+    try{const remote=await fetchMetaPaidCampaignStatus(req.user.id,String(ad.meta_connection_id||''),ad.meta_campaign_id);const saved=await saveMetaDelivery(ad,req.user.id,remote);res.json({adCampaign:mapAdCampaign(saved),remote});}catch(e){res.status(502).json({error:e.message||'meta_status_refresh_failed',meta:e.meta||undefined});}
   });
 
   app.post(`${ROOT}/ad-campaigns/:id/meta/status`, requireAuth, async (req,res)=>{
@@ -880,12 +888,12 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
       if(status==='ACTIVE')return res.status(409).json({error:'meta_submission_incomplete'});
       try{await pauseMetaPaidCampaignDelivery(req.user.id,String(ad.meta_connection_id||''),ad.meta_campaign_id);const {rows}=await pool.query(`UPDATE promotion_ad_campaigns SET status='failed',meta_status='RECONCILIATION_REQUIRED',updated_at=now() WHERE id=$1 AND owner_user_id=$2 RETURNING *`,[ad.id,req.user.id]);return res.json({adCampaign:mapAdCampaign(rows[0]),campaignPaused:true});}catch(e){return res.status(502).json({error:e.message||'meta_pause_failed'});}
     }
-    try{await setMetaPaidCampaignStatus(req.user.id,String(ad.meta_connection_id||''),ad.meta_campaign_id,status);const remote=await fetchMetaPaidCampaignStatus(req.user.id,String(ad.meta_connection_id||''),ad.meta_campaign_id);const localStatus=deriveLocalMetaStatus(remote);const metaStatus=String(remote.campaign?.effective_status||remote.campaign?.status||status);const {rows}=await pool.query(`UPDATE promotion_ad_campaigns SET status=$3,meta_status=$4,updated_at=now() WHERE id=$1 AND owner_user_id=$2 RETURNING *`,[ad.id,req.user.id,localStatus,metaStatus]);res.json({adCampaign:mapAdCampaign(rows[0]),remote});}catch(e){res.status(502).json({error:e.message||'meta_status_update_failed',meta:e.meta||undefined});}
+    try{await setMetaPaidCampaignStatus(req.user.id,String(ad.meta_connection_id||''),ad.meta_campaign_id,status);const remote=await fetchMetaPaidCampaignStatus(req.user.id,String(ad.meta_connection_id||''),ad.meta_campaign_id);const saved=await saveMetaDelivery(ad,req.user.id,remote);res.json({adCampaign:mapAdCampaign(saved),remote});}catch(e){res.status(502).json({error:e.message||'meta_status_update_failed',meta:e.meta||undefined});}
   });
 
   app.post(`${ROOT}/ad-campaigns/:id/meta/discard`, requireAuth, async (req,res)=>{
     const ad=await adCampaignOwned(req.params.id,req.user.id);if(!ad)return res.status(404).json({error:'ad_campaign_not_found'});if(ad.status==='publishing')return res.status(409).json({error:'meta_submission_in_progress'});if(!ad.meta_campaign_id)return res.status(409).json({error:'meta_campaign_not_created'});if(String(req.body?.confirmationText||'').trim().toUpperCase()!=='DELETE')return res.status(400).json({error:'delete_confirmation_required'});
-    try{await deleteMetaPaidCampaign(req.user.id,String(ad.meta_connection_id||''),ad.meta_campaign_id);await pool.query(`UPDATE promotion_ad_creatives SET meta_video_id_916='',meta_video_id_43='',meta_ad_ids='[]'::jsonb,updated_at=now() WHERE ad_campaign_id=$1`,[ad.id]);const {rows}=await pool.query(`UPDATE promotion_ad_campaigns SET status='ready',meta_campaign_id='',meta_adset_id='',meta_status='',meta_published_at=NULL,meta_publish_fingerprint='',meta_last_error='{}'::jsonb,updated_at=now() WHERE id=$1 AND owner_user_id=$2 RETURNING *`,[ad.id,req.user.id]);res.json({adCampaign:mapAdCampaign(rows[0]),deleted:true});}catch(e){res.status(502).json({error:e.message||'meta_discard_failed',meta:e.meta||undefined});}
+    try{await deleteMetaPaidCampaign(req.user.id,String(ad.meta_connection_id||''),ad.meta_campaign_id);await pool.query(`UPDATE promotion_ad_creatives SET meta_video_id_916='',meta_video_id_43='',meta_ad_ids='[]'::jsonb,updated_at=now() WHERE ad_campaign_id=$1`,[ad.id]);const {rows}=await pool.query(`UPDATE promotion_ad_campaigns SET status='ready',meta_campaign_id='',meta_adset_id='',meta_status='',meta_published_at=NULL,meta_publish_fingerprint='',meta_last_error='{}'::jsonb,metadata=metadata-'metaDelivery'-'metaPublish',updated_at=now() WHERE id=$1 AND owner_user_id=$2 RETURNING *`,[ad.id,req.user.id]);res.json({adCampaign:mapAdCampaign(rows[0]),deleted:true});}catch(e){res.status(502).json({error:e.message||'meta_discard_failed',meta:e.meta||undefined});}
   });
 
   app.get(`${ROOT}/ad-campaigns/:id/analytics`, requireAuth, async (req,res)=>{

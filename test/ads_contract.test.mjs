@@ -44,9 +44,19 @@ test("Review and submission states do not claim approval for a paused remote dra
     meta_campaign_id: "remote-id", meta_status: "PAUSED", meta_last_error: {} };
   const paused = projectAdsCampaign(base);
   assert.equal(paused.metaSubmission.state, "submitted");
+  assert.equal(paused.delivery.state, "paused");
   assert.equal(paused.review.state, "unknown");
   assert.equal(projectAdsCampaign({ ...base, status: "in_review" }).review.state, "pending");
   assert.equal(projectAdsCampaign({ ...base, status: "failed", meta_status: "DISAPPROVED" }).review.state, "rejected");
+  const submitted = projectAdsCampaign({ ...base, status: "submitted", meta_status: "ACTIVE", meta_published_at: "2026-09-30T12:00:00Z" });
+  assert.equal(submitted.delivery.state, "submitted");
+  assert.equal(submitted.review.state, "unknown");
+  const rejected = projectAdsCampaign({ ...base, status: "rejected", metadata: { metaDelivery: {
+    refreshedAt: "2026-09-30T13:00:00Z", remote: { campaign: { effective_status: "ACTIVE" }, adSets: [{ effective_status: "ACTIVE" }],
+      ads: [{ effective_status: "DISAPPROVED", issues_info: [{ error_message: "Policy issue" }] }] } } } });
+  assert.equal(rejected.delivery.state, "rejected");
+  assert.equal(rejected.review.state, "rejected");
+  assert.equal(rejected.delivery.reasons[0].message, "Policy issue");
 });
 
 test("Ads draft rejects provider payloads, invalid ages, and duplicate placements", () => {

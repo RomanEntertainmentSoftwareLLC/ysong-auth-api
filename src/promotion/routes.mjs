@@ -11,6 +11,7 @@ import { DestinationSchema, saveDestinations } from "./destinations.mjs";
 import { eventMetadataWithAttribution, verifiedAttribution } from "./attribution.mjs";
 import { stockProviderStatus, searchStockVideos, resolveStockVideoForImport, downloadStockFile } from "./stock.mjs";
 import { buildPromotionIntelligence } from "./intelligence.mjs";
+import { normalizePaidAnalytics } from "./analytics.mjs";
 import { AdsDraftSchema, draftToStorage, storageToDraft, projectAdsCampaign } from "./ads-contract.mjs";
 import { assertMetaAssetSelection, metaAssetInventory } from "./meta-assets.mjs";
 import { metaDeliveryState } from "./meta-delivery.mjs";
@@ -339,7 +340,8 @@ async function loadPaidAnalyticsEnvelope(ad,userId,query={}){
   }else warnings.push({code:'meta_campaign_not_created',message:'This YSong ad campaign has not been created in Meta yet. Smart Link attribution will still appear when tagged traffic exists.'});
   if(Array.isArray(meta.warnings))warnings.push(...meta.warnings);
   const derived=mergePaidAnalytics(meta,ysong,ad.currency);
-  return {range,capturedAt,stale,meta,ysong,derived,warnings};
+  const normalized=normalizePaidAnalytics({ad,range,capturedAt,stale,meta,ysong});
+  return {range,capturedAt,stale,meta,ysong,derived,normalized,warnings};
 }
 
 export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMetadata,writeObjectMetadata,assertOwnedObjectKey}) {

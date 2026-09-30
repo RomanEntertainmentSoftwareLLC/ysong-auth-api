@@ -471,7 +471,10 @@ function actionValue(row, type) {
 function actionTotal(row) {
   return Array.isArray(row) ? row.reduce((n, x) => n + Number(x?.value || 0), 0) : Number(row || 0);
 }
-function insightNumber(row, key) { return Number(row?.[key] || 0); }
+function insightNumber(row, key) {
+  const value = row?.[key];
+  return value === undefined || value === null || value === "" || !Number.isFinite(Number(value)) ? null : Number(value);
+}
 function normalizeInsightRow(row = {}) {
   const outboundClicks = actionTotal(row.outbound_clicks);
   const linkClicks = insightNumber(row, "inline_link_clicks") || actionValue(row.actions, "link_click") || outboundClicks;

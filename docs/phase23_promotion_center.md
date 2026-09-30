@@ -124,9 +124,12 @@ Paid publishing is explicit and fail-closed:
 - A draft Smart Link is never activated silently; the user must explicitly approve activation.
 - Meta objects are created PAUSED first. For active publishing, Ads are activated first, then the Ad Set, then the Campaign. The paused parent prevents delivery during partial activation.
 - Pausing reverses that safety order by pausing the Campaign first, then descendants.
+- Status changes read every page of Ad Sets and Ads and fail if Meta cannot provide the hierarchy; an incomplete child lookup is never treated as an empty hierarchy.
 - Resuming paid delivery requires the user to type `RESUME`.
 - Deleting a failed/paused remote Meta draft requires `DELETE`. YSong source assets and campaign configuration remain intact.
 - Partial Meta creation is persisted progressively so a failure can be inspected and the remote draft can be cleaned up rather than orphaned silently.
+- Publish atomically claims a reviewed draft before the first Graph write. Repeating a publish request returns `meta_submission_already_started`; it never automatically replays an uncertain Meta POST. The claim fingerprint and each returned campaign, ad set, video, and ad ID remain in Promotion storage.
+- A failed partial submission reports `RECONCILIATION_REQUIRED`. If a campaign ID was saved, refresh can inspect the remote hierarchy and confirmed `DELETE` can discard it before a new preflight. Incomplete submissions cannot be resumed for delivery. If a request timed out before Meta returned a campaign ID, YSong cannot prove whether a remote object exists; inspect the selected ad account in Meta before any manual recovery. No success is inferred from a timeout.
 
 ### Placement-aware creative mapping
 
@@ -149,6 +152,8 @@ The Meta connection requests Page/Instagram scopes plus `ads_read`, `ads_managem
 Optional server setting:
 
 - `META_PROMOTION_CTA=LISTEN_NOW` (falls back to `LEARN_MORE` if Meta rejects the preferred CTA while creating the ad creative)
+
+The adapter follows Meta's official [campaign](https://www.postman.com/meta/facebook-marketing-api/request/q8owgyc/creating-campaign-l3), [ad set](https://www.postman.com/meta/facebook-marketing-api/request/exbh254/creating-adset-l2), and [ad](https://www.postman.com/meta/facebook-marketing-api/request/kyc8tuh/creating-an-ad-based-on-adcreative-id-l1) request examples. Account eligibility, creative acceptance, review, and delivery still depend on Meta's live response for the connected assets.
 
 Phase 23.4 intentionally does not implement the Phase 23.5 analytics dashboard yet. Status refresh exists now; spend, reach, CTR/CPC, video-view metrics, and joined YSong/Meta attribution are the next sub-phase.
 

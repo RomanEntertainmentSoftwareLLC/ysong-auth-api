@@ -31,6 +31,7 @@ import {
   fetchMetaCampaignAnalyticsBundle,
   fetchMetaPaidCampaignStatus,
   setMetaPaidCampaignStatus,
+  pauseMetaPaidCampaignDelivery,
   deleteMetaPaidCampaign,
   deriveLocalMetaStatus,
   META_DSA_COUNTRIES,
@@ -362,7 +363,7 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
     else if(smart.status==='archived')errors.push({code:'smart_link_archived',message:'The Smart Link is archived and cannot receive paid traffic.'});
     else if(requiresSmartLinkActivation)warnings.push({code:'smart_link_activation_required',message:'The Smart Link is still a draft. You must explicitly activate it when publishing.'});
     if(smart&&destinations.length<1)errors.push({code:'smart_link_destination_required',message:'Add at least one enabled destination to the Smart Link before buying traffic.'});
-    if(ad.meta_campaign_id)errors.push({code:'meta_campaign_already_exists',message:'A Meta campaign already exists for this YSong ad campaign. Refresh or manage that campaign instead of publishing a duplicate.'});
+    if(ad.meta_campaign_id || ad.meta_publish_fingerprint || ad.status==='publishing')errors.push({code:'meta_submission_already_started',message:'A Meta submission already started. Inspect its saved state before attempting another publish.'});
     if(!ad.meta_connection_id||!connection)errors.push({code:'meta_connection_required',message:'Select a connected Facebook Page / Instagram profile.'});
     if(!ad.meta_ad_account_id)errors.push({code:'meta_ad_account_required',message:'Select a Meta Ad Account.'});
     else if(!account)errors.push({code:'meta_ad_account_unavailable',message:'The selected Meta Ad Account is not available through this connection.'});
@@ -510,7 +511,7 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
   app.patch(`${ROOT}/ads/campaigns/:id`, requireAuth, async (req,res)=>{
     const current=await adCampaignOwned(req.params.id,req.user.id);
     if(!current)return res.status(404).json({error:"ad_campaign_not_found"});
-    if(current.meta_campaign_id||!["draft","ready","failed"].includes(current.status))return res.status(409).json({error:"ads_draft_locked"});
+    if(current.meta_campaign_id||current.meta_publish_fingerprint||!["draft","ready","failed"].includes(current.status))return res.status(409).json({error:"ads_draft_locked"});
     try{
       const prior=storageToDraft(current);
       const body=req.body||{};
@@ -524,7 +525,7 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
       if(!smart)return res.status(404).json({error:"campaign_not_found"});
       const referenceError=await validateAdsDraftReferences(draft,smart,req.user.id,current.id,body.connectedAssets!==undefined);
       if(referenceError)return res.status(referenceError==='connected_assets_changed'||referenceError==='selected_release_not_linked'||referenceError==='track_release_mismatch'?409:404).json({error:referenceError});
-      const {rows}=await pool.query(`UPDATE promotion_ad_campaigns SET source_track_id=$3,name=$4,goal=$5,genre=$6,genre_source=$7,daily_budget_minor=$8,currency=$9,schedule_start=$10,schedule_end=$11,timezone=$12,placements=$13::jsonb,targeting=$14::jsonb,ad_text=$15,ad_headline=$16,language=$17,meta_connection_id=$18,meta_ad_account_id=$19,meta_pixel_id=$20,metadata=$21::jsonb,updated_at=now() WHERE id=$1 AND owner_user_id=$2 AND meta_campaign_id='' AND status IN ('draft','ready','failed') RETURNING *`,[
+      const {rows}=await pool.query(`UPDATE promotion_ad_campaigns SET source_track_id=$3,name=$4,goal=$5,genre=$6,genre_source=$7,daily_budget_minor=$8,currency=$9,schedule_start=$10,schedule_end=$11,timezone=$12,placements=$13::jsonb,targeting=$14::jsonb,ad_text=$15,ad_headline=$16,language=$17,meta_connection_id=$18,meta_ad_account_id=$19,meta_pixel_id=$20,metadata=$21::jsonb,updated_at=now() WHERE id=$1 AND owner_user_id=$2 AND meta_campaign_id='' AND meta_publish_fingerprint='' AND status IN ('draft','ready','failed') RETURNING *`,[
         current.id,req.user.id,input.sourceTrackId,input.name,input.goal,input.genre,input.genreSource,input.dailyBudgetMinor,input.currency,input.scheduleStart?new Date(input.scheduleStart):null,input.scheduleEnd?new Date(input.scheduleEnd):null,input.timezone,JSON.stringify(input.placements),JSON.stringify(input.targeting),input.adText,input.adHeadline,input.language,input.metaConnectionId,input.metaAdAccountId,input.metaPixelId,JSON.stringify({...current.metadata,adsDraft:input.adsDraft}),
       ]);
       if(!rows[0])return res.status(409).json({error:"ads_draft_locked"});
@@ -577,6 +578,7 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
 
   app.patch(`${ROOT}/ad-campaigns/:id`, requireAuth, async (req,res)=>{
     const current=await adCampaignOwned(req.params.id,req.user.id); if(!current)return res.status(404).json({error:"ad_campaign_not_found"});
+    if(current.meta_publish_fingerprint||current.meta_campaign_id||current.status==='publishing')return res.status(409).json({error:'ad_campaign_locked'});
     try{
       const merged={
         campaignId:String(req.body?.campaignId||current.campaign_id),
@@ -595,9 +597,10 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
       const input=AdCampaignSchema.parse(merged);
       const target={...input.targeting,platforms:input.placements};
       let coverKey=input.coverArtObjectKey||null; if(coverKey)coverKey=assertOwnedObjectKey(req.user.id,coverKey);
-      const {rows}=await pool.query(`UPDATE promotion_ad_campaigns SET source_track_id=$3,name=$4,goal=$5,genre=$6,genre_source=$7,daily_budget_minor=$8,currency=$9,schedule_start=$10,schedule_end=$11,timezone=$12,placements=$13::jsonb,targeting=$14::jsonb,ad_text=$15,ad_headline=$16,language=$17,cover_art_object_key=$18,meta_connection_id=$19,meta_ad_account_id=$20,meta_pixel_id=$21,dsa_beneficiary=$22,dsa_payor=$23,updated_at=now() WHERE id=$1 AND owner_user_id=$2 RETURNING *`,[
+      const {rows}=await pool.query(`UPDATE promotion_ad_campaigns SET source_track_id=$3,name=$4,goal=$5,genre=$6,genre_source=$7,daily_budget_minor=$8,currency=$9,schedule_start=$10,schedule_end=$11,timezone=$12,placements=$13::jsonb,targeting=$14::jsonb,ad_text=$15,ad_headline=$16,language=$17,cover_art_object_key=$18,meta_connection_id=$19,meta_ad_account_id=$20,meta_pixel_id=$21,dsa_beneficiary=$22,dsa_payor=$23,updated_at=now() WHERE id=$1 AND owner_user_id=$2 AND meta_campaign_id='' AND meta_publish_fingerprint='' AND status<>'publishing' RETURNING *`,[
         current.id,req.user.id,input.sourceTrackId||null,input.name,input.goal,input.genre,input.genreSource,input.dailyBudgetMinor,input.currency.toUpperCase(),input.scheduleStart?new Date(input.scheduleStart):null,input.scheduleEnd?new Date(input.scheduleEnd):null,input.timezone,JSON.stringify(input.placements),JSON.stringify(target),input.adText,input.adHeadline,input.language,coverKey,input.metaConnectionId||null,input.metaAdAccountId,input.metaPixelId,input.dsaBeneficiary,input.dsaPayor
       ]);
+      if(!rows[0])return res.status(409).json({error:'ad_campaign_locked'});
       res.json({adCampaign:mapAdCampaign(rows[0])});
     }catch(e){ if(e instanceof z.ZodError)return res.status(400).json({error:"invalid_ad_campaign",issues:e.issues}); if(e?.statusCode===403)return res.status(403).json({error:"forbidden"}); res.status(500).json({error:"ad_campaign_update_failed",message:e.message}); }
   });
@@ -813,28 +816,37 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
 
   app.post(`${ROOT}/ad-campaigns/:id/meta/publish`, requireAuth, async (req,res)=>{
     let ad=await adCampaignOwned(req.params.id,req.user.id); if(!ad)return res.status(404).json({error:"ad_campaign_not_found"});
+    if(ad.meta_publish_fingerprint || ad.meta_campaign_id || ad.status==='publishing')return res.status(409).json({error:'meta_submission_already_started',adCampaign:mapAdCampaign(ad)});
+    let requestedMode='paused'; let remoteCampaignId='';
     try{
       const input=MetaPublishSchema.parse(req.body||{});
+      requestedMode=input.mode;
       if(input.mode==='active'&&input.confirmationText.trim().toUpperCase()!=='PUBLISH')return res.status(400).json({error:'publish_confirmation_required',message:'Type PUBLISH to authorize an active paid Meta campaign.'});
       const preflight=await buildMetaPaidPreflight(ad,req.user.id,req,input);
       if(preflight.fingerprint!==input.fingerprint)return res.status(409).json({error:'campaign_changed_after_review',message:'Campaign settings changed after the confirmation screen was reviewed. Run preflight again.',preflight});
       if(!preflight.ready)return res.status(409).json({error:'meta_preflight_failed',preflight});
       if(preflight.requiresSmartLinkActivation&&!input.activateSmartLink)return res.status(409).json({error:'smart_link_activation_required',message:'Explicitly approve Smart Link activation before publishing.',preflight});
-      if(preflight.requiresSmartLinkActivation)await pool.query(`UPDATE promotion_campaigns SET status='active',updated_at=now() WHERE id=$1 AND owner_user_id=$2 AND status='draft'`,[ad.campaign_id,req.user.id]);
-      const smart=await campaignOwned(ad.campaign_id,req.user.id); if(!smart||smart.status!=='active')throw new Error('smart_link_not_active');
-      await pool.query(`UPDATE promotion_ad_campaigns SET status='publishing',meta_status='CREATING',meta_last_error='{}'::jsonb,dsa_beneficiary=$3,dsa_payor=$4,updated_at=now() WHERE id=$1 AND owner_user_id=$2`,[ad.id,req.user.id,preflight.effectiveDsa.beneficiary,preflight.effectiveDsa.payor]);
       const creativeInputs=[];
+      const smart=await campaignOwned(ad.campaign_id,req.user.id); if(!smart||!['active','draft'].includes(smart.status))throw new Error('smart_link_not_available');
       for(const c of preflight.creatives){
         const k916=assertOwnedObjectKey(req.user.id,String(c.object_key_916||'')); const k43=assertOwnedObjectKey(req.user.id,String(c.object_key_43||''));
         const filePath916=objectPath(k916); const filePath43=objectPath(k43); await Promise.all([fs.promises.access(filePath916,fs.constants.R_OK),fs.promises.access(filePath43,fs.constants.R_OK)]);
         creativeInputs.push({id:String(c.id),filePath916,filePath43,linkUrl:paidCreativeLink(smart,ad,String(c.id))});
       }
+      // Claim the draft before any remote write. A timed-out Graph POST may have
+      // succeeded without returning an ID, so a retry must never create another.
+      const claim=await pool.query(`UPDATE promotion_ad_campaigns SET status='publishing',meta_status='CREATING',meta_publish_fingerprint=$3,meta_last_error='{}'::jsonb,dsa_beneficiary=$4,dsa_payor=$5,updated_at=now() WHERE id=$1 AND owner_user_id=$2 AND meta_campaign_id='' AND meta_publish_fingerprint='' AND status IN ('draft','ready','failed') RETURNING id`,[ad.id,req.user.id,input.fingerprint,preflight.effectiveDsa.beneficiary,preflight.effectiveDsa.payor]);
+      if(!claim.rows[0])return res.status(409).json({error:'meta_submission_already_started'});
+      if(preflight.requiresSmartLinkActivation)await pool.query(`UPDATE promotion_campaigns SET status='active',updated_at=now() WHERE id=$1 AND owner_user_id=$2 AND status='draft'`,[ad.campaign_id,req.user.id]);
+      const activeSmart=await campaignOwned(ad.campaign_id,req.user.id); if(!activeSmart||activeSmart.status!=='active')throw new Error('smart_link_not_active');
       const progress={stage:'starting',ads:[]};
       const onProgress=async(next)=>{
+        if(next.campaignId)remoteCampaignId=String(next.campaignId);
         Object.assign(progress,next); if(Array.isArray(next.ads))progress.ads=next.ads;
         if(next.campaignId)await pool.query(`UPDATE promotion_ad_campaigns SET meta_campaign_id=$3,meta_status=$4,updated_at=now() WHERE id=$1 AND owner_user_id=$2`,[ad.id,req.user.id,String(next.campaignId),String(next.stage||'CREATING').toUpperCase()]);
         if(next.adSetId)await pool.query(`UPDATE promotion_ad_campaigns SET meta_adset_id=$3,updated_at=now() WHERE id=$1 AND owner_user_id=$2`,[ad.id,req.user.id,String(next.adSetId)]);
         if(next.localCreativeId&&(next.verticalVideoId||next.feedVideoId))await pool.query(`UPDATE promotion_ad_creatives SET meta_video_id_916=COALESCE(NULLIF($3,''),meta_video_id_916),meta_video_id_43=COALESCE(NULLIF($4,''),meta_video_id_43),updated_at=now() WHERE id=$1 AND ad_campaign_id=$2`,[next.localCreativeId,ad.id,String(next.verticalVideoId||''),String(next.feedVideoId||'')]);
+        if(next.localCreativeId&&next.creativeId&&!next.ad)await pool.query(`UPDATE promotion_ad_creatives SET meta_ad_ids=$3::jsonb,updated_at=now() WHERE id=$1 AND ad_campaign_id=$2`,[next.localCreativeId,ad.id,JSON.stringify([{creativeId:next.creativeId,adId:'',linkUrl:next.linkUrl}])]);
         if(next.ad?.localCreativeId)await pool.query(`UPDATE promotion_ad_creatives SET meta_ad_ids=$3::jsonb,updated_at=now() WHERE id=$1 AND ad_campaign_id=$2`,[next.ad.localCreativeId,ad.id,JSON.stringify([{adId:next.ad.adId,creativeId:next.ad.creativeId,linkUrl:next.ad.linkUrl}])]);
       };
       const remote=await createMetaPaidCampaign({userId:req.user.id,connectionId:String(ad.meta_connection_id||''),adAccountId:ad.meta_ad_account_id,name:ad.name,dailyBudgetMinor:Number(ad.daily_budget_minor),startTime:ad.schedule_start,endTime:ad.schedule_end,targeting:ad.targeting||{},message:ad.ad_text,headline:ad.ad_headline,creatives:creativeInputs,dsaBeneficiary:preflight.effectiveDsa.beneficiary,dsaPayor:preflight.effectiveDsa.payor,activate:input.mode==='active',onProgress});
@@ -845,26 +857,34 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
       res.status(201).json({adCampaign:mapAdCampaign(rows[0]),remote,preflight});
     }catch(e){
       console.error('Meta paid publish',e);
-      const latest=await adCampaignOwned(req.params.id,req.user.id).catch(()=>null); const errorBody={message:e?.message||'meta_paid_publish_failed',code:e?.code||'',meta:e?.meta||{},at:new Date().toISOString()};
-      if(latest)await pool.query(`UPDATE promotion_ad_campaigns SET status='failed',meta_status='ERROR',meta_last_error=$3::jsonb,updated_at=now() WHERE id=$1 AND owner_user_id=$2`,[latest.id,req.user.id,JSON.stringify(errorBody)]).catch(()=>{});
+      const latest=await adCampaignOwned(req.params.id,req.user.id).catch(()=>null);
+      const knownCampaignId=remoteCampaignId||String(latest?.meta_campaign_id||'');
+      let deliveryPauseError='';
+      if(requestedMode==='active'&&knownCampaignId)await pauseMetaPaidCampaignDelivery(req.user.id,String(ad.meta_connection_id||''),knownCampaignId).catch(error=>{deliveryPauseError=error?.message||'meta_pause_failed';});
+      const errorBody={message:e?.message||'meta_paid_publish_failed',code:e?.code||'',meta:e?.meta||{},at:new Date().toISOString(),...(deliveryPauseError?{deliveryPauseError}:{})};
+      if(latest?.meta_publish_fingerprint)await pool.query(`UPDATE promotion_ad_campaigns SET status='failed',meta_status='RECONCILIATION_REQUIRED',meta_campaign_id=CASE WHEN meta_campaign_id='' THEN $4 ELSE meta_campaign_id END,meta_last_error=$3::jsonb,updated_at=now() WHERE id=$1 AND owner_user_id=$2`,[latest.id,req.user.id,JSON.stringify(errorBody),knownCampaignId]).catch(()=>{});
       if(e instanceof z.ZodError)return res.status(400).json({error:'invalid_meta_publish',issues:e.issues});
       res.status(502).json({error:e?.message||'meta_paid_publish_failed',meta:e?.meta||undefined});
     }
   });
 
   app.post(`${ROOT}/ad-campaigns/:id/meta/refresh`, requireAuth, async (req,res)=>{
-    const ad=await adCampaignOwned(req.params.id,req.user.id);if(!ad)return res.status(404).json({error:'ad_campaign_not_found'});if(!ad.meta_campaign_id)return res.status(409).json({error:'meta_campaign_not_created'});
-    try{const remote=await fetchMetaPaidCampaignStatus(req.user.id,String(ad.meta_connection_id||''),ad.meta_campaign_id);const localStatus=deriveLocalMetaStatus(remote);const metaStatus=String(remote.campaign?.effective_status||remote.campaign?.status||'');const metadata={...(ad.metadata||{}),metaDelivery:{refreshedAt:new Date().toISOString(),remote}};const {rows}=await pool.query(`UPDATE promotion_ad_campaigns SET status=$3,meta_status=$4,metadata=$5::jsonb,updated_at=now() WHERE id=$1 AND owner_user_id=$2 RETURNING *`,[ad.id,req.user.id,localStatus,metaStatus,JSON.stringify(metadata)]);res.json({adCampaign:mapAdCampaign(rows[0]),remote});}catch(e){res.status(502).json({error:e.message||'meta_status_refresh_failed',meta:e.meta||undefined});}
+    const ad=await adCampaignOwned(req.params.id,req.user.id);if(!ad)return res.status(404).json({error:'ad_campaign_not_found'});if(ad.status==='publishing')return res.status(409).json({error:'meta_submission_in_progress'});if(!ad.meta_campaign_id)return res.status(409).json({error:'meta_campaign_not_created'});
+    try{const remote=await fetchMetaPaidCampaignStatus(req.user.id,String(ad.meta_connection_id||''),ad.meta_campaign_id);const incomplete=!ad.meta_published_at;const localStatus=incomplete?'failed':deriveLocalMetaStatus(remote);const metaStatus=incomplete?'RECONCILIATION_REQUIRED':String(remote.campaign?.effective_status||remote.campaign?.status||'');const metadata={...(ad.metadata||{}),metaDelivery:{refreshedAt:new Date().toISOString(),remote}};const {rows}=await pool.query(`UPDATE promotion_ad_campaigns SET status=$3,meta_status=$4,metadata=$5::jsonb,updated_at=now() WHERE id=$1 AND owner_user_id=$2 RETURNING *`,[ad.id,req.user.id,localStatus,metaStatus,JSON.stringify(metadata)]);res.json({adCampaign:mapAdCampaign(rows[0]),remote});}catch(e){res.status(502).json({error:e.message||'meta_status_refresh_failed',meta:e.meta||undefined});}
   });
 
   app.post(`${ROOT}/ad-campaigns/:id/meta/status`, requireAuth, async (req,res)=>{
-    const ad=await adCampaignOwned(req.params.id,req.user.id);if(!ad)return res.status(404).json({error:'ad_campaign_not_found'});if(!ad.meta_campaign_id)return res.status(409).json({error:'meta_campaign_not_created'});
+    const ad=await adCampaignOwned(req.params.id,req.user.id);if(!ad)return res.status(404).json({error:'ad_campaign_not_found'});if(!ad.meta_campaign_id)return res.status(409).json({error:'meta_campaign_not_created'});if(ad.status==='publishing')return res.status(409).json({error:'meta_submission_in_progress'});
     const status=String(req.body?.status||'').toUpperCase();if(!['ACTIVE','PAUSED'].includes(status))return res.status(400).json({error:'meta_status_invalid'});if(status==='ACTIVE'&&(req.body?.confirm!==true||String(req.body?.confirmationText||'').trim().toUpperCase()!=='RESUME'))return res.status(400).json({error:'resume_confirmation_required',message:'Type RESUME to authorize paid delivery.'});
+    if(!ad.meta_published_at){
+      if(status==='ACTIVE')return res.status(409).json({error:'meta_submission_incomplete'});
+      try{await pauseMetaPaidCampaignDelivery(req.user.id,String(ad.meta_connection_id||''),ad.meta_campaign_id);const {rows}=await pool.query(`UPDATE promotion_ad_campaigns SET status='failed',meta_status='RECONCILIATION_REQUIRED',updated_at=now() WHERE id=$1 AND owner_user_id=$2 RETURNING *`,[ad.id,req.user.id]);return res.json({adCampaign:mapAdCampaign(rows[0]),campaignPaused:true});}catch(e){return res.status(502).json({error:e.message||'meta_pause_failed'});}
+    }
     try{await setMetaPaidCampaignStatus(req.user.id,String(ad.meta_connection_id||''),ad.meta_campaign_id,status);const remote=await fetchMetaPaidCampaignStatus(req.user.id,String(ad.meta_connection_id||''),ad.meta_campaign_id);const localStatus=deriveLocalMetaStatus(remote);const metaStatus=String(remote.campaign?.effective_status||remote.campaign?.status||status);const {rows}=await pool.query(`UPDATE promotion_ad_campaigns SET status=$3,meta_status=$4,updated_at=now() WHERE id=$1 AND owner_user_id=$2 RETURNING *`,[ad.id,req.user.id,localStatus,metaStatus]);res.json({adCampaign:mapAdCampaign(rows[0]),remote});}catch(e){res.status(502).json({error:e.message||'meta_status_update_failed',meta:e.meta||undefined});}
   });
 
   app.post(`${ROOT}/ad-campaigns/:id/meta/discard`, requireAuth, async (req,res)=>{
-    const ad=await adCampaignOwned(req.params.id,req.user.id);if(!ad)return res.status(404).json({error:'ad_campaign_not_found'});if(!ad.meta_campaign_id)return res.status(409).json({error:'meta_campaign_not_created'});if(String(req.body?.confirmationText||'').trim().toUpperCase()!=='DELETE')return res.status(400).json({error:'delete_confirmation_required'});
+    const ad=await adCampaignOwned(req.params.id,req.user.id);if(!ad)return res.status(404).json({error:'ad_campaign_not_found'});if(ad.status==='publishing')return res.status(409).json({error:'meta_submission_in_progress'});if(!ad.meta_campaign_id)return res.status(409).json({error:'meta_campaign_not_created'});if(String(req.body?.confirmationText||'').trim().toUpperCase()!=='DELETE')return res.status(400).json({error:'delete_confirmation_required'});
     try{await deleteMetaPaidCampaign(req.user.id,String(ad.meta_connection_id||''),ad.meta_campaign_id);await pool.query(`UPDATE promotion_ad_creatives SET meta_video_id_916='',meta_video_id_43='',meta_ad_ids='[]'::jsonb,updated_at=now() WHERE ad_campaign_id=$1`,[ad.id]);const {rows}=await pool.query(`UPDATE promotion_ad_campaigns SET status='ready',meta_campaign_id='',meta_adset_id='',meta_status='',meta_published_at=NULL,meta_publish_fingerprint='',meta_last_error='{}'::jsonb,updated_at=now() WHERE id=$1 AND owner_user_id=$2 RETURNING *`,[ad.id,req.user.id]);res.json({adCampaign:mapAdCampaign(rows[0]),deleted:true});}catch(e){res.status(502).json({error:e.message||'meta_discard_failed',meta:e.meta||undefined});}
   });
 

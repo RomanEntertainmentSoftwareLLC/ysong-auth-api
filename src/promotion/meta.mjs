@@ -315,7 +315,7 @@ export function buildMetaPlacementCreativeSpec({ conn, targeting, verticalVideoI
 }
 
 async function createRemoteCampaign({ token, adAccountId, name }) {
-  const body = new URLSearchParams({ access_token: token, name, objective: "OUTCOME_TRAFFIC", buying_type: "AUCTION", status: "PAUSED", special_ad_categories: "[]" });
+  const body = new URLSearchParams({ access_token: token, name, objective: "OUTCOME_TRAFFIC", buying_type: "AUCTION", status: "PAUSED", special_ad_categories: "[]", is_adset_budget_sharing_enabled: "false" });
   const data = await jsonFetch(`${GRAPH}/${actId(adAccountId)}/campaigns`, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
   const id = String(data.id || "");
   if (!id) throw new Error("meta_campaign_missing_id");
@@ -385,15 +385,23 @@ export async function createMetaPaidCampaign({ userId, connectionId, adAccountId
       spec = buildMetaPlacementCreativeSpec({ conn, targeting, verticalVideoId, feedVideoId, linkUrl: item.linkUrl, message, headline, ctaType: "LEARN_MORE" });
       creativeId = await createRemoteCreative({ token, adAccountId, name: `${name} · Creative ${i + 1}`, spec });
     }
+    if (onProgress) await onProgress({ stage: "creative", campaignId, adSetId, localCreativeId: item.id, creativeId, linkUrl: item.linkUrl });
     const adId = await createRemoteAd({ token, adAccountId, name: `${name} · Ad ${i + 1}`, adSetId, creativeId });
     const created = { localCreativeId: item.id, verticalVideoId, feedVideoId, creativeId, adId, linkUrl: item.linkUrl };
     ads.push(created);
     if (onProgress) await onProgress({ stage: "ad", campaignId, adSetId, ad: created, ads: [...ads] });
   }
   if (activate) {
-    for (const ad of ads) await setRemoteStatus(token, ad.adId, "ACTIVE");
-    await setRemoteStatus(token, adSetId, "ACTIVE");
-    await setRemoteStatus(token, campaignId, "ACTIVE");
+    try {
+      for (const ad of ads) await setRemoteStatus(token, ad.adId, "ACTIVE");
+      await setRemoteStatus(token, adSetId, "ACTIVE");
+      await setRemoteStatus(token, campaignId, "ACTIVE");
+    } catch (error) {
+      // The campaign is the delivery gate. Preserve the original error and
+      // leave the persisted IDs available for refresh or explicit discard.
+      await setRemoteStatus(token, campaignId, "PAUSED").catch(() => {});
+      throw error;
+    }
   }
   const status = activate ? "ACTIVE" : "PAUSED";
   if (onProgress) await onProgress({ stage: "complete", campaignId, adSetId, ads, status });
@@ -421,6 +429,10 @@ export async function setMetaPaidCampaignStatus(userId, connectionId, campaignId
   }
   return { campaignId, status: normalized, adSetIds, adIds };
 }
+export async function pauseMetaPaidCampaignDelivery(userId, connectionId, campaignId) {
+  const { token } = await marketingToken(userId, connectionId);
+  await setRemoteStatus(token, campaignId, "PAUSED");
+}
 export async function deleteMetaPaidCampaign(userId, connectionId, campaignId) {
   const { token } = await marketingToken(userId, connectionId);
   const body = new URLSearchParams({ access_token: token });
@@ -430,9 +442,9 @@ export async function deleteMetaPaidCampaign(userId, connectionId, campaignId) {
 async function fetchMetaPaidCampaignStatusWithToken(token, campaignId) {
   const campaignFields = "id,name,status,effective_status,start_time,stop_time,updated_time";
   const campaign = await jsonFetch(`${GRAPH}/${encodeURIComponent(campaignId)}?${new URLSearchParams({ fields: campaignFields, access_token: token }).toString()}`);
-  const adsets = await jsonFetch(`${GRAPH}/${encodeURIComponent(campaignId)}/adsets?${new URLSearchParams({ fields: "id,name,status,effective_status,start_time,end_time,daily_budget,budget_remaining", limit: "100", access_token: token }).toString()}`).catch(() => ({ data: [] }));
-  const ads = await jsonFetch(`${GRAPH}/${encodeURIComponent(campaignId)}/ads?${new URLSearchParams({ fields: "id,name,status,effective_status,issues_info,adset_id,creative{id}", limit: "500", access_token: token }).toString()}`).catch(() => ({ data: [] }));
-  return { campaign, adSets: adsets.data || [], ads: ads.data || [] };
+  const adSets = await graphCollection(`${GRAPH}/${encodeURIComponent(campaignId)}/adsets`, { fields: "id,name,status,effective_status,start_time,end_time,daily_budget,budget_remaining", limit: "100", access_token: token });
+  const ads = await graphCollection(`${GRAPH}/${encodeURIComponent(campaignId)}/ads`, { fields: "id,name,status,effective_status,issues_info,adset_id,creative{id}", limit: "100", access_token: token });
+  return { campaign, adSets, ads };
 }
 export async function fetchMetaPaidCampaignStatus(userId, connectionId, campaignId) {
   const { token } = await marketingToken(userId, connectionId);

@@ -4,6 +4,7 @@ import path from "path";
 import { pool } from "../db.js";
 import { decryptSecret, encryptSecret, promotionSecretsConfigured } from "./crypto.mjs";
 import { fetchMetaInterests, parseMetaInterestSearch } from "./meta-interests.mjs";
+import { fetchMetaReachEstimate } from "./meta-reach.mjs";
 
 export const META_GRAPH_VERSION = String(process.env.META_GRAPH_VERSION || "v26.0").replace(/^([^v])/, "v$1");
 const GRAPH = `https://graph.facebook.com/${META_GRAPH_VERSION}`;
@@ -167,6 +168,16 @@ export async function searchMetaInterests(userId, query, limit = 20, connectionI
   const input = parseMetaInterestSearch({ q: query, limit, connectionId });
   const { token } = await marketingToken(userId, connectionId);
   return fetchMetaInterests({ graphBase: GRAPH, token, query: input.query, limit: input.limit, fetchJson: jsonFetch });
+}
+
+export async function estimateMetaReach(userId, { adAccountId, targeting, connectionId = "" }) {
+  const account = plainAdAccountId(adAccountId);
+  if (!/^[0-9]+$/.test(account)) throw new Error("meta_ad_account_required");
+  const accounts = await listMetaAdAccounts(userId, connectionId);
+  if (!accounts.some((item) => item.id === account)) throw new Error("meta_ad_account_unavailable");
+  const { token } = await marketingToken(userId, connectionId);
+  return fetchMetaReachEstimate({ graphBase: GRAPH, token, adAccountId: account,
+    targetingSpec: buildMetaTargetingPayload(targeting), fetchJson: jsonFetch });
 }
 
 export async function publishToMeta({ userId, channel, message, linkUrl, imageUrl }) {

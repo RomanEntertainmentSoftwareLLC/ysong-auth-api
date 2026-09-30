@@ -26,6 +26,7 @@ import {
   listMetaAdAccounts,
   listMetaPixels,
   searchMetaInterests,
+  estimateMetaReach,
   createMetaPaidCampaign,
   fetchMetaCampaignAnalyticsBundle,
   fetchMetaPaidCampaignStatus,
@@ -755,6 +756,26 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
     }catch(e){res.status(e instanceof z.ZodError?400:e.message==='meta_pixel_unavailable'||e.message==='meta_ad_account_unavailable'?409:502).json({error:e instanceof z.ZodError?'invalid_meta_asset_selection':e.message||'meta_asset_selection_failed'});}
   });
   app.get(`${ROOT}/meta/interests`, requireAuth, async (req,res)=>{try{if(req.query.q===undefined||typeof req.query.q==="string"&&req.query.q.trim().length<2)return res.json({interests:[]});const input=parseMetaInterestSearch(req.query);res.json({interests:await searchMetaInterests(req.user.id,input.query,input.limit,input.connectionId)});}catch(e){const invalid=String(e.message||"").startsWith("meta_interest_")&&String(e.message||"").endsWith("_invalid");res.status(invalid?400:502).json({error:e.message||"meta_interest_search_failed",meta:e.meta||undefined});}});
+
+  app.post(`${ROOT}/meta/reach-estimate`, requireAuth, async (req,res)=>{
+    try {
+      const input=z.object({
+        connectionId:z.string().uuid().optional().default(''),
+        adAccountId:z.string().regex(/^(?:act_)?[0-9]+$/),
+        targeting:z.object({
+          countries:z.array(z.string().regex(/^[A-Za-z]{2}$/)).min(1).max(250),
+          ageMin:z.number().int().min(18).max(65), ageMax:z.number().int().min(18).max(65),
+          gender:z.enum(['all','male','female']),
+          interests:z.array(z.object({id:z.string().regex(/^[0-9]+$/),name:z.string().max(180).optional()}).passthrough()).max(200),
+          placementTargets:z.array(z.enum(['facebook_feed','facebook_reels','facebook_stories','instagram_feed','instagram_reels','instagram_stories'])).min(1).max(6),
+        }).strict().refine(t=>t.ageMin<=t.ageMax,{path:['ageMax'],message:'Maximum age must be at least minimum age'}),
+      }).strict().parse(req.body||{});
+      res.json({reachEstimate:await estimateMetaReach(req.user.id,input)});
+    } catch(e) {
+      if(e instanceof z.ZodError)return res.status(400).json({error:'invalid_meta_reach_request',issues:e.issues});
+      res.status(e.message==='meta_ad_account_unavailable'?409:502).json({error:e.message||'meta_reach_estimate_failed'});
+    }
+  });
 
   app.post(`${ROOT}/ad-campaigns/:id/meta/preflight`, requireAuth, async (req,res)=>{
     const ad=await adCampaignOwned(req.params.id,req.user.id); if(!ad)return res.status(404).json({error:"ad_campaign_not_found"});

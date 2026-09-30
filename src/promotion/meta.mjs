@@ -3,6 +3,7 @@ import fs from "fs";
 import path from "path";
 import { pool } from "../db.js";
 import { decryptSecret, encryptSecret, promotionSecretsConfigured } from "./crypto.mjs";
+import { fetchMetaInterests, parseMetaInterestSearch } from "./meta-interests.mjs";
 
 export const META_GRAPH_VERSION = String(process.env.META_GRAPH_VERSION || "v26.0").replace(/^([^v])/, "v$1");
 const GRAPH = `https://graph.facebook.com/${META_GRAPH_VERSION}`;
@@ -163,10 +164,9 @@ async function graphCollection(endpoint, params) {
   throw new Error("meta_pagination_limit");
 }
 export async function searchMetaInterests(userId, query, limit = 20, connectionId = "") {
+  const input = parseMetaInterestSearch({ q: query, limit, connectionId });
   const { token } = await marketingToken(userId, connectionId);
-  const params = new URLSearchParams({ type: "adinterest", q: String(query || "").slice(0, 120), limit: String(Math.max(1, Math.min(50, limit))), access_token: token });
-  const data = await jsonFetch(`${GRAPH}/search?${params.toString()}`);
-  return (data.data || []).map((r) => ({ id: String(r.id || ""), name: String(r.name || ""), audienceSizeLower: Number(r.audience_size_lower_bound || r.audience_size || 0), audienceSizeUpper: Number(r.audience_size_upper_bound || r.audience_size || 0), path: r.path || [] }));
+  return fetchMetaInterests({ graphBase: GRAPH, token, query: input.query, limit: input.limit, fetchJson: jsonFetch });
 }
 
 export async function publishToMeta({ userId, channel, message, linkUrl, imageUrl }) {

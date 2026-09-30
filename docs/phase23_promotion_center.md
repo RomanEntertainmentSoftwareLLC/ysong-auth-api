@@ -76,8 +76,10 @@ Audience interest selection now behaves as a live Meta targeting explorer rather
 
 - After 2 typed characters, ysong-web waits 300ms and queries the server.
 - ysong-auth-api performs the authenticated Meta `type=adinterest` lookup.
+- `GET /api/tools/promotion/meta/interests?q=...&limit=...` uses the selected Meta connection by default or an owned `connectionId`. It requires at least two query characters, accepts at most 120, and bounds results to 1–50 (default 20). Short type-ahead input returns an empty list. Invalid long queries, limits, or connection IDs return 400; a missing grant or Meta failure returns 502.
+- The lookup uses the connected user's server-side user token on Meta's versioned global `/search` endpoint. Meta's [official Marketing API request](https://www.postman.com/meta/facebook-marketing-api/request/fqmcqe2/getsearchinterest) shows `type=adinterest` with `q` and bearer authorization. A selected ad account is not a parameter of this global search. Meta App access and the user's ads permission still govern live availability.
 - Up to 50 real Meta interest objects are returned per search.
-- Each result can include Meta's lower/upper estimated audience-size bounds and taxonomy path.
+- Each result includes Meta's targeting ID and readable name, plus audience-size bounds, taxonomy path, and description only when Meta actually returns them. The service never substitutes zero for missing estimates.
 - Only selected Meta interest IDs are eligible for paid-ad targeting.
 - Phase 22 / YSong genre and tag suggestions are search seeds only. They are never silently treated as Meta targeting IDs.
 - Selected audience-size values are kept for draft UI display, but Meta publishing only sends the verified interest ID/name pair.

@@ -13,6 +13,7 @@ import { stockProviderStatus, searchStockVideos, resolveStockVideoForImport, dow
 import { buildPromotionIntelligence } from "./intelligence.mjs";
 import { AdsDraftSchema, draftToStorage, storageToDraft, projectAdsCampaign } from "./ads-contract.mjs";
 import { assertMetaAssetSelection, metaAssetInventory } from "./meta-assets.mjs";
+import { parseMetaInterestSearch } from "./meta-interests.mjs";
 import {
   META_GRAPH_VERSION,
   completeMetaOAuth,
@@ -753,7 +754,7 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
       res.json({selection});
     }catch(e){res.status(e instanceof z.ZodError?400:e.message==='meta_pixel_unavailable'||e.message==='meta_ad_account_unavailable'?409:502).json({error:e instanceof z.ZodError?'invalid_meta_asset_selection':e.message||'meta_asset_selection_failed'});}
   });
-  app.get(`${ROOT}/meta/interests`, requireAuth, async (req,res)=>{try{const q=String(req.query.q||"").trim();const connectionId=String(req.query.connectionId||"");if(q.length<2)return res.json({interests:[]});res.json({interests:await searchMetaInterests(req.user.id,q,Number(req.query.limit||20),connectionId)});}catch(e){res.status(502).json({error:e.message||"meta_interest_search_failed",meta:e.meta||undefined});}});
+  app.get(`${ROOT}/meta/interests`, requireAuth, async (req,res)=>{try{if(req.query.q===undefined||typeof req.query.q==="string"&&req.query.q.trim().length<2)return res.json({interests:[]});const input=parseMetaInterestSearch(req.query);res.json({interests:await searchMetaInterests(req.user.id,input.query,input.limit,input.connectionId)});}catch(e){const invalid=String(e.message||"").startsWith("meta_interest_")&&String(e.message||"").endsWith("_invalid");res.status(invalid?400:502).json({error:e.message||"meta_interest_search_failed",meta:e.meta||undefined});}});
 
   app.post(`${ROOT}/ad-campaigns/:id/meta/preflight`, requireAuth, async (req,res)=>{
     const ad=await adCampaignOwned(req.params.id,req.user.id); if(!ad)return res.status(404).json({error:"ad_campaign_not_found"});

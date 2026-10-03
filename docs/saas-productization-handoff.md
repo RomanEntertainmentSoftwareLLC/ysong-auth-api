@@ -1,5 +1,24 @@
 # YSong SaaS productization handoff — 2026-10-02
 
+## Priority 1 admin, quota recovery and billing regression — 2026-10-03
+
+Completed in `D:\YSong\ysong-auth-api` only, starting from a clean working tree at `331ffe4`. This pass authorizes one local product commit; the historical no-commit statements below describe earlier passes. No push, deployment, production configuration/schema change, live provider request or Stripe mutation occurred. Existing launch blockers and SaaS enablement requirements remain in force.
+
+The new `test/saas_admin_recovery.test.mjs` runs production route/service code over HTTP against real isolated PostgreSQL transactions. Authentication transport, paid render/storage adapters and Stripe retrievals are fixtures. It requires `TEST_SAAS_DATABASE_URL` and fails instead of silently skipping when that variable is absent. It covers immutable superadmin identity after email reassignment; normal-admin peer/self/superadmin protection; comp expiry; suspend/ban/restore; generation/upload restrictions; supported session revocation; audit-write rollback; executor locks and uncertain-result evidence; concurrent quota reservation/consume/refund; reservation recount; original-period late settlement; retained-artifact project finalization; signed failed-webhook ingestion/replay; current-subscription reconciliation; duplicate suppression; and operator access loss during a Stripe retrieval. Existing focused suites add actual standalone generation, partial session/restart recovery, provider restrictions, billing ordering/mode/ownership and migration replay coverage.
+
+Confirmed and fixed a recovery authorization bypass: ordinary account actions protected peer admins and superadmins, but generation cancellation/review/finalization, uncertain-part resolution, quota recount and billing profile/reconciliation/replay did not consistently enforce that target boundary. Normal admins now receive `protected_account` for those protected targets. Superadmins retain operational recovery access, including their own exempt records; account-action prohibitions such as self-ban remain unchanged. Billing recovery checks target/actor authorization inside the event transaction, including after provider retrieval, so an access change rolls back the event journal and entitlement changes. Ordinary signed webhook delivery still reconciles subscriptions without an operator role and never changes roles or comp overrides.
+
+Two test expectations were corrected: the older readiness test now uses the explicit `NOT CONFIGURED`/`FAIL` values introduced by the preceding preflight change, and the billing recovery unit fixture now represents an ordinary user when operated on by a normal admin. No preflight or authorization check was weakened.
+
+Validation completed with PostgreSQL 16 in task-specific container `ysong-p1-regression-20261003`, created with `--network none`, no published ports, and database `ysong_saas_validation`. Test processes used the existing Node 20/ffmpeg image `ysong-auth-api:saas-safety-validation`, sharing only that container's network namespace, with current repository source/tests/scripts mounted read-only. No repository `.env` or production credentials were supplied. Fixture schemas/data are retained in the stopped PostgreSQL container.
+
+- Focused baseline: 40/41 passed; the stale readiness assertion failed. New regressions then demonstrated the protected-target bypass before the fixes.
+- Final focused pass: **74/74 passed, zero skipped**. With the dedicated loopback test URL set, run `node --test test/saas_admin_recovery.test.mjs test/saas.test.mjs test/saas_readiness.test.mjs test/session_jobs.test.mjs test/stripe_webhook.test.mjs test/saas_launch.test.mjs`.
+- Full API suite, justified by changes to shared account, billing and job services: **190/190 passed, zero skipped**, using `node --test test/*.test.mjs` in the isolated Linux image. Includes migration/preflight, catalog, storage, audio/ffmpeg and existing product regressions.
+- Syntax checks for all four changed service modules and the new regression file passed. `git diff --check` passed; existing LF/CRLF conversion notices are informational.
+
+This is an API regression result, not a browser walkthrough or a universal session-revocation claim. Separate media/realtime authentication paths and production Stripe/provider behavior retain their existing release review requirements. Only this repository was changed; no second task was started.
+
 ## Scope and release state
 
 This is a locally validated Priority 1 foundation, **not a completed SaaS launch**. `SAAS_ENABLED` remains absent/disabled in the existing environment; `.env.example` explicitly uses `0`. No production migration, billing configuration, deployment, commit, push, or paid AI/music call was performed. Existing dirty Cloudflare/R2 work was retained. Foreman/control-plane were not operated on. Autopilot was not started or modified.

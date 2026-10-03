@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import {notifySaas} from './notifications.mjs';
-import { AccessError, assertCapability, effectiveEntitlement, quantityOf } from './service.mjs';
+import { AccessError, assertCapability, assertRecoveryTarget, effectiveEntitlement, quantityOf } from './service.mjs';
 
 const terminal = new Set(['ready','partially_ready','failed','cancelled']);
 const uuid = /^[0-9a-f-]{36}$/i;
@@ -188,6 +188,7 @@ export function createSessionJobs({pool,service,enabled,provider,generate,persis
         const v=(await c.query('SELECT * FROM ysong_generation_versions WHERE id=$1 FOR UPDATE',[req.params.id])).rows[0];
         const batch=v?(await c.query('SELECT * FROM ysong_generation_batches WHERE id=$1',[v.batch_id])).rows[0]:null;
         const part=v?.execution?.parts?.[req.params.part];if(!part)throw new AccessError('generation_not_found',404);
+        assertRecoveryTarget(a,await service.account(c,v.user_id));
         if(part.resolution){if(part.resolution.outcome!==req.body.outcome)throw new AccessError('resolution_conflict',409);return {duplicate:true};}
         if(part.state!=='ambiguous'||!['failed','partially_ready'].includes(v.state))throw new AccessError('not_uncertain',409);
         if(req.body.outcome==='confirmed_success') {

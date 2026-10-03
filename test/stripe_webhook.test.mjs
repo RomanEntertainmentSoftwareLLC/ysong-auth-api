@@ -108,7 +108,7 @@ test('HTTP raw signatures, explicit flag, mode separation, authoritative fetch, 
 
 test('operator replay and reconciliation reuse the billing owner, audit once, and reject foreign/live snapshots',async t=>{
   const f=fixture(),user='00000000-0000-4000-8000-000000000001',admin='00000000-0000-4000-8000-000000000002';
-  Object.assign(f.state.account,{user_id:user,billing_subscription_id:'sub_fixture'});
+  Object.assign(f.state.account,{user_id:user,role:'user',billing_subscription_id:'sub_fixture'});
   f.service.account=async(_c,id)=>id===admin?{role:'admin',account_status:'active'}:structuredClone(f.state.account);
   let current=sub(),replay=event('evt_failed',100,'customer.subscription.created'),reads=0;
   const pool={query:async(sql,p)=>{

@@ -3,6 +3,14 @@ import {notifySaas} from './notifications.mjs';
 export class AccessError extends Error {
   constructor(code, status = 403) { super(code); this.code = code; this.status = status; }
 }
+// Recovery may repair a superadmin's exempt records, but only a superadmin can
+// operate on protected accounts. Ordinary admins cannot use recovery to bypass
+// the peer/superadmin boundary enforced by account actions.
+export function assertRecoveryTarget(actor, target) {
+  if (!actor || actor.account_status !== 'active' || !['admin','superadmin'].includes(actor.role)) throw new AccessError('admin_required');
+  if (!target) throw new AccessError('account_not_found',404);
+  if (actor.role !== 'superadmin' && ['admin','superadmin'].includes(target.role)) throw new AccessError('protected_account');
+}
 export function quantityOf(value = 1) {
   if (!Number.isInteger(value) || value < 1 || value > 20) throw new AccessError('invalid_quantity', 400);
   return value;

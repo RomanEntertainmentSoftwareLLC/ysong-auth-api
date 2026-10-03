@@ -1,14 +1,15 @@
 import crypto from 'node:crypto';
-import {AccessError} from './service.mjs';
+import {AccessError,assertRecoveryTarget} from './service.mjs';
 import {stripeAdapter,applySubscriptionEvent,subscriptionEvents} from './billing.mjs';
 import {notifySaas} from './notifications.mjs';
 const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function registerRecoveryRoutes(app,{pool,service,requireAuth,enabled,env=process.env,billingAdapter=stripeAdapter}) {
   const wrap=fn=>async(req,res)=>{if(!enabled())return res.status(503).json({error:'saas_not_enabled'});try{await fn(req,res);}catch(e){res.status(e instanceof AccessError?e.status:503).json({error:e instanceof AccessError?e.code:'recovery_unavailable'});}};
   async function admin(c,id){const a=await service.account(c,id);if(a?.account_status!=='active'||!['admin','superadmin'].includes(a.role))throw new AccessError('admin_required');}
+  async function target(c,actorId,targetId){const actor=await service.account(c,actorId),account=await service.account(c,targetId);assertRecoveryTarget(actor,account);return account;}
   function reason(req){if(typeof req.body?.reason!=='string'||req.body.reason.trim().length<10||req.body.reason.length>2000)throw new AccessError('recovery_reason_required',400);return req.body.reason.trim();}
   async function audit(c,req,target,action,before,after,id=crypto.randomUUID()) {await c.query('INSERT INTO ysong_admin_audit(id,actor_id,target_id,action,reason,before_state,after_state) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO NOTHING',[id,req.user.id,target,action,reason(req),before,after]);}
-  async function version(c,req){await admin(c,req.user.id);if(!uuid.test(req.params.id))throw new AccessError('generation_not_found',404);if(!(await c.query('SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS locked',[req.params.id])).rows[0].locked)throw new AccessError('render_executor_active',409);const v=(await c.query('SELECT * FROM ysong_generation_versions WHERE id=$1 FOR UPDATE',[req.params.id])).rows[0];if(!v)throw new AccessError('generation_not_found',404);return v;}
+  async function version(c,req){await admin(c,req.user.id);if(!uuid.test(req.params.id))throw new AccessError('generation_not_found',404);if(!(await c.query('SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS locked',[req.params.id])).rows[0].locked)throw new AccessError('render_executor_active',409);const v=(await c.query('SELECT * FROM ysong_generation_versions WHERE id=$1 FOR UPDATE',[req.params.id])).rows[0];if(!v)throw new AccessError('generation_not_found',404);await target(c,req.user.id,v.user_id);return v;}
   app.get('/api/admin/recovery',requireAuth,wrap(async(req,res)=>{
     await admin(pool,req.user.id);
     const generations=(await pool.query("SELECT v.*,b.source->>'kind' AS source_kind FROM ysong_generation_versions v JOIN ysong_generation_batches b ON b.id=v.batch_id WHERE v.reconciliation='reserved' OR v.state='failed' ORDER BY v.created_at LIMIT 100")).rows;
@@ -45,8 +46,8 @@ export function registerRecoveryRoutes(app,{pool,service,requireAuth,enabled,env
   app.post('/api/admin/recovery/quota/:id/recount-reservations',requireAuth,wrap(async(req,res)=>{
     reason(req);if(!uuid.test(req.params.id)||!Number.isInteger(req.body.expectedReserved)||req.body.expectedReserved<0)throw new AccessError('invalid_quota_recount',400);
     res.json(await service.transaction(async c=>{
-      await admin(c,req.user.id);const target=(await c.query('SELECT user_id FROM ysong_quota_periods WHERE id=$1',[req.params.id])).rows[0];if(!target)throw new AccessError('quota_period_not_found',404);
-      await service.account(c,target.user_id,true);const p=(await c.query('SELECT * FROM ysong_quota_periods WHERE id=$1 FOR UPDATE',[req.params.id])).rows[0];
+      await admin(c,req.user.id);const owner=(await c.query('SELECT user_id FROM ysong_quota_periods WHERE id=$1',[req.params.id])).rows[0];if(!owner)throw new AccessError('quota_period_not_found',404);
+      await service.account(c,owner.user_id,true);await target(c,req.user.id,owner.user_id);const p=(await c.query('SELECT * FROM ysong_quota_periods WHERE id=$1 FOR UPDATE',[req.params.id])).rows[0];
       const count=Number((await c.query("SELECT count(*) AS reserved FROM ysong_generation_versions v JOIN ysong_generation_batches b ON b.id=v.batch_id WHERE b.quota_period_id=$1 AND b.charged AND v.reconciliation='reserved'",[p.id])).rows[0].reserved);
       if(p.reserved===count)return {duplicate:true,reserved:count};if(p.reserved!==req.body.expectedReserved)throw new AccessError('quota_period_changed',409);
       await c.query('UPDATE ysong_quota_periods SET reserved=$2 WHERE id=$1',[p.id,count]);await audit(c,req,p.user_id,'quota_reservation_recount',{periodId:p.id,reserved:p.reserved,used:p.used},{reserved:count,used:p.used});return {reserved:count};
@@ -54,7 +55,7 @@ export function registerRecoveryRoutes(app,{pool,service,requireAuth,enabled,env
   }));
   app.post('/api/admin/recovery/billing/:id/reconcile',requireAuth,wrap(async(req,res)=>{
     reason(req);await admin(pool,req.user.id);if(!uuid.test(req.params.id)||typeof req.body.requestKey!=='string'||! /^[\w-]{8,128}$/.test(req.body.requestKey))throw new AccessError('invalid_recovery_request',400);
-    const a=await service.account(pool,req.params.id),{stripe,live}=billingAdapter(env);
+    const a=await target(pool,req.user.id,req.params.id),{stripe,live}=billingAdapter(env);
     if(!a?.billing_customer_id||!a.billing_subscription_id||a.billing_live!==live)throw new AccessError('billing_profile_incomplete',409);
     const eventId=`recovery:${req.user.id}:${req.params.id}:${req.body.requestKey}`;
     if((await pool.query('SELECT 1 FROM ysong_billing_events WHERE provider=$1 AND live=$2 AND event_id=$3',['stripe',live,eventId])).rows.length)return res.json({duplicate:true});
@@ -65,11 +66,12 @@ export function registerRecoveryRoutes(app,{pool,service,requireAuth,enabled,env
   }));
   app.post('/api/admin/recovery/billing/:id/link-profile',requireAuth,wrap(async(req,res)=>{
     reason(req);await admin(pool,req.user.id);if(!uuid.test(req.params.id)||typeof req.body.customerId!=='string'||!req.body.customerId.startsWith('cus_')||typeof req.body.subscriptionId!=='string'||!req.body.subscriptionId.startsWith('sub_'))throw new AccessError('invalid_billing_profile',400);
+    await target(pool,req.user.id,req.params.id);
     const {stripe,live}=billingAdapter(env),customer=await stripe.customers.retrieve(req.body.customerId),subscription=await stripe.subscriptions.retrieve(req.body.subscriptionId);
     const owner=typeof subscription.customer==='string'?subscription.customer:subscription.customer?.id;
     if(customer.deleted||customer.livemode!==live||customer.metadata?.ysong_user_id!==req.params.id||subscription.livemode!==live||owner!==customer.id)throw new AccessError('billing_profile_owner_or_mode_mismatch',409);
     res.json(await service.transaction(async c=>{
-      await admin(c,req.user.id);const a=await service.account(c,req.params.id,true);if(!a)throw new AccessError('account_not_found',404);
+      await admin(c,req.user.id);const a=await service.account(c,req.params.id,true);await target(c,req.user.id,req.params.id);
       if(a.billing_customer_id&&(a.billing_customer_id!==customer.id||a.billing_live!==live)||a.billing_subscription_id&&a.billing_subscription_id!==subscription.id)throw new AccessError('billing_profile_conflict',409);
       if(a.billing_customer_id===customer.id&&a.billing_subscription_id===subscription.id)return {duplicate:true};
       await c.query("UPDATE ysong_account_access SET billing_provider='stripe',billing_live=$2,billing_customer_id=$3,billing_subscription_id=$4,updated_at=now() WHERE user_id=$1",[a.user_id,live,customer.id,subscription.id]);

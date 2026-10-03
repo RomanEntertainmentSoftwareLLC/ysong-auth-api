@@ -1,5 +1,5 @@
 import Stripe from 'stripe';
-import { AccessError } from './service.mjs';
+import { AccessError, assertRecoveryTarget } from './service.mjs';
 import {notifySaas} from './notifications.mjs';
 
 export const subscriptionEvents = Object.freeze(['customer.subscription.created','customer.subscription.updated','customer.subscription.deleted']);
@@ -24,11 +24,17 @@ export function verifyBillingEvent(raw, signature, env = process.env) {
 export async function applySubscriptionEvent(service,event,subscription,recovery=null,retrieve=null) {
   if (!event?.id || typeof event.livemode !== 'boolean' || !Number.isSafeInteger(event.created) || event.created < 0) throw new AccessError('invalid_billing_event',400);
   return service.transaction(async c => {
+    const authorizeRecovery = async () => {
+      if (!recovery) return;
+      const target = (await c.query("SELECT * FROM ysong_account_access WHERE billing_provider='stripe' AND billing_live=$1 AND billing_customer_id=$2",[event.livemode,customerOf(subscription??event.data?.object)])).rows[0];
+      assertRecoveryTarget(await service.account(c,recovery.actorId),target);
+    };
     const settled = async result => {
       await c.query('UPDATE ysong_billing_failures SET resolved_at=now() WHERE live=$1 AND event_id=$2',[event.livemode,event.id]);
       return result;
     };
     const inserted = await c.query('INSERT INTO ysong_billing_events(provider,live,event_id,event_type,event_created) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING RETURNING event_id',['stripe',event.livemode,event.id,event.type,event.created]);
+    await authorizeRecovery();
     if (!inserted.rows.length) return settled({ duplicate:true });
     if (['invoice.paid','invoice.payment_failed'].includes(event.type)){
       const invoice=event.data?.object;const customer=typeof invoice?.customer==='string'?invoice.customer:invoice?.customer?.id;
@@ -50,6 +56,8 @@ export async function applySubscriptionEvent(service,event,subscription,recovery
       const current = await retrieve(subscription.id);
       if (current?.id !== subscription.id || customerOf(current) !== customerId || current.livemode !== event.livemode) throw new AccessError('billing_subscription_owner_or_mode_mismatch',409);
       subscription = current;
+      // The operator may have lost access while the provider request was pending.
+      await authorizeRecovery();
     }
     if (event.type === 'customer.subscription.deleted' && subscription.status !== 'canceled') throw new AccessError('invalid_deleted_subscription',400);
     if (event.created === Number(a.last_billing_event_at) && a.subscription_status === 'canceled' && a.billing_subscription_id === subscription.id && subscription.status !== 'canceled') return settled({ stale:true });

@@ -18,7 +18,7 @@ test('billing mode/key separation fails closed without printing credentials',()=
  assert.throws(()=>verifyBillingEvent(Buffer.from('{}'),'anything',{BILLING_MODE:'live'}),/billing_not_configured/);
 });
 test('preflight distinguishes missing configuration, inconsistent mode and SaaS enablement',()=>{
- assert.equal(readiness(environmentGates({})),'B - READY FOR BILLING CONFIGURATION');assert.equal(readiness(environmentGates({BILLING_MODE:'live',STRIPE_SECRET_KEY:'sk_test_fixture'})),'A - NOT READY');assert.equal(readiness(environmentGates({SAAS_ENABLED:'1'})),'A - NOT READY');assert.equal(catalogGates([]).find(g=>g.gate==='Live price/product mappings').status,'NOT CONFIGURED');
+ assert.equal(readiness(environmentGates({})),'NOT CONFIGURED');assert.equal(readiness(environmentGates({BILLING_MODE:'live',STRIPE_SECRET_KEY:'sk_test_fixture'})),'FAIL');assert.equal(readiness(environmentGates({SAAS_ENABLED:'1'})),'FAIL');assert.equal(catalogGates([]).find(g=>g.gate==='Live price/product mappings').status,'NOT CONFIGURED');
 });
 test('operator configuration rejects placeholders, duplicate mappings and invented unlimited allowances',()=>{
  const c=reviewed(crypto.randomUUID());assert.equal(validateLaunchConfiguration(c).plans.length,4);

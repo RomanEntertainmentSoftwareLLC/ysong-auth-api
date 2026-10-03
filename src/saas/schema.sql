@@ -7,9 +7,13 @@ CREATE TABLE IF NOT EXISTS ysong_plans (
   billing_prices jsonb NOT NULL DEFAULT '{}'::jsonb,
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+-- Add pricing columns before inserting NEW plans; never fill or overwrite existing catalog rows.
+ALTER TABLE ysong_plans ADD COLUMN IF NOT EXISTS monthly_price_cents integer CHECK(monthly_price_cents>=0);
+ALTER TABLE ysong_plans ADD COLUMN IF NOT EXISTS upgrade_order integer NOT NULL DEFAULT 0;
 -- NULL quota means not configured, NOT unlimited. Configure deliberately before enabling.
-INSERT INTO ysong_plans(id,name) VALUES ('free','Free'),('basic','YSong Basic'),
- ('pro','YSong Pro'),('premium','YSong Premium') ON CONFLICT DO NOTHING;
+INSERT INTO ysong_plans(id,name,monthly_price_cents,upgrade_order) VALUES
+ ('free','Free',0,0),('basic','YSong Basic',999,1),
+ ('pro','YSong Pro',1999,2),('premium','YSong Premium',2999,3) ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS ysong_account_access (
   user_id uuid PRIMARY KEY REFERENCES users(id),
   role text NOT NULL DEFAULT 'user' CHECK (role IN ('user','admin','superadmin')),
@@ -33,14 +37,32 @@ CREATE TABLE IF NOT EXISTS ysong_account_access (
 CREATE UNIQUE INDEX IF NOT EXISTS ysong_billing_customer_unique ON ysong_account_access(billing_provider,billing_live,billing_customer_id) WHERE billing_customer_id IS NOT NULL;
 INSERT INTO ysong_account_access(user_id) SELECT id FROM users ON CONFLICT DO NOTHING;
 -- Resolve this bootstrap email once into an immutable FK. Requests authorize the stored role.
+CREATE TABLE IF NOT EXISTS ysong_saas_bootstrap (
+ id text PRIMARY KEY CHECK(id='superadmin'), user_id uuid NOT NULL UNIQUE REFERENCES users(id)
+);
 DO $$
 BEGIN
+  IF (SELECT count(*) FROM ysong_account_access WHERE role='superadmin') > 1 THEN
+    RAISE EXCEPTION 'Multiple stored superadmin identities';
+  END IF;
   IF NOT EXISTS (SELECT 1 FROM ysong_account_access WHERE role='superadmin') THEN
-    IF (SELECT count(*) FROM users WHERE lower(email::text)='psychopathetica@gmail.com') > 1 THEN
-      RAISE EXCEPTION 'Ambiguous superadmin bootstrap identity';
+    IF EXISTS (SELECT 1 FROM ysong_saas_bootstrap) OR to_regclass('ysong_saas_migrations') IS NOT NULL THEN
+      RAISE EXCEPTION 'Stored superadmin identity missing; manual review required';
+    END IF;
+    IF (SELECT count(*) FROM users WHERE lower(email::text)='psychopathetica@gmail.com') <> 1 THEN
+      RAISE EXCEPTION 'Missing or ambiguous superadmin bootstrap identity';
     END IF;
     UPDATE ysong_account_access SET role='superadmin'
       WHERE user_id IN (SELECT id FROM users WHERE lower(email::text)='psychopathetica@gmail.com');
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM ysong_account_access WHERE role='superadmin' AND account_status='active') THEN
+    RAISE EXCEPTION 'Stored superadmin must be active';
+  END IF;
+  INSERT INTO ysong_saas_bootstrap(id,user_id)
+    SELECT 'superadmin',user_id FROM ysong_account_access WHERE role='superadmin' ON CONFLICT DO NOTHING;
+  IF NOT EXISTS (SELECT 1 FROM ysong_saas_bootstrap b JOIN ysong_account_access a ON a.user_id=b.user_id
+    WHERE b.id='superadmin' AND a.role='superadmin') THEN
+    RAISE EXCEPTION 'Immutable superadmin identity mismatch';
   END IF;
 END $$;
 CREATE TABLE IF NOT EXISTS ysong_quota_periods (
@@ -96,8 +118,6 @@ ALTER TABLE ysong_plans ADD COLUMN IF NOT EXISTS storage_quota_bytes bigint CHEC
 ALTER TABLE ysong_plans ADD COLUMN IF NOT EXISTS available boolean NOT NULL DEFAULT false;
 ALTER TABLE ysong_plans ADD COLUMN IF NOT EXISTS public_visible boolean NOT NULL DEFAULT true;
 ALTER TABLE ysong_plans ADD COLUMN IF NOT EXISTS upgrade_order integer NOT NULL DEFAULT 0;
-UPDATE ysong_plans SET monthly_price_cents=CASE id WHEN 'free' THEN 0 WHEN 'basic' THEN 999 WHEN 'pro' THEN 1999 WHEN 'premium' THEN 2999 END,
- upgrade_order=CASE id WHEN 'free' THEN 0 WHEN 'basic' THEN 1 WHEN 'pro' THEN 2 WHEN 'premium' THEN 3 END WHERE monthly_price_cents IS NULL;
 ALTER TABLE ysong_plans ADD COLUMN IF NOT EXISTS usage_limits jsonb NOT NULL DEFAULT '{}';
 CREATE TABLE IF NOT EXISTS ysong_usage_events (
  id uuid PRIMARY KEY,user_id uuid NOT NULL REFERENCES users(id),request_key text NOT NULL,request_hash text NOT NULL,
@@ -142,3 +162,4 @@ ALTER TABLE ysong_takedown_cases ADD COLUMN IF NOT EXISTS notification_evidence 
 ALTER TABLE ysong_policy_versions ADD COLUMN IF NOT EXISTS approval_reference text;
 CREATE TABLE IF NOT EXISTS ysong_saas_migrations (id text PRIMARY KEY,applied_at timestamptz NOT NULL DEFAULT now());
 INSERT INTO ysong_saas_migrations(id) VALUES('launch-preparation-v1') ON CONFLICT DO NOTHING;
+INSERT INTO ysong_saas_migrations(id) VALUES('guarded-migration-v2') ON CONFLICT DO NOTHING;

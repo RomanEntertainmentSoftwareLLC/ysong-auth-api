@@ -1,0 +1,2221 @@
+{
+  "sha256": "98e20c3beed23430c77f42036cd38d28a388bade4020ac1a3d33045426f0e62c",
+  "tables": [
+    {
+      "name": "ysong_account_access",
+      "kind": "r",
+      "rls": false,
+      "persistence": "p",
+      "triggers": false,
+      "rules": false,
+      "columns": [
+        {
+          "name": "account_status",
+          "type": "text",
+          "default": "'active'::text",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "billing_customer_id",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "billing_live",
+          "type": "boolean",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "billing_price_id",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "billing_product_id",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "billing_provider",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "billing_subscription_id",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "cancel_at_period_end",
+          "type": "boolean",
+          "default": "false",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "default": "now()",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "generation_disabled",
+          "type": "boolean",
+          "default": "false",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "last_billing_event_at",
+          "type": "bigint",
+          "default": "0",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "override_capabilities",
+          "type": "jsonb",
+          "default": "'{}'::jsonb",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "override_expires_at",
+          "type": "timestamp with time zone",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "override_plan_id",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "override_quota",
+          "type": "integer",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "override_reason",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "period_end",
+          "type": "timestamp with time zone",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "period_start",
+          "type": "timestamp with time zone",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "plan_id",
+          "type": "text",
+          "default": "'free'::text",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "role",
+          "type": "text",
+          "default": "'user'::text",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "sessions_revoked_before",
+          "type": "timestamp with time zone",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "subscription_status",
+          "type": "text",
+          "default": "'none'::text",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "default": "now()",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "uploads_disabled",
+          "type": "boolean",
+          "default": "false",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "user_id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        }
+      ],
+      "constraints": [
+        {
+          "name": "ysong_account_access_account_status_check",
+          "valid": true,
+          "columns": [
+            "account_status"
+          ],
+          "definition": "CHECK ((account_status = ANY (ARRAY['active'::text, 'suspended'::text, 'banned'::text])))"
+        },
+        {
+          "name": "ysong_account_access_override_plan_id_fkey",
+          "valid": true,
+          "columns": [
+            "override_plan_id"
+          ],
+          "definition": "FOREIGN KEY (override_plan_id) REFERENCES ysong_plans(id)"
+        },
+        {
+          "name": "ysong_account_access_override_quota_check",
+          "valid": true,
+          "columns": [
+            "override_quota"
+          ],
+          "definition": "CHECK ((override_quota >= 0))"
+        },
+        {
+          "name": "ysong_account_access_pkey",
+          "valid": true,
+          "columns": [
+            "user_id"
+          ],
+          "definition": "PRIMARY KEY (user_id)"
+        },
+        {
+          "name": "ysong_account_access_plan_id_fkey",
+          "valid": true,
+          "columns": [
+            "plan_id"
+          ],
+          "definition": "FOREIGN KEY (plan_id) REFERENCES ysong_plans(id)"
+        },
+        {
+          "name": "ysong_account_access_role_check",
+          "valid": true,
+          "columns": [
+            "role"
+          ],
+          "definition": "CHECK ((role = ANY (ARRAY['user'::text, 'admin'::text, 'superadmin'::text])))"
+        },
+        {
+          "name": "ysong_account_access_user_id_fkey",
+          "valid": true,
+          "columns": [
+            "user_id"
+          ],
+          "definition": "FOREIGN KEY (user_id) REFERENCES users(id)"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ysong_account_access_pkey",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_account_access_pkey ON ysong_account_access USING btree (user_id)"
+        },
+        {
+          "name": "ysong_billing_customer_unique",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_billing_customer_unique ON ysong_account_access USING btree (billing_provider, billing_live, billing_customer_id) WHERE (billing_customer_id IS NOT NULL)"
+        }
+      ]
+    },
+    {
+      "name": "ysong_admin_audit",
+      "kind": "r",
+      "rls": false,
+      "persistence": "p",
+      "triggers": false,
+      "rules": false,
+      "columns": [
+        {
+          "name": "action",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "actor_id",
+          "type": "uuid",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "after_state",
+          "type": "jsonb",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "before_state",
+          "type": "jsonb",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "default": "now()",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "reason",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "target_id",
+          "type": "uuid",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        }
+      ],
+      "constraints": [
+        {
+          "name": "ysong_admin_audit_actor_id_fkey",
+          "valid": true,
+          "columns": [
+            "actor_id"
+          ],
+          "definition": "FOREIGN KEY (actor_id) REFERENCES users(id)"
+        },
+        {
+          "name": "ysong_admin_audit_pkey",
+          "valid": true,
+          "columns": [
+            "id"
+          ],
+          "definition": "PRIMARY KEY (id)"
+        },
+        {
+          "name": "ysong_admin_audit_target_id_fkey",
+          "valid": true,
+          "columns": [
+            "target_id"
+          ],
+          "definition": "FOREIGN KEY (target_id) REFERENCES users(id)"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ysong_admin_audit_pkey",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_admin_audit_pkey ON ysong_admin_audit USING btree (id)"
+        }
+      ]
+    },
+    {
+      "name": "ysong_billing_events",
+      "kind": "r",
+      "rls": false,
+      "persistence": "p",
+      "triggers": false,
+      "rules": false,
+      "columns": [
+        {
+          "name": "event_created",
+          "type": "bigint",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "event_id",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "event_type",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "live",
+          "type": "boolean",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "processed_at",
+          "type": "timestamp with time zone",
+          "default": "now()",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "provider",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "transition",
+          "type": "jsonb",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        }
+      ],
+      "constraints": [
+        {
+          "name": "ysong_billing_events_pkey",
+          "valid": true,
+          "columns": [
+            "event_id",
+            "live",
+            "provider"
+          ],
+          "definition": "PRIMARY KEY (provider, live, event_id)"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ysong_billing_events_pkey",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_billing_events_pkey ON ysong_billing_events USING btree (provider, live, event_id)"
+        }
+      ]
+    },
+    {
+      "name": "ysong_billing_failures",
+      "kind": "r",
+      "rls": false,
+      "persistence": "p",
+      "triggers": false,
+      "rules": false,
+      "columns": [
+        {
+          "name": "error_code",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "event_id",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "event_type",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "first_seen_at",
+          "type": "timestamp with time zone",
+          "default": "now()",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "last_seen_at",
+          "type": "timestamp with time zone",
+          "default": "now()",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "live",
+          "type": "boolean",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "object_id",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "resolved_at",
+          "type": "timestamp with time zone",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        }
+      ],
+      "constraints": [
+        {
+          "name": "ysong_billing_failures_pkey",
+          "valid": true,
+          "columns": [
+            "event_id",
+            "live"
+          ],
+          "definition": "PRIMARY KEY (live, event_id)"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ysong_billing_failures_pkey",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_billing_failures_pkey ON ysong_billing_failures USING btree (live, event_id)"
+        }
+      ]
+    },
+    {
+      "name": "ysong_checkout_attempts",
+      "kind": "r",
+      "rls": false,
+      "persistence": "p",
+      "triggers": false,
+      "rules": false,
+      "columns": [
+        {
+          "name": "expires_at",
+          "type": "timestamp with time zone",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "plan_id",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "request_key",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "session_id",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "url",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "user_id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        }
+      ],
+      "constraints": [
+        {
+          "name": "ysong_checkout_attempts_pkey",
+          "valid": true,
+          "columns": [
+            "user_id"
+          ],
+          "definition": "PRIMARY KEY (user_id)"
+        },
+        {
+          "name": "ysong_checkout_attempts_plan_id_fkey",
+          "valid": true,
+          "columns": [
+            "plan_id"
+          ],
+          "definition": "FOREIGN KEY (plan_id) REFERENCES ysong_plans(id)"
+        },
+        {
+          "name": "ysong_checkout_attempts_user_id_fkey",
+          "valid": true,
+          "columns": [
+            "user_id"
+          ],
+          "definition": "FOREIGN KEY (user_id) REFERENCES users(id)"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ysong_checkout_attempts_pkey",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_checkout_attempts_pkey ON ysong_checkout_attempts USING btree (user_id)"
+        }
+      ]
+    },
+    {
+      "name": "ysong_content_reviews",
+      "kind": "r",
+      "rls": false,
+      "persistence": "p",
+      "triggers": false,
+      "rules": false,
+      "columns": [
+        {
+          "name": "content_hash",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "evidence",
+          "type": "jsonb",
+          "default": "'{}'::jsonb",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "object_key",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "owner_user_id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "rights_record",
+          "type": "jsonb",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "state",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "default": "now()",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        }
+      ],
+      "constraints": [
+        {
+          "name": "ysong_content_reviews_owner_user_id_fkey",
+          "valid": true,
+          "columns": [
+            "owner_user_id"
+          ],
+          "definition": "FOREIGN KEY (owner_user_id) REFERENCES users(id)"
+        },
+        {
+          "name": "ysong_content_reviews_pkey",
+          "valid": true,
+          "columns": [
+            "object_key"
+          ],
+          "definition": "PRIMARY KEY (object_key)"
+        },
+        {
+          "name": "ysong_content_reviews_state_check",
+          "valid": true,
+          "columns": [
+            "state"
+          ],
+          "definition": "CHECK ((state = ANY (ARRAY['clear'::text, 'needs_review'::text, 'restricted'::text, 'hidden'::text, 'removed'::text, 'restored'::text])))"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ysong_content_reviews_pkey",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_content_reviews_pkey ON ysong_content_reviews USING btree (object_key)"
+        }
+      ]
+    },
+    {
+      "name": "ysong_generation_batches",
+      "kind": "r",
+      "rls": false,
+      "persistence": "p",
+      "triggers": false,
+      "rules": false,
+      "columns": [
+        {
+          "name": "charged",
+          "type": "boolean",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "default": "now()",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "parent_generation_id",
+          "type": "uuid",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "quantity",
+          "type": "integer",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "quota_period_id",
+          "type": "uuid",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "request_hash",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "request_key",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "source",
+          "type": "jsonb",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "default": "now()",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "user_id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        }
+      ],
+      "constraints": [
+        {
+          "name": "ysong_generation_batches_pkey",
+          "valid": true,
+          "columns": [
+            "id"
+          ],
+          "definition": "PRIMARY KEY (id)"
+        },
+        {
+          "name": "ysong_generation_batches_quantity_check",
+          "valid": true,
+          "columns": [
+            "quantity"
+          ],
+          "definition": "CHECK (((quantity >= 1) AND (quantity <= 20)))"
+        },
+        {
+          "name": "ysong_generation_batches_quota_period_id_fkey",
+          "valid": true,
+          "columns": [
+            "quota_period_id"
+          ],
+          "definition": "FOREIGN KEY (quota_period_id) REFERENCES ysong_quota_periods(id)"
+        },
+        {
+          "name": "ysong_generation_batches_user_id_fkey",
+          "valid": true,
+          "columns": [
+            "user_id"
+          ],
+          "definition": "FOREIGN KEY (user_id) REFERENCES users(id)"
+        },
+        {
+          "name": "ysong_generation_batches_user_id_request_key_key",
+          "valid": true,
+          "columns": [
+            "request_key",
+            "user_id"
+          ],
+          "definition": "UNIQUE (user_id, request_key)"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ysong_generation_batches_pkey",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_generation_batches_pkey ON ysong_generation_batches USING btree (id)"
+        },
+        {
+          "name": "ysong_generation_batches_user_id_request_key_key",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_generation_batches_user_id_request_key_key ON ysong_generation_batches USING btree (user_id, request_key)"
+        },
+        {
+          "name": "ysong_generation_owner_history",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE INDEX ysong_generation_owner_history ON ysong_generation_batches USING btree (user_id, created_at DESC)"
+        }
+      ]
+    },
+    {
+      "name": "ysong_generation_versions",
+      "kind": "r",
+      "rls": false,
+      "persistence": "p",
+      "triggers": false,
+      "rules": false,
+      "columns": [
+        {
+          "name": "batch_id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "default": "now()",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "error_code",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "execution",
+          "type": "jsonb",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "feedback",
+          "type": "smallint",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "model",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "model_version",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "project_id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "provider",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "reconciliation",
+          "type": "text",
+          "default": "'reserved'::text",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "result",
+          "type": "jsonb",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "state",
+          "type": "text",
+          "default": "'queued'::text",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "default": "now()",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "user_id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "version_index",
+          "type": "integer",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        }
+      ],
+      "constraints": [
+        {
+          "name": "ysong_generation_versions_batch_id_fkey",
+          "valid": true,
+          "columns": [
+            "batch_id"
+          ],
+          "definition": "FOREIGN KEY (batch_id) REFERENCES ysong_generation_batches(id)"
+        },
+        {
+          "name": "ysong_generation_versions_batch_id_version_index_key",
+          "valid": true,
+          "columns": [
+            "batch_id",
+            "version_index"
+          ],
+          "definition": "UNIQUE (batch_id, version_index)"
+        },
+        {
+          "name": "ysong_generation_versions_feedback_check",
+          "valid": true,
+          "columns": [
+            "feedback"
+          ],
+          "definition": "CHECK ((feedback = ANY (ARRAY['-1'::integer, 1])))"
+        },
+        {
+          "name": "ysong_generation_versions_pkey",
+          "valid": true,
+          "columns": [
+            "id"
+          ],
+          "definition": "PRIMARY KEY (id)"
+        },
+        {
+          "name": "ysong_generation_versions_reconciliation_check",
+          "valid": true,
+          "columns": [
+            "reconciliation"
+          ],
+          "definition": "CHECK ((reconciliation = ANY (ARRAY['reserved'::text, 'consumed'::text, 'released'::text])))"
+        },
+        {
+          "name": "ysong_generation_versions_state_check",
+          "valid": true,
+          "columns": [
+            "state"
+          ],
+          "definition": "CHECK ((state = ANY (ARRAY['queued'::text, 'planning'::text, 'generating'::text, 'processing'::text, 'finalizing'::text, 'ready'::text, 'partially_ready'::text, 'failed'::text, 'cancelled'::text])))"
+        },
+        {
+          "name": "ysong_generation_versions_user_id_fkey",
+          "valid": true,
+          "columns": [
+            "user_id"
+          ],
+          "definition": "FOREIGN KEY (user_id) REFERENCES users(id)"
+        },
+        {
+          "name": "ysong_generation_versions_version_index_check",
+          "valid": true,
+          "columns": [
+            "version_index"
+          ],
+          "definition": "CHECK ((version_index >= 1))"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ysong_generation_versions_batch_id_version_index_key",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_generation_versions_batch_id_version_index_key ON ysong_generation_versions USING btree (batch_id, version_index)"
+        },
+        {
+          "name": "ysong_generation_versions_pkey",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_generation_versions_pkey ON ysong_generation_versions USING btree (id)"
+        }
+      ]
+    },
+    {
+      "name": "ysong_notifications",
+      "kind": "r",
+      "rls": false,
+      "persistence": "p",
+      "triggers": false,
+      "rules": false,
+      "columns": [
+        {
+          "name": "actor_user_id",
+          "type": "uuid",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "body",
+          "type": "text",
+          "default": "''::text",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "default": "now()",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "entity_id",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "entity_type",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "href",
+          "type": "text",
+          "default": "'/app'::text",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "kind",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "read_at",
+          "type": "timestamp with time zone",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "title",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "user_id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        }
+      ],
+      "constraints": [
+        {
+          "name": "ysong_notifications_actor_user_id_fkey",
+          "valid": true,
+          "columns": [
+            "actor_user_id"
+          ],
+          "definition": "FOREIGN KEY (actor_user_id) REFERENCES users(id) ON DELETE SET NULL"
+        },
+        {
+          "name": "ysong_notifications_pkey",
+          "valid": true,
+          "columns": [
+            "id"
+          ],
+          "definition": "PRIMARY KEY (id)"
+        },
+        {
+          "name": "ysong_notifications_user_id_fkey",
+          "valid": true,
+          "columns": [
+            "user_id"
+          ],
+          "definition": "FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ysong_notifications_pkey",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_notifications_pkey ON ysong_notifications USING btree (id)"
+        },
+        {
+          "name": "ysong_notifications_unread_idx",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE INDEX ysong_notifications_unread_idx ON ysong_notifications USING btree (user_id, read_at) WHERE (read_at IS NULL)"
+        },
+        {
+          "name": "ysong_notifications_user_idx",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE INDEX ysong_notifications_user_idx ON ysong_notifications USING btree (user_id, created_at DESC)"
+        }
+      ]
+    },
+    {
+      "name": "ysong_plans",
+      "kind": "r",
+      "rls": false,
+      "persistence": "p",
+      "triggers": false,
+      "rules": false,
+      "columns": [
+        {
+          "name": "available",
+          "type": "boolean",
+          "default": "false",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "billing_interval",
+          "type": "text",
+          "default": "'month'::text",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "billing_prices",
+          "type": "jsonb",
+          "default": "'{}'::jsonb",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "billing_products",
+          "type": "jsonb",
+          "default": "'{}'::jsonb",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "capabilities",
+          "type": "jsonb",
+          "default": "'{}'::jsonb",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "currency",
+          "type": "text",
+          "default": "'usd'::text",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "id",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "monthly_generation_quota",
+          "type": "integer",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "monthly_price_cents",
+          "type": "integer",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "name",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "public_visible",
+          "type": "boolean",
+          "default": "true",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "storage_quota_bytes",
+          "type": "bigint",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "default": "now()",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "upgrade_order",
+          "type": "integer",
+          "default": "0",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "usage_limits",
+          "type": "jsonb",
+          "default": "'{}'::jsonb",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        }
+      ],
+      "constraints": [
+        {
+          "name": "ysong_plans_id_check",
+          "valid": true,
+          "columns": [
+            "id"
+          ],
+          "definition": "CHECK ((id = ANY (ARRAY['free'::text, 'basic'::text, 'pro'::text, 'premium'::text])))"
+        },
+        {
+          "name": "ysong_plans_monthly_generation_quota_check",
+          "valid": true,
+          "columns": [
+            "monthly_generation_quota"
+          ],
+          "definition": "CHECK ((monthly_generation_quota >= 0))"
+        },
+        {
+          "name": "ysong_plans_monthly_price_cents_check",
+          "valid": true,
+          "columns": [
+            "monthly_price_cents"
+          ],
+          "definition": "CHECK ((monthly_price_cents >= 0))"
+        },
+        {
+          "name": "ysong_plans_pkey",
+          "valid": true,
+          "columns": [
+            "id"
+          ],
+          "definition": "PRIMARY KEY (id)"
+        },
+        {
+          "name": "ysong_plans_storage_quota_bytes_check",
+          "valid": true,
+          "columns": [
+            "storage_quota_bytes"
+          ],
+          "definition": "CHECK ((storage_quota_bytes >= 0))"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ysong_plans_pkey",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_plans_pkey ON ysong_plans USING btree (id)"
+        }
+      ]
+    },
+    {
+      "name": "ysong_policy_acceptances",
+      "kind": "r",
+      "rls": false,
+      "persistence": "p",
+      "triggers": false,
+      "rules": false,
+      "columns": [
+        {
+          "name": "accepted_at",
+          "type": "timestamp with time zone",
+          "default": "now()",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "policy_id",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "user_id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "version",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        }
+      ],
+      "constraints": [
+        {
+          "name": "ysong_policy_acceptances_pkey",
+          "valid": true,
+          "columns": [
+            "policy_id",
+            "user_id",
+            "version"
+          ],
+          "definition": "PRIMARY KEY (user_id, policy_id, version)"
+        },
+        {
+          "name": "ysong_policy_acceptances_policy_id_version_fkey",
+          "valid": true,
+          "columns": [
+            "policy_id",
+            "version"
+          ],
+          "definition": "FOREIGN KEY (policy_id, version) REFERENCES ysong_policy_versions(policy_id, version)"
+        },
+        {
+          "name": "ysong_policy_acceptances_user_id_fkey",
+          "valid": true,
+          "columns": [
+            "user_id"
+          ],
+          "definition": "FOREIGN KEY (user_id) REFERENCES users(id)"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ysong_policy_acceptances_pkey",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_policy_acceptances_pkey ON ysong_policy_acceptances USING btree (user_id, policy_id, version)"
+        }
+      ]
+    },
+    {
+      "name": "ysong_policy_versions",
+      "kind": "r",
+      "rls": false,
+      "persistence": "p",
+      "triggers": false,
+      "rules": false,
+      "columns": [
+        {
+          "name": "active",
+          "type": "boolean",
+          "default": "false",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "approval_reference",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "approved",
+          "type": "boolean",
+          "default": "false",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "policy_id",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "required",
+          "type": "boolean",
+          "default": "true",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "url",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "version",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        }
+      ],
+      "constraints": [
+        {
+          "name": "ysong_policy_versions_pkey",
+          "valid": true,
+          "columns": [
+            "policy_id",
+            "version"
+          ],
+          "definition": "PRIMARY KEY (policy_id, version)"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ysong_policy_current",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_policy_current ON ysong_policy_versions USING btree (policy_id) WHERE active"
+        },
+        {
+          "name": "ysong_policy_versions_pkey",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_policy_versions_pkey ON ysong_policy_versions USING btree (policy_id, version)"
+        }
+      ]
+    },
+    {
+      "name": "ysong_provider_controls",
+      "kind": "r",
+      "rls": false,
+      "persistence": "p",
+      "triggers": false,
+      "rules": false,
+      "columns": [
+        {
+          "name": "enabled",
+          "type": "boolean",
+          "default": "true",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "id",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "default": "now()",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        }
+      ],
+      "constraints": [
+        {
+          "name": "ysong_provider_controls_pkey",
+          "valid": true,
+          "columns": [
+            "id"
+          ],
+          "definition": "PRIMARY KEY (id)"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ysong_provider_controls_pkey",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_provider_controls_pkey ON ysong_provider_controls USING btree (id)"
+        }
+      ]
+    },
+    {
+      "name": "ysong_quota_periods",
+      "kind": "r",
+      "rls": false,
+      "persistence": "p",
+      "triggers": false,
+      "rules": false,
+      "columns": [
+        {
+          "name": "ends_at",
+          "type": "timestamp with time zone",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "reserved",
+          "type": "integer",
+          "default": "0",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "starts_at",
+          "type": "timestamp with time zone",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "used",
+          "type": "integer",
+          "default": "0",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "user_id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        }
+      ],
+      "constraints": [
+        {
+          "name": "ysong_quota_periods_check",
+          "valid": true,
+          "columns": [
+            "ends_at",
+            "starts_at"
+          ],
+          "definition": "CHECK ((ends_at > starts_at))"
+        },
+        {
+          "name": "ysong_quota_periods_pkey",
+          "valid": true,
+          "columns": [
+            "id"
+          ],
+          "definition": "PRIMARY KEY (id)"
+        },
+        {
+          "name": "ysong_quota_periods_reserved_check",
+          "valid": true,
+          "columns": [
+            "reserved"
+          ],
+          "definition": "CHECK ((reserved >= 0))"
+        },
+        {
+          "name": "ysong_quota_periods_used_check",
+          "valid": true,
+          "columns": [
+            "used"
+          ],
+          "definition": "CHECK ((used >= 0))"
+        },
+        {
+          "name": "ysong_quota_periods_user_id_fkey",
+          "valid": true,
+          "columns": [
+            "user_id"
+          ],
+          "definition": "FOREIGN KEY (user_id) REFERENCES users(id)"
+        },
+        {
+          "name": "ysong_quota_periods_user_id_starts_at_key",
+          "valid": true,
+          "columns": [
+            "starts_at",
+            "user_id"
+          ],
+          "definition": "UNIQUE (user_id, starts_at)"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ysong_quota_periods_pkey",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_quota_periods_pkey ON ysong_quota_periods USING btree (id)"
+        },
+        {
+          "name": "ysong_quota_periods_user_id_starts_at_key",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_quota_periods_user_id_starts_at_key ON ysong_quota_periods USING btree (user_id, starts_at)"
+        }
+      ]
+    },
+    {
+      "name": "ysong_saas_bootstrap",
+      "kind": "r",
+      "rls": false,
+      "persistence": "p",
+      "triggers": false,
+      "rules": false,
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "user_id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        }
+      ],
+      "constraints": [
+        {
+          "name": "ysong_saas_bootstrap_id_check",
+          "valid": true,
+          "columns": [
+            "id"
+          ],
+          "definition": "CHECK ((id = 'superadmin'::text))"
+        },
+        {
+          "name": "ysong_saas_bootstrap_pkey",
+          "valid": true,
+          "columns": [
+            "id"
+          ],
+          "definition": "PRIMARY KEY (id)"
+        },
+        {
+          "name": "ysong_saas_bootstrap_user_id_fkey",
+          "valid": true,
+          "columns": [
+            "user_id"
+          ],
+          "definition": "FOREIGN KEY (user_id) REFERENCES users(id)"
+        },
+        {
+          "name": "ysong_saas_bootstrap_user_id_key",
+          "valid": true,
+          "columns": [
+            "user_id"
+          ],
+          "definition": "UNIQUE (user_id)"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ysong_saas_bootstrap_pkey",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_saas_bootstrap_pkey ON ysong_saas_bootstrap USING btree (id)"
+        },
+        {
+          "name": "ysong_saas_bootstrap_user_id_key",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_saas_bootstrap_user_id_key ON ysong_saas_bootstrap USING btree (user_id)"
+        }
+      ]
+    },
+    {
+      "name": "ysong_saas_migrations",
+      "kind": "r",
+      "rls": false,
+      "persistence": "p",
+      "triggers": false,
+      "rules": false,
+      "columns": [
+        {
+          "name": "applied_at",
+          "type": "timestamp with time zone",
+          "default": "now()",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "id",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        }
+      ],
+      "constraints": [
+        {
+          "name": "ysong_saas_migrations_pkey",
+          "valid": true,
+          "columns": [
+            "id"
+          ],
+          "definition": "PRIMARY KEY (id)"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ysong_saas_migrations_pkey",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_saas_migrations_pkey ON ysong_saas_migrations USING btree (id)"
+        }
+      ]
+    },
+    {
+      "name": "ysong_takedown_cases",
+      "kind": "r",
+      "rls": false,
+      "persistence": "p",
+      "triggers": false,
+      "rules": false,
+      "columns": [
+        {
+          "name": "claim",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "claimant_user_id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "contact_reference",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "counter_notice",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "decision_reason",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "notification_evidence",
+          "type": "jsonb",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "notification_state",
+          "type": "text",
+          "default": "'pending'::text",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "object_key",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "state",
+          "type": "text",
+          "default": "'submitted'::text",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "default": "now()",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        }
+      ],
+      "constraints": [
+        {
+          "name": "ysong_takedown_cases_claimant_user_id_fkey",
+          "valid": true,
+          "columns": [
+            "claimant_user_id"
+          ],
+          "definition": "FOREIGN KEY (claimant_user_id) REFERENCES users(id)"
+        },
+        {
+          "name": "ysong_takedown_cases_object_key_fkey",
+          "valid": true,
+          "columns": [
+            "object_key"
+          ],
+          "definition": "FOREIGN KEY (object_key) REFERENCES ysong_content_reviews(object_key)"
+        },
+        {
+          "name": "ysong_takedown_cases_pkey",
+          "valid": true,
+          "columns": [
+            "id"
+          ],
+          "definition": "PRIMARY KEY (id)"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ysong_takedown_cases_pkey",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_takedown_cases_pkey ON ysong_takedown_cases USING btree (id)"
+        }
+      ]
+    },
+    {
+      "name": "ysong_usage_events",
+      "kind": "r",
+      "rls": false,
+      "persistence": "p",
+      "triggers": false,
+      "rules": false,
+      "columns": [
+        {
+          "name": "admin_exempt",
+          "type": "boolean",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "capability",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "default": "now()",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "model",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "provider",
+          "type": "text",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "reported_cost",
+          "type": "numeric",
+          "default": null,
+          "notNull": false,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "request_hash",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "request_key",
+          "type": "text",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "state",
+          "type": "text",
+          "default": "'submitted'::text",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "units",
+          "type": "integer",
+          "default": "1",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "default": "now()",
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        },
+        {
+          "name": "user_id",
+          "type": "uuid",
+          "default": null,
+          "notNull": true,
+          "identity": "",
+          "generated": ""
+        }
+      ],
+      "constraints": [
+        {
+          "name": "ysong_usage_events_pkey",
+          "valid": true,
+          "columns": [
+            "id"
+          ],
+          "definition": "PRIMARY KEY (id)"
+        },
+        {
+          "name": "ysong_usage_events_user_id_fkey",
+          "valid": true,
+          "columns": [
+            "user_id"
+          ],
+          "definition": "FOREIGN KEY (user_id) REFERENCES users(id)"
+        },
+        {
+          "name": "ysong_usage_events_user_id_request_key_key",
+          "valid": true,
+          "columns": [
+            "request_key",
+            "user_id"
+          ],
+          "definition": "UNIQUE (user_id, request_key)"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "ysong_usage_events_pkey",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_usage_events_pkey ON ysong_usage_events USING btree (id)"
+        },
+        {
+          "name": "ysong_usage_events_user_id_request_key_key",
+          "ready": true,
+          "valid": true,
+          "definition": "CREATE UNIQUE INDEX ysong_usage_events_user_id_request_key_key ON ysong_usage_events USING btree (user_id, request_key)"
+        }
+      ]
+    }
+  ]
+}

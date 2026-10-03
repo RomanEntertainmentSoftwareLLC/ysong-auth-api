@@ -33,6 +33,8 @@ test('durable server batch lifecycle on isolated PostgreSQL with mocked paid pro
   await pool.query('CREATE TABLE users(id uuid PRIMARY KEY,email text); CREATE TABLE user_client_state(user_id uuid PRIMARY KEY REFERENCES users(id),state jsonb NOT NULL DEFAULT \'{}\',updated_at timestamptz DEFAULT now())');
   const user=crypto.randomUUID(),other=crypto.randomUUID();
   await pool.query('INSERT INTO users VALUES($1,$2),($3,$4)',[user,'fixture@example.invalid',other,'other@example.invalid']);
+  // The migration requires one bootstrap identity; keep quota subjects ordinary users.
+  await pool.query('INSERT INTO users VALUES($1,$2)',[crypto.randomUUID(),'psychopathetica@gmail.com']);
   await pool.query(await fs.readFile(new URL('../src/saas/schema.sql',import.meta.url),'utf8'));
   await pool.query("UPDATE ysong_plans SET monthly_generation_quota=20,capabilities='{\"generation\":true}' WHERE id='free'");
   const service=createSaasService(pool);let calls=0,fail=false;

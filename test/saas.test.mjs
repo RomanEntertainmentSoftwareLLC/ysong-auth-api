@@ -121,7 +121,7 @@ test('isolated PostgreSQL: additive migration, concurrency, quota lifecycle, lin
   await t.test('billing replay/stale events are safe and comp/role survive billing updates',async()=>{
     await pool.query("UPDATE ysong_plans SET billing_prices='{\"stripe:test\":\"price_fixture\"}' WHERE id='pro'");
     await pool.query("UPDATE ysong_account_access SET billing_provider='stripe',billing_live=false,billing_customer_id='cus_fixture' WHERE user_id=$1",[other]);
-    const subscription={id:'sub_fixture',customer:'cus_fixture',status:'active',items:{data:[{price:{id:'price_fixture',product:'prod_fixture'},current_period_start:100,current_period_end:4102444800}]}};
+    const subscription={id:'sub_fixture',customer:'cus_fixture',livemode:false,status:'active',items:{data:[{price:{id:'price_fixture',product:'prod_fixture'},current_period_start:100,current_period_end:4102444800}]}};
     const event={id:'evt_fixture',type:'customer.subscription.updated',created:200,livemode:false};
     assert.equal((await applySubscriptionEvent(service,event,subscription)).applied,true);
     assert.equal((await applySubscriptionEvent(service,event,subscription)).duplicate,true);

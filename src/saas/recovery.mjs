@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import {AccessError} from './service.mjs';
-import {stripeAdapter,applySubscriptionEvent} from './billing.mjs';
+import {stripeAdapter,applySubscriptionEvent,subscriptionEvents} from './billing.mjs';
 import {notifySaas} from './notifications.mjs';
 const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function registerRecoveryRoutes(app,{pool,service,requireAuth,enabled,env=process.env,billingAdapter=stripeAdapter}) {
@@ -61,7 +61,7 @@ export function registerRecoveryRoutes(app,{pool,service,requireAuth,enabled,env
     const sub=await stripe.subscriptions.retrieve(a.billing_subscription_id),customer=typeof sub.customer==='string'?sub.customer:sub.customer?.id;
     if(sub.livemode!==live||customer!==a.billing_customer_id||sub.id!==a.billing_subscription_id)throw new AccessError('billing_recovery_owner_or_mode_mismatch',409);
     const event={id:eventId,type:sub.status==='canceled'?'customer.subscription.deleted':'customer.subscription.updated',created:Math.floor(Date.now()/1000),livemode:live};
-    res.json(await applySubscriptionEvent(service,event,sub,{id:crypto.randomUUID(),actorId:req.user.id,reason:reason(req),requestKey:req.body.requestKey}));
+    res.json(await applySubscriptionEvent(service,event,sub,{id:crypto.randomUUID(),actorId:req.user.id,reason:reason(req),requestKey:req.body.requestKey},id=>stripe.subscriptions.retrieve(id)));
   }));
   app.post('/api/admin/recovery/billing/:id/link-profile',requireAuth,wrap(async(req,res)=>{
     reason(req);await admin(pool,req.user.id);if(!uuid.test(req.params.id)||typeof req.body.customerId!=='string'||!req.body.customerId.startsWith('cus_')||typeof req.body.subscriptionId!=='string'||!req.body.subscriptionId.startsWith('sub_'))throw new AccessError('invalid_billing_profile',400);
@@ -91,8 +91,8 @@ export function registerRecoveryRoutes(app,{pool,service,requireAuth,enabled,env
     const failure=(await pool.query('SELECT * FROM ysong_billing_failures WHERE live=$1 AND event_id=$2',[live,req.params.id])).rows[0];if(!failure)throw new AccessError('billing_failure_not_found',404);if(failure.resolved_at)return res.json({duplicate:true});
     const event=await stripe.events.retrieve(failure.event_id);
     if(event.id!==failure.event_id||event.livemode!==live||event.type!==failure.event_type)throw new AccessError('billing_event_mode_mismatch',409);
-    const sub=event.type.startsWith('customer.subscription.')?(event.type==='customer.subscription.deleted'?event.data.object:await stripe.subscriptions.retrieve(event.data.object.id)):null;
-    const result=await applySubscriptionEvent(service,event,sub,{id:crypto.randomUUID(),actorId:req.user.id,reason:reason(req),requestKey:event.id});
+    const sub=subscriptionEvents.includes(event.type)?event.data.object:null;
+    const result=await applySubscriptionEvent(service,event,sub,{id:crypto.randomUUID(),actorId:req.user.id,reason:reason(req),requestKey:event.id},sub&&event.type!=='customer.subscription.deleted'?id=>stripe.subscriptions.retrieve(id):null);
     if(result.duplicate||result.stale)await service.transaction(async c=>{await c.query('UPDATE ysong_billing_failures SET resolved_at=now() WHERE live=$1 AND event_id=$2',[live,event.id]);await audit(c,req,null,'billing_event_replay',{eventId:event.id},{...result,resolved:true});});
     res.json(result);
   }));

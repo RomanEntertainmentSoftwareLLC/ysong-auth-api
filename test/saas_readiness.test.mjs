@@ -64,7 +64,7 @@ test('real launch configuration/recovery/billing boundaries on isolated PostgreS
  });
  await t.test('audited billing reconciliation is read-only at Stripe, owner/mode checked and idempotent',async()=>{
   const path='/api/admin/recovery/billing/'+user+'/reconcile',body={requestKey:'recovery-fixture',reason:'Verified current Stripe state after delivery outage'};
-  assert.equal((await request(path,body,user)).status,403);assert.equal((await request(path,body)).status,200);assert.equal((await service.summary(user)).planId,'pro');assert.equal((await request(path,body)).data.duplicate,true);assert.equal(retrieval,1);assert.equal((await pool.query("SELECT * FROM ysong_admin_audit WHERE action='billing_reconciliation'")).rows.length,1);
+  assert.equal((await request(path,body,user)).status,403);assert.equal((await request(path,body)).status,200);assert.equal((await service.summary(user)).planId,'pro');assert.equal((await request(path,body)).data.duplicate,true);assert.equal(retrieval,2);assert.equal((await pool.query("SELECT * FROM ysong_admin_audit WHERE action='billing_reconciliation'")).rows.length,1);
   sub={...sub,livemode:true};assert.equal((await request(path,{...body,requestKey:'wrong-mode-recovery'})).status,409);sub={...sub,livemode:false};assert.equal(checkout,0);
  });
  await t.test('verified invoice notifications and failed webhook replay do not grant access or spam',async()=>{

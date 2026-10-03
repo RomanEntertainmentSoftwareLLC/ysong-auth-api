@@ -17,7 +17,7 @@ logs, configuration JSON, source control, or browser/Vite environment variables.
 If set, `BILLING_MODE` must be `test`. Only `sk_test_` secret keys are accepted;
 live, restricted, publishable, and unrecognized keys fail closed even in check mode.
 
-The only command that mutates Stripe is:
+The catalog command that mutates Stripe is:
 
 ```sh
 node scripts/bootstrap-stripe-test.mjs --apply-test-mode
@@ -52,11 +52,99 @@ operator workflow above: check is read-only and no network mutation occurs unles
 `--apply-test-mode` is explicitly supplied. After an authorized apply, a second
 check should report `reuse` for all three paid plans.
 
+### Stripe TEST webhook operator workflow (2026-10-03)
+
+The authoritative route is `POST /api/billing/webhook` in
+`src/saas/billing.mjs`, registered in `src/index.js` **before** `express.json()`.
+`cloudflare/worker.js` forwards the original request to the existing API container;
+it does not implement a second billing owner. Confirm the selected sandbox HTTPS
+origin reaches this revision and preserves request bytes and `Stripe-Signature`.
+The historical production URL below is not a verified sandbox target.
+
+```sh
+node scripts/configure-stripe-test-webhook.mjs --check
+node scripts/configure-stripe-test-webhook.mjs --dry-run
+# Only after inspecting the proposed test action:
+node scripts/configure-stripe-test-webhook.mjs --apply-test-mode
+```
+
+Supply `BILLING_MODE=test`, `STRIPE_SECRET_KEY` (an explicit `sk_test_` key),
+`STRIPE_TEST_WEBHOOK_URL=https://<isolated-test-api>/api/billing/webhook`, and
+`SAAS_ENABLED=0` through the operator process environment. The utility does not
+load `.env`, select a production origin, alter runtime flags, or write a database.
+No credentials or missing URL/mode yields a deterministic offline check and an
+exact manual blocker; apply with incomplete configuration fails. Check/dry-run
+with complete configuration lists endpoints read-only. Apply creates a missing
+TEST endpoint or reuses one enabled endpoint with exactly the five supported
+events. Live/restricted/unknown keys, non-test mode, non-HTTPS/wrong-path URLs,
+URL credentials/query/fragment, duplicate endpoints, disabled endpoints and event
+configuration conflicts fail closed. Resolve conflicts manually in the selected
+test Dashboard; this utility never updates or deletes existing endpoints.
+
+Creation uses a deterministic URL-based idempotency key; run one operator at a
+time. After a timeout, rerun check before apply. A successful create can remain
+even if the local command failed afterward. Listing discovers that endpoint on
+rerun; Stripe idempotency retention is finite. Output whitelists endpoint ID,
+URL, event names and action, and never returns the SDK response or signing secret.
+See the [Stripe endpoint API](https://docs.stripe.com/api/webhook_endpoints/create)
+for endpoint creation and signing-secret semantics.
+
+**Manual blocker:** in the matching Stripe test sandbox, securely copy the chosen
+endpoint's signing secret into the isolated backend's `STRIPE_WEBHOOK_SECRET`.
+Do not paste it into commands, tickets, logs, or this repository. The tool never
+stores it, and reuse cannot recover it. Finish the existing reviewed test schema,
+customer link and `stripe:test` price configuration. Set
+`BILLING_WEBHOOK_ENABLED=1` only on that isolated backend, keeping `SAAS_ENABLED=0`.
+This opens ingestion and the existing authenticated operator recovery routes;
+Checkout and ordinary SaaS flows remain gated. Deliver actual test lifecycle
+events and record event IDs, endpoint ID, HTTP outcomes and ledger transitions
+without secrets. No real endpoint or delivery was verified by local mock tests.
+
+Reconciliation contract and sandbox acceptance:
+
+- Created/updated events retrieve the current subscription **after** locking the
+  linked customer's account row. The returned subscription ID, customer and mode
+  must match the signed event. Only active/trialing subscriptions with exactly one
+  configured price and a valid billing period grant a plan. Unknown customers,
+  unmapped/ambiguous active prices and identity/mode mismatches roll back the
+  event ledger and entitlement transaction, returning retryable failure evidence.
+- Deleted events use the signed canceled snapshot, without requiring a provider
+  lookup. They remove subscription access even when the price is missing; unknown
+  prices never grant access. A deletion for a replaced subscription cannot cancel
+  its replacement. Role and manual override columns are untouched.
+- Duplicate event IDs are transactional and produce no repeated transition or
+  notification. Earlier event timestamps are acknowledged as stale. Equal-second
+  updates retrieve current state under the same account lock; a same-second
+  update cannot resurrect a canceled subscription. Event IDs are not ordered as
+  timestamps. Settled retries clear previous failure records.
+- Incomplete, past-due, unpaid, paused and canceled subscriptions fall back to Free.
+  Exercise renewal periods, upgrade/downgrade prices, cancellation scheduling and
+  resume. Invoice paid/failed events notify once and never grant a plan. Unsupported
+  event types are acknowledged and ignored; Checkout redirects are not payment proof.
+- Retry a transient failure with the same event ID, then verify one transition and
+  one notice. Use `POST /api/admin/recovery/billing-events/:id/replay` with an audited
+  reason for recorded failures, or `/api/admin/recovery/billing/:id/reconcile` with
+  a reason and stable `requestKey` for current state. Both reuse the billing owner,
+  read Stripe only, and require existing authenticated admin authorization.
+
+Focused validation command:
+
+```sh
+node --test test/stripe_webhook.test.mjs test/stripe_bootstrap.test.mjs test/saas.test.mjs test/saas_launch.test.mjs test/saas_readiness.test.mjs
+```
+
+The webhook suite uses signed HTTP requests, serialized rollback-capable SQL
+mocks, mocked Stripe responses, and CLI subprocesses with no real credentials.
+Existing PostgreSQL suites additionally require the dedicated loopback
+`TEST_SAAS_DATABASE_URL`; skipped suites are not evidence of real database behavior.
+Real sandbox delivery, dashboard configuration, deployed secrets and subsequent
+production release approval remain external Priority 1 gates.
+
 | Configuration | Location / source | Verified status and required action |
 | --- | --- | --- |
 | `SAAS_ENABLED` | Server runtime | Local value off; keep `0` throughout preparation. Deployed bindings require separate inspection. |
 | `BILLING_MODE`, `STRIPE_SECRET_KEY` | Server secret; Stripe account | Production live key/mode not configured. Use a separate test environment for sandbox lifecycle tests; never mix test IDs and live keys. |
-| `STRIPE_WEBHOOK_SECRET` | Server secret; endpoint signing secret | Not configured. Endpoint is `https://api.ysong.ai/api/billing/webhook`; verify signed raw-body delivery. |
+| `STRIPE_WEBHOOK_SECRET` | Server secret; endpoint signing secret | Not configured. Historical production route: `https://api.ysong.ai/api/billing/webhook`; explicitly choose and verify an isolated test origin using the workflow above. |
 | `BILLING_WEBHOOK_ENABLED` | Server runtime | Currently off. A separately approved `1` allows signed ingestion and operator recovery while SaaS remains off; it does not enable Checkout or grant access by itself. |
 | `STRIPE_PORTAL_CONFIGURATION_ID` | Server; Stripe portal configuration | Not configured. Review payment management, switching, cancellation, resumption and downgrade timing before using the selected configuration. |
 | `BILLING_RETURN_URL`, `BILLING_SUCCESS_URL`, `BILLING_CANCEL_URL` | Server; frontend HTTPS URLs | Explicit production values required. Success/cancel must share the return origin. Returning from Checkout is never proof of payment. |

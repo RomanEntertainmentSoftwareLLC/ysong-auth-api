@@ -33,7 +33,7 @@ test('isolated launch boundaries: billing, metering, governance and render recon
   assert.equal((await request(`/api/admin/accounts/${user}/usage`)).status,403);assert.equal((await request(`/api/admin/accounts/${user}/usage`,undefined,admin)).status,200);
  });
  await t.test('authoritative upgrade/downgrade/cancel and stale webhook cannot grant via redirect',async()=>{
-  const sub={id:'sub_fixture',customer:'cus_fixture',status:'active',current_period_start:100,current_period_end:4102444800,cancel_at_period_end:false,items:{data:[{price:{id:'price_pro',product:'prod_fixture'}}]}};
+  const sub={id:'sub_fixture',customer:'cus_fixture',livemode:false,status:'active',current_period_start:100,current_period_end:4102444800,cancel_at_period_end:false,items:{data:[{price:{id:'price_pro',product:'prod_fixture'}}]}};
   const event={id:'evt_pro',type:'customer.subscription.updated',created:100,livemode:false};await applySubscriptionEvent(service,event,sub);assert.equal((await service.summary(user)).planId,'pro');
   await applySubscriptionEvent(service,{...event,id:'evt_basic',created:200},{...sub,cancel_at_period_end:true,items:{data:[{price:{id:'price_basic'}}]}});assert.equal((await request('/api/billing/account')).data.cancellationScheduled,true);
   await applySubscriptionEvent(service,{...event,id:'evt_old',created:150},sub);assert.equal((await service.summary(user)).planId,'basic');

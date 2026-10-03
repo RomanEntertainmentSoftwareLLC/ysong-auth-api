@@ -30,4 +30,28 @@ The preflight label B means preparation can continue; its implementation returns
 
 ## Next Priority 1 action
 
+### Stripe webhook hardening checkpoint (2026-10-03)
+
+The existing Express billing owner now checks subscription identity/customer/mode,
+serializes authoritative Stripe reads under the account lock, and handles
+same-second cancellation without resurrecting access. Created/updated/deleted,
+duplicate/stale/retried events, unknown customer/active price, invoice notices and
+audited recovery have credential-free signed HTTP and transactional mock coverage.
+No schema or runtime flag change is required; `SAAS_ENABLED=0` remains the gate.
+
+`node scripts/configure-stripe-test-webhook.mjs --check` is the deterministic
+operator entry point. With explicit test key/mode and `STRIPE_TEST_WEBHOOK_URL`, it
+inspects read-only; only `--apply-test-mode` can create a missing TEST endpoint.
+It reuses a matching endpoint, rejects conflicts/live credentials and never prints
+or stores the signing secret. Follow the exact environment, secret-transfer and
+delivery checklist in the [TEST webhook workflow](saas-production-launch.md#stripe-test-webhook-operator-workflow-2026-10-03).
+
+Local focused result: 24 passed, 3 PostgreSQL suites skipped because the dedicated
+fixture database was not supplied; the 8 new webhook/operator tests all passed
+without skips. This is mock evidence, not verified Stripe delivery. The remaining
+blocker is operator-supplied sandbox credentials and HTTPS owner URL, secure
+installation of the endpoint signing secret, reviewed test database configuration,
+and recorded real lifecycle deliveries with SaaS still off. No endpoint creation,
+deployment, live billing operation or push occurred in this task.
+
 Obtain the commercial/legal inputs and isolated Stripe test setup, then complete the sandbox lifecycle and evidence based operator walkthrough. Preserve the production migration and deploy gates in the runbook. Do not start Priority 2 work or enable SaaS based on local green tests.

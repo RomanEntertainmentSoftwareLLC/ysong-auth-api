@@ -5,6 +5,10 @@ import {
   HeadObjectCommand,
   DeleteObjectCommand,
   CopyObjectCommand,
+  CreateMultipartUploadCommand,
+  UploadPartCommand,
+  ListPartsCommand,
+  CompleteMultipartUploadCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
@@ -33,6 +37,30 @@ const client = R2_ENABLED
 function requireR2() {
   if (!client) throw new Error("r2_not_configured");
   return client;
+}
+
+export async function startR2Multipart(key, contentType, metadata) {
+  const result = await requireR2().send(new CreateMultipartUploadCommand({ Bucket: bucket, Key: key, ContentType: contentType,
+    Metadata: { ysong: Buffer.from(JSON.stringify(metadata)).toString('base64') } }));
+  return result.UploadId;
+}
+export async function putR2Part(key, uploadId, partNumber, body) {
+  await requireR2().send(new UploadPartCommand({ Bucket: bucket, Key: key, UploadId: uploadId, PartNumber: partNumber, Body: body, ContentLength: body.length }));
+}
+export async function listR2Parts(key, uploadId) {
+  const parts = []; let marker;
+  do {
+    const result = await requireR2().send(new ListPartsCommand({ Bucket: bucket, Key: key, UploadId: uploadId, PartNumberMarker: marker }));
+    parts.push(...(result.Parts || []));
+    if (!result.IsTruncated) break;
+    if (!result.NextPartNumberMarker || result.NextPartNumberMarker === marker) throw new Error('invalid_part_listing');
+    marker = result.NextPartNumberMarker;
+  } while (true);
+  return parts;
+}
+export async function finishR2Multipart(key, uploadId, parts) {
+  await requireR2().send(new CompleteMultipartUploadCommand({ Bucket: bucket, Key: key, UploadId: uploadId,
+    MultipartUpload: { Parts: parts.map(p => ({ PartNumber: p.PartNumber, ETag: p.ETag })) } }));
 }
 
 export async function putR2Object(objectKey, body, {

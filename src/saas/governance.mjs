@@ -8,9 +8,12 @@ export function initialModeration(contentType,buffer=Buffer.alloc(0)) {const hea
 export const artworkPolicy={allowed:['cleavage','swimwear','lingerie','shirtless people','non-explicit partial nudity'],blocked:['visible nipples','visible areola','visible genitalia','exposed pubic hair','explicit sexual content']};
 export function createGovernance({pool,service,enabled,assertOwnedObjectKey}) {
  async function recordUpload(userId,key,buffer,contentType){if(!enabled())return;
-  const hash=crypto.createHash('sha256').update(buffer).digest('hex');
+  const digest=crypto.createHash('sha256');let header=Buffer.alloc(0);
+  if(Buffer.isBuffer(buffer)){digest.update(buffer);header=buffer.subarray(0,512);}
+  else {for await(const chunk of buffer){digest.update(chunk);if(header.length<512)header=Buffer.concat([header,Buffer.from(chunk).subarray(0,512-header.length)]);}}
+  const hash=digest.digest('hex');
   await pool.query(`INSERT INTO ysong_content_reviews(object_key,owner_user_id,content_hash,state,evidence) VALUES($1,$2,$3,$4,$5)
-   ON CONFLICT(object_key) DO UPDATE SET content_hash=excluded.content_hash,state=CASE WHEN ysong_content_reviews.content_hash=excluded.content_hash THEN ysong_content_reviews.state ELSE excluded.state END,rights_record=CASE WHEN ysong_content_reviews.content_hash=excluded.content_hash THEN ysong_content_reviews.rights_record ELSE NULL END,evidence=CASE WHEN ysong_content_reviews.content_hash=excluded.content_hash THEN ysong_content_reviews.evidence ELSE excluded.evidence END,updated_at=now()`,[key,userId,hash,initialModeration(contentType,buffer),{contentType,visualClassification:'not_performed',artworkPolicy}]);
+   ON CONFLICT(object_key) DO UPDATE SET content_hash=excluded.content_hash,state=CASE WHEN ysong_content_reviews.content_hash=excluded.content_hash THEN ysong_content_reviews.state ELSE excluded.state END,rights_record=CASE WHEN ysong_content_reviews.content_hash=excluded.content_hash THEN ysong_content_reviews.rights_record ELSE NULL END,evidence=CASE WHEN ysong_content_reviews.content_hash=excluded.content_hash THEN ysong_content_reviews.evidence ELSE excluded.evidence END,updated_at=now()`,[key,userId,hash,initialModeration(contentType,header),{contentType,visualClassification:'not_performed',artworkPolicy}]);
  }
  async function assertPublic(key){if(!enabled())return;const r=(await pool.query('SELECT * FROM ysong_content_reviews WHERE object_key=$1',[key])).rows[0];
   if(!r||!['clear','restored'].includes(r.state))throw new AccessError('content_requires_review',403);

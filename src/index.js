@@ -32,6 +32,7 @@ import { registerRecoveryRoutes } from "./saas/recovery.mjs";
 import { notifySaas } from "./saas/notifications.mjs";
 import { validateReleaseMetadata, applyReleaseMetadata } from "./artists/releaseMetadata.mjs";
 import { registerReleaseLinking } from "./artists/releaseLinking.mjs";
+import { registerMultipartUploads } from "./storage/multipartUploads.mjs";
 
 import {
 	R2_ENABLED,
@@ -42,6 +43,7 @@ import {
 	copyR2Object,
 	deleteR2Object,
 	getR2SignedUrl,
+	startR2Multipart, putR2Part, listR2Parts, finishR2Multipart,
 } from "./storage/r2.js";
 
 const app = express();
@@ -260,8 +262,8 @@ const corsOptions = {
 		const ok = allowedOrigins.some((o) => (o instanceof RegExp ? o.test(origin) : o === origin));
 		return ok ? cb(null, true) : cb(new Error("Not allowed by CORS"));
 	},
-	methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-	allowedHeaders: ["Content-Type", "Authorization", "Range", "X-YSong-Client-Id", "Idempotency-Key"],
+	methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+	allowedHeaders: ["Content-Type", "Authorization", "Range", "X-YSong-Client-Id", "X-YSong-Upload-Session", "Idempotency-Key"],
 	exposedHeaders: ["Content-Length", "Content-Range", "Accept-Ranges", "Content-Disposition", "X-YSong-Generation-Id", "X-YSong-Object-Key"],
 	credentials: true,
 	maxAge: 86400,
@@ -764,6 +766,14 @@ app.post("/api/uploads", requireAuth, upload.single("file"), async (req, res) =>
 		console.error("POST /api/uploads ERROR", e);
 		return res.status(500).json({ error: "upload_failed", message: e?.message });
 	}
+});
+
+registerMultipartUploads(app, {
+	requireAuth, enabled: () => USE_R2, secret: () => process.env.JWT_SECRET,
+	storage: { start: startR2Multipart, part: putR2Part, list: listR2Parts, finish: finishR2Multipart, head: headR2Object },
+	recordUpload: async (userId, key, contentType) => {
+		if (saasEnabled()) await governance.recordUpload(userId, key, (await getR2Object(key)).Body, contentType);
+	},
 });
 
 app.post("/api/uploads/copy", requireAuth, async (req, res) => {

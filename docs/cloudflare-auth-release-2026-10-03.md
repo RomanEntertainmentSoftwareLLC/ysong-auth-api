@@ -1,0 +1,11 @@
+# Controlled Cloudflare Auth API release check — 2026-10-03
+
+Target: committed `main` source, existing `cloudflare/` Wrangler deployment, `api.ysong.ai`, with `SAAS_ENABLED=0`. No deployment occurred in this check.
+
+The retired `.github/workflows/deploy.yml` has only manual dispatch and an explanatory echo. The working tree began clean. `.env` is ignored and not tracked; the tracked environment file is `.env.example`. The deployment helper now refuses a release unless `SAAS_ENABLED=0` is explicit and the local `main` working tree is clean and committed. It prints the intended commit SHA before calling Wrangler.
+
+Local `.env` contains the existing API, Neon, R2, Resend, and Cloudflare AI configuration names required by the helper, but `SAAS_ENABLED` is unset. `CLOUDFLARE_API_TOKEN` is absent; an existing Wrangler login, if available, has not been validated. No credential values were printed. A reviewed production migration target file and superadmin UUID were not supplied, so the guarded migration compatibility check and any apply are blocked. A read-only Neon connection attempt failed in this environment; schema and configuration compatibility remain unverified.
+
+`node --check cloudflare/deploy.mjs` and the focused SaaS readiness tests passed (3 passed, 1 PostgreSQL integration test skipped). `npm run check` in `cloudflare/` failed because the Docker CLI could not launch; Wrangler also could not write its default log under the user profile. The container image was not built. This is not a validated release artifact.
+
+Before a release, provide the independently reviewed production migration target, run the guarded read-only `migrate-saas.mjs --check`, verify the actual deployed SaaS binding is off and schema/configuration compatibility, and make Docker available for the existing Wrangler dry run. Set `SAAS_ENABLED=0` explicitly in the release environment. Review the resulting committed source SHA and clean tree, then use only `npm run deploy` in `cloudflare/`. After deployment, verify `https://api.ysong.ai/healthz`, `/healthz/db`, allowed `https://www.ysong.ai` CORS, denied foreign-origin CORS, and the current Cloudflare release identifier against the intended commit. Do not claim release completion from local checks.

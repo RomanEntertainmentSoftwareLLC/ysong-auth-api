@@ -7,6 +7,17 @@ import dotenv from "../node_modules/dotenv/lib/main.js";
 
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const source = { ...dotenv.parse(fs.readFileSync(path.join(directory, "../.env"))), ...process.env };
+const repository = path.resolve(directory, "..");
+const git = (args) => spawnSync("git", args, { cwd: repository, encoding: "utf8", windowsHide: true });
+if (source.SAAS_ENABLED !== "0") throw new Error("Set SAAS_ENABLED=0 explicitly before this release; deployment was not attempted.");
+const branch = git(["branch", "--show-current"]);
+const status = git(["status", "--porcelain", "--untracked-files=normal"]);
+const committed = git(["rev-parse", "HEAD"]);
+if ([branch, status, committed].some((result) => result.status !== 0) ||
+    branch.stdout.trim() !== "main" || status.stdout.trim() || !/^[a-f0-9]{40}$/.test(committed.stdout.trim())) {
+  throw new Error("Release requires a clean committed main branch; deployment was not attempted.");
+}
+console.log(`Deploying committed main source ${committed.stdout.trim()}`);
 const required = ["DATABASE_URL", "JWT_SECRET", "RESEND_API_KEY", "EMAIL_FROM", "R2_ENDPOINT",
   "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_AI_API_TOKEN"];
 const optional = ["AUTH_TOKEN_TTL", "TOS_VERSION", "AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_IMAGE_MODEL",

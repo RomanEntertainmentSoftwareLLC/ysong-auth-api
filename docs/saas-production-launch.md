@@ -4,6 +4,54 @@
 
 ## Configuration matrix
 
+### Stripe test catalog bootstrap
+
+Run `node scripts/bootstrap-stripe-test.mjs --check` (or `--dry-run`; check is the default).
+Without credentials this prints the intended Basic $9.99, Pro $19.99, and Premium
+$29.99 USD monthly catalog and reports `offline`; it does not claim Stripe was
+verified. Free always has null product/price references and needs no subscription.
+With `STRIPE_SECRET_KEY` supplied through the operator process environment, check
+lists the complete Stripe catalog read-only and reports proposed creates or reuse.
+The utility deliberately does not load `.env`. Never put keys in command arguments,
+logs, configuration JSON, source control, or browser/Vite environment variables.
+If set, `BILLING_MODE` must be `test`. Only `sk_test_` secret keys are accepted;
+live, restricted, publishable, and unrecognized keys fail closed even in check mode.
+
+The only command that mutates Stripe is:
+
+```sh
+node scripts/bootstrap-stripe-test.mjs --apply-test-mode
+```
+
+Use an isolated Stripe test account/environment. This explicit flag creates only
+missing products/prices with `ysong_plan=basic|pro|premium` metadata. Repeating the
+command reuses discovered resources; deterministic Stripe idempotency keys protect
+retries and overlapping creates. Run one operator at a time. Stripe idempotency
+retention is finite; durable rerun discovery relies on preserving metadata. The
+utility refuses duplicate, archived, untagged attached, or incompatible prices
+(including different amounts, currency, interval counts, or metered billing).
+Resolve conflicts in the test dashboard before retrying; it never deletes or
+silently replaces catalog resources. A partial failure may leave test resources;
+rerun after resolving the failure to reuse them. Errors suppress provider details
+to avoid exposing credentials, and return a nonzero exit status.
+
+The JSON output contains only test catalog references and actions, not credentials.
+Copy each `productId` and `priceId` into the matching plan in an operator copy of
+`docs/saas-launch-config.example.json`, keeping `mode: "test"` and Free references
+null. Do not copy the bootstrap-only `action` field. Complete the existing reviewed
+quota, capability, identity, database, and policy values; then use
+`node scripts/configure-saas.mjs --file <reviewed-file> --check` and the existing
+reviewed `--apply` workflow against the intended test database. That configuration
+boundary alone persists the references under `ysong_plans.billing_prices` and
+`billing_products` as `stripe:test`. The bootstrap does not write the database,
+enable SaaS, create subscriptions, or configure live billing.
+
+Local validation: `node --test test/stripe_bootstrap.test.mjs`. All tests use mocks
+or credential-free/invalid-key CLI subprocesses. Real integration is the guarded
+operator workflow above: check is read-only and no network mutation occurs unless
+`--apply-test-mode` is explicitly supplied. After an authorized apply, a second
+check should report `reuse` for all three paid plans.
+
 | Configuration | Location / source | Verified status and required action |
 | --- | --- | --- |
 | `SAAS_ENABLED` | Server runtime | Local value off; keep `0` throughout preparation. Deployed bindings require separate inspection. |

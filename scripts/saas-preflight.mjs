@@ -5,7 +5,7 @@ import {fileURLToPath} from 'node:url';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {S3Client,ListObjectsV2Command} from '@aws-sdk/client-s3';
-import {environmentGates,catalogGates,readiness} from '../src/saas/preflight.mjs';
+import {environmentGates,catalogGates,legalGates,readiness} from '../src/saas/preflight.mjs';
 
 const env=process.env,remote=process.argv.includes('--remote'),gates=environmentGates(env);
 const report=(gate,status,detail)=>gates.push({gate,status,detail});
@@ -60,8 +60,7 @@ else{
    report('Immutable superadmin identity',count===1&&roles===1?'PASS':'FAIL','Bootstrap UUID and active role must match exactly once');
   }else report('Immutable superadmin identity','NOT CONFIGURED','Bootstrap/access table absent');
   const policies=present('ysong_policy_versions')?(await client.query('SELECT * FROM ysong_policy_versions WHERE active')).rows:[];
-  for(const id of ['terms','privacy','upload-rights','billing','generated-output','bridge-license'])
-   report('Approved policy: '+id,policies.some(p=>p.policy_id===id&&p.approved&&p.required&&p.approval_reference&&!/draft|placeholder|attorney.review.required/i.test(p.version))?'PASS':'NOT CONFIGURED','Stored approval evidence only');
+  gates.push(...legalGates(policies));
   report('Critical notification storage',present('ysong_notifications')?'PASS':'NOT CONFIGURED','Inbox table presence only');
   report('Generation/recovery storage',['ysong_generation_batches','ysong_generation_versions','ysong_quota_periods','ysong_admin_audit','ysong_billing_failures'].every(present)?'PASS':'NOT CONFIGURED','Runtime walkthrough remains manual');
  }catch{report('Database launch audit','FAIL','Connection or schema query failed');}
@@ -69,7 +68,8 @@ else{
 }
 
 // Keep every database domain visible even when the connection fails early.
-for(const gate of ['SaaS tables','Additive migration markers','Immutable superadmin identity','Critical notification storage','Generation/recovery storage',...catalogGates([]).map(g=>g.gate),...['terms','privacy','upload-rights','billing','generated-output','bridge-license'].map(id=>'Approved policy: '+id)])
+for(const legal of legalGates([]))if(!gates.some(g=>g.gate===legal.gate))gates.push(legal);
+for(const gate of ['SaaS tables','Additive migration markers','Immutable superadmin identity','Critical notification storage','Generation/recovery storage',...catalogGates([]).map(g=>g.gate)])
  if(!gates.some(g=>g.gate===gate))report(gate,'NOT CONFIGURED','Database evidence unavailable');
 
 async function get(gate,url,check){

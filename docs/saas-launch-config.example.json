@@ -14,6 +14,9 @@
     {"id":"upload-rights","version":null,"url":null,"approvalReference":null},
     {"id":"billing","version":null,"url":null,"approvalReference":null},
     {"id":"generated-output","version":null,"url":null,"approvalReference":null},
-    {"id":"bridge-license","version":null,"url":null,"approvalReference":null}
+    {"id":"bridge-license","version":null,"url":null,"approvalReference":null},
+    {"id":"dmca-takedown","version":null,"url":null,"approvalReference":null},
+    {"id":"repeat-infringer","version":null,"url":null,"approvalReference":null},
+    {"id":"moderation","version":null,"url":null,"approvalReference":null}
   ]
 }

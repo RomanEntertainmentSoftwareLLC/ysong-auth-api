@@ -1,3 +1,10 @@
+import {POLICY_IDS,approvedPolicy} from './policies.mjs';
+export function legalGates(policies){
+ return [
+  ...POLICY_IDS.map(id=>({gate:'Approved policy: '+id,status:policies.some(p=>p.policy_id===id&&approvedPolicy(p))?'PASS':'NOT CONFIGURED',detail:'Stored version/reference checks only; no attorney approval is inferred'})),
+  {gate:'Attorney review of required legal versions',status:POLICY_IDS.every(id=>policies.some(p=>p.policy_id===id&&approvedPolicy(p)))?'MANUAL ACTION REQUIRED':'ATTORNEY REVIEW REQUIRED',detail:'Counsel and operator must verify real approval and delivery evidence before launch'}
+ ];
+}
 export function environmentGates(env){
  const key=env.STRIPE_SECRET_KEY;
  return [
@@ -22,4 +29,4 @@ export function catalogGates(plans){
   {gate:'Existing Free account compatibility',status:plans.some(p=>p.id==='free')?'PASS':'NOT CONFIGURED',detail:'No subscription needed for account/project reads; costly features remain separately configured'}
  ];
 }
-export function readiness(gates){return ['FAIL','NOT CONFIGURED','MANUAL ACTION REQUIRED','PASS'].find(status=>gates.some(g=>g.status===status))??'NOT CONFIGURED';}
+export function readiness(gates){return ['FAIL','NOT CONFIGURED','ATTORNEY REVIEW REQUIRED','MANUAL ACTION REQUIRED','PASS'].find(status=>gates.some(g=>g.status===status))??'NOT CONFIGURED';}

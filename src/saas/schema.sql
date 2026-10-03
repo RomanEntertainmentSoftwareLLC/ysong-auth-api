@@ -160,6 +160,11 @@ CREATE TABLE IF NOT EXISTS ysong_billing_failures (
 );
 ALTER TABLE ysong_takedown_cases ADD COLUMN IF NOT EXISTS notification_evidence jsonb;
 ALTER TABLE ysong_policy_versions ADD COLUMN IF NOT EXISTS approval_reference text;
+INSERT INTO ysong_policy_versions(policy_id,version,url,required) VALUES
+ ('dmca-takedown','attorney-review-required','/legal',false),
+ ('repeat-infringer','attorney-review-required','/legal',false),
+ ('moderation','attorney-review-required','/legal',false)
+ ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS ysong_saas_migrations (id text PRIMARY KEY,applied_at timestamptz NOT NULL DEFAULT now());
 INSERT INTO ysong_saas_migrations(id) VALUES('launch-preparation-v1') ON CONFLICT DO NOTHING;
 INSERT INTO ysong_saas_migrations(id) VALUES('guarded-migration-v2') ON CONFLICT DO NOTHING;

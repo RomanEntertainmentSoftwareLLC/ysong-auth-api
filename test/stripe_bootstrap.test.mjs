@@ -76,7 +76,7 @@ test('references integrate through reviewed configuration into stripe:test only'
   const f=fixture(),result=await f.run({applyTestMode:true});
   const c=validateLaunchConfiguration({mode:result.mode,databaseHost:'localhost',superadminUserId:'00000000-0000-4000-8000-000000000001',
     plans:result.plans.map(({id,priceId,productId})=>({id,priceId,productId,quota:5,storageQuotaBytes:null,capabilities:{generation:false,assistant:false,uploads:false,artwork:false},assistantLimit:null,available:false})),
-    policies:['terms','privacy','upload-rights','billing','generated-output','bridge-license'].map(id=>({id,version:'reviewed-v1',url:'https://example.com/'+id,approvalReference:'Fixture review reference'}))});
+    policies:['terms','privacy','upload-rights','billing','generated-output','bridge-license','dmca-takedown','repeat-infringer','moderation'].map(id=>({id,version:'reviewed-v1',url:'https://example.com/'+id,approvalReference:'Fixture review reference'}))});
   const updates=[];
   await applyLaunchConfiguration({query:async(sql,args)=>{
     if(sql.startsWith('SELECT id,monthly'))return {rows:[{id:'free',monthly_price_cents:0},...testCatalog.map(p=>({id:p.id,monthly_price_cents:p.amount}))].map(p=>({...p,currency:'usd',billing_interval:'month'}))};

@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import {notifySaas} from './notifications.mjs';
-import {approvedPolicy} from './policies.mjs';
+import {approvedPolicy,ACCEPTANCE_POLICY_IDS} from './policies.mjs';
 import { AccessError } from './service.mjs';
 import { classifyCost } from './metering.mjs';
 import { ContentRightsRecordSchema, evaluateContentRightsGate, contentRightsEvidenceHash } from '../contentRights/gate.mjs';
@@ -21,11 +21,11 @@ export function createGovernance({pool,service,enabled,assertOwnedObjectKey}) {
   async function admin(c,id){const a=await service.account(c,id);if(a?.account_status!=='active'||!['admin','superadmin'].includes(a.role))throw new AccessError('admin_required');}
   app.get('/api/account/policies',requireAuth,wrap(async(req,res)=>{
    const policies=(await pool.query('SELECT p.*,a.accepted_at FROM ysong_policy_versions p LEFT JOIN ysong_policy_acceptances a ON a.policy_id=p.policy_id AND a.version=p.version AND a.user_id=$1 WHERE p.active',[req.user.id])).rows;
-   res.json({policies:policies.map(p=>({...p,approved:approvedPolicy(p)})),configured:policies.length>=6&&policies.every(approvedPolicy),legalReview:'ATTORNEY REVIEW REQUIRED until published versions are approved'});
+   res.json({policies:policies.filter(p=>p.required).map(p=>({...p,approved:approvedPolicy(p)})),configured:ACCEPTANCE_POLICY_IDS.every(id=>policies.some(p=>p.policy_id===id&&approvedPolicy(p))),legalReview:'ATTORNEY REVIEW REQUIRED until published versions are approved'});
   }));
   app.post('/api/account/policies/accept',requireAuth,wrap(async(req,res)=>{
    if(req.body?.accepted!==true)throw new AccessError('explicit_acceptance_required',400);
-   const p=(await pool.query('SELECT * FROM ysong_policy_versions WHERE policy_id=$1 AND version=$2 AND active',[req.body.policyId,req.body.version])).rows[0];if(!approvedPolicy(p))throw new AccessError('policy_version_not_current',409);
+   const p=(await pool.query('SELECT * FROM ysong_policy_versions WHERE policy_id=$1 AND version=$2 AND active',[req.body.policyId,req.body.version])).rows[0];if(!approvedPolicy(p)||!p.required)throw new AccessError('policy_version_not_current',409);
    const r=await pool.query('INSERT INTO ysong_policy_acceptances(user_id,policy_id,version) SELECT $1,policy_id,version FROM ysong_policy_versions WHERE policy_id=$2 AND version=$3 AND active AND approved ON CONFLICT DO NOTHING RETURNING accepted_at',[req.user.id,req.body.policyId,req.body.version]);
    if(!r.rows.length&&!(await pool.query('SELECT 1 FROM ysong_policy_acceptances a JOIN ysong_policy_versions p USING(policy_id,version) WHERE a.user_id=$1 AND a.policy_id=$2 AND a.version=$3 AND p.active AND p.approved',[req.user.id,req.body.policyId,req.body.version])).rows.length)throw new AccessError('policy_version_stale_or_unapproved',409);res.json({accepted:true});
   }));
@@ -90,7 +90,7 @@ export function createGovernance({pool,service,enabled,assertOwnedObjectKey}) {
   if(!enabled()||req.method!=='POST'||(classifyCost(req.path)==='free'&&!['/api/uploads','/api/world/publish'].includes(req.path)))return next();
   requireAuth(req,res,async()=>{try{
    const rows=(await pool.query('SELECT p.*,a.accepted_at FROM ysong_policy_versions p LEFT JOIN ysong_policy_acceptances a ON a.policy_id=p.policy_id AND a.version=p.version AND a.user_id=$1 WHERE p.active AND p.required',[req.user.id])).rows;
-   if(!['terms','privacy','upload-rights','billing','generated-output'].every(id=>rows.some(p=>p.policy_id===id&&approvedPolicy(p)))||rows.some(p=>!approvedPolicy(p)))throw new AccessError('policies_not_configured',503);
+   if(!ACCEPTANCE_POLICY_IDS.every(id=>rows.some(p=>p.policy_id===id&&approvedPolicy(p)))||rows.some(p=>!approvedPolicy(p)))throw new AccessError('policies_not_configured',503);
    if(rows.some(p=>!p.accepted_at))throw new AccessError('policy_acceptance_required',403);
    next();
   }catch(e){res.status(e instanceof AccessError?e.status:503).json({error:e instanceof AccessError?e.code:'policy_service_unavailable'});}});

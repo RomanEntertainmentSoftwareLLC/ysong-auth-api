@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
 import {environmentGates,catalogGates,readiness} from '../src/saas/preflight.mjs';
+import {POLICY_IDS} from '../src/saas/policies.mjs';
 
 test('environment distinguishes absent, mismatched and disabled production configuration',()=>{
  const byName=env=>Object.fromEntries(environmentGates(env).map(g=>[g.gate,g.status]));
@@ -25,5 +26,6 @@ test('CLI produces one parseable record and fails closed without production evid
  assert.equal(record.status,'NOT CONFIGURED');
  assert.equal(record.gates.find(g=>g.gate==='Neon/read-only database connection').status,'NOT CONFIGURED');
  assert.equal(record.gates.find(g=>g.gate==='Production API health').status,'NOT CONFIGURED');
+ for(const id of POLICY_IDS)assert.equal(record.gates.find(g=>g.gate==='Approved policy: '+id).status,'NOT CONFIGURED');
  assert.ok(record.gates.some(g=>g.status==='MANUAL ACTION REQUIRED'));
 });

@@ -75,7 +75,7 @@ test('conflicts anywhere in catalog fail before writes, including archived and w
 test('references integrate through reviewed configuration into stripe:test only',async()=>{
   const f=fixture(),result=await f.run({applyTestMode:true});
   const c=validateLaunchConfiguration({mode:result.mode,databaseHost:'localhost',superadminUserId:'00000000-0000-4000-8000-000000000001',
-    plans:result.plans.map(({id,priceId,productId})=>({id,priceId,productId,quota:5,storageQuotaBytes:null,capabilities:{},assistantLimit:null,available:false})),
+    plans:result.plans.map(({id,priceId,productId})=>({id,priceId,productId,quota:5,storageQuotaBytes:null,capabilities:{generation:false,assistant:false,uploads:false,artwork:false},assistantLimit:null,available:false})),
     policies:['terms','privacy','upload-rights','billing','generated-output','bridge-license'].map(id=>({id,version:'reviewed-v1',url:'https://example.com/'+id,approvalReference:'Fixture review reference'}))});
   const updates=[];
   await applyLaunchConfiguration({query:async(sql,args)=>{

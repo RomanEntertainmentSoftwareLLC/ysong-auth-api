@@ -3,10 +3,10 @@
   "databaseHost": null,
   "superadminUserId": null,
   "plans": [
-    {"id":"free","quota":null,"storageQuotaBytes":null,"capabilities":{},"assistantLimit":null,"available":false,"priceId":null,"productId":null},
-    {"id":"basic","quota":null,"storageQuotaBytes":null,"capabilities":{},"assistantLimit":null,"available":false,"priceId":null,"productId":null},
-    {"id":"pro","quota":null,"storageQuotaBytes":null,"capabilities":{},"assistantLimit":null,"available":false,"priceId":null,"productId":null},
-    {"id":"premium","quota":null,"storageQuotaBytes":null,"capabilities":{},"assistantLimit":null,"available":false,"priceId":null,"productId":null}
+    {"id":"free","quota":null,"storageQuotaBytes":null,"capabilities":{"generation":false,"assistant":false,"uploads":false,"artwork":false},"assistantLimit":null,"available":false,"priceId":null,"productId":null},
+    {"id":"basic","quota":null,"storageQuotaBytes":null,"capabilities":{"generation":false,"assistant":false,"uploads":false,"artwork":false},"assistantLimit":null,"available":false,"priceId":null,"productId":null},
+    {"id":"pro","quota":null,"storageQuotaBytes":null,"capabilities":{"generation":false,"assistant":false,"uploads":false,"artwork":false},"assistantLimit":null,"available":false,"priceId":null,"productId":null},
+    {"id":"premium","quota":null,"storageQuotaBytes":null,"capabilities":{"generation":false,"assistant":false,"uploads":false,"artwork":false},"assistantLimit":null,"available":false,"priceId":null,"productId":null}
   ],
   "policies": [
     {"id":"terms","version":null,"url":null,"approvalReference":null},

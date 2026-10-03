@@ -1,12 +1,12 @@
 export function environmentGates(env){
  const key=env.STRIPE_SECRET_KEY;
  return [
-  {gate:'SaaS remains disabled',status:env.SAAS_ENABLED==='1'?'FAIL':'PASS',detail:'Configuration is not an enable decision'},
-  {gate:'Production billing mode/key',status:!key?'NOT CONFIGURED':env.BILLING_MODE==='live'&&key.startsWith('sk_live_')?'PASS':'FAIL',detail:'Live key must match live mode; no values displayed'},
-  {gate:'Webhook signing secret',status:env.STRIPE_WEBHOOK_SECRET?.startsWith('whsec_')?'PASS':'NOT CONFIGURED',detail:'Separately configured Stripe endpoint'},
+  {gate:'SaaS remains disabled',status:env.SAAS_ENABLED==='0'?'PASS':env.SAAS_ENABLED==='1'?'FAIL':'NOT CONFIGURED',detail:'Explicit disabled flag required'},
+  {gate:'Production billing mode/key',status:!key||!env.BILLING_MODE?'NOT CONFIGURED':env.BILLING_MODE==='live'&&key.startsWith('sk_live_')?'PASS':'FAIL',detail:'Live key must match live mode; no values displayed'},
+  {gate:'Webhook signing secret',status:!env.STRIPE_WEBHOOK_SECRET?'NOT CONFIGURED':env.STRIPE_WEBHOOK_SECRET.startsWith('whsec_')?'PASS':'FAIL',detail:'Presence only; endpoint delivery requires review'},
   {gate:'Explicit portal configuration',status:env.STRIPE_PORTAL_CONFIGURATION_ID?.startsWith('bpc_')?'PASS':'NOT CONFIGURED',detail:'Presence only; dashboard review required'},
   {gate:'Billing redirect URLs',status:redirectsReady(env)?'PASS':'NOT CONFIGURED',detail:'HTTPS success/cancel URLs must share the return origin'},
-  {gate:'Pre-enablement signed webhook ingestion',status:env.BILLING_WEBHOOK_ENABLED==='1'?'PASS':'MANUAL ACTION REQUIRED',detail:'Only after schema/config review; SaaS may remain off'},
+  {gate:'Pre-enablement signed webhook ingestion',status:env.BILLING_WEBHOOK_ENABLED==='1'?'PASS':env.BILLING_WEBHOOK_ENABLED==='0'?'NOT CONFIGURED':'MANUAL ACTION REQUIRED',detail:'Runtime flag presence only; delivery requires review'},
   {gate:'Resend presence',status:env.RESEND_API_KEY&&env.EMAIL_FROM?'PASS':'NOT CONFIGURED',detail:'No email sent'},
   {gate:'R2 configuration presence',status:['R2_ENDPOINT','R2_BUCKET','R2_ACCESS_KEY_ID','R2_SECRET_ACCESS_KEY'].every(k=>env[k])?'PASS':'NOT CONFIGURED',detail:'No object changed'},
   {gate:'Generation provider configuration',status:['cloudflare','cf'].includes(String(env.MINIMAX_MUSIC_PROVIDER).toLowerCase())&&env.CLOUDFLARE_ACCOUNT_ID&&env.CLOUDFLARE_AI_API_TOKEN?'PASS':'MANUAL ACTION REQUIRED',detail:'Existing audio.cpp/HTTP remain available; no AI/music smoke call'}
@@ -22,4 +22,4 @@ export function catalogGates(plans){
   {gate:'Existing Free account compatibility',status:plans.some(p=>p.id==='free')?'PASS':'NOT CONFIGURED',detail:'No subscription needed for account/project reads; costly features remain separately configured'}
  ];
 }
-export function readiness(gates){return gates.some(g=>g.status==='FAIL')?'A - NOT READY':'B - READY FOR BILLING CONFIGURATION';}
+export function readiness(gates){return ['FAIL','NOT CONFIGURED','MANUAL ACTION REQUIRED','PASS'].find(status=>gates.some(g=>g.status===status))??'NOT CONFIGURED';}

@@ -209,4 +209,27 @@ Keep SaaS off if any gate fails. Roll back application revisions using the recor
 
 The local retired `.github/workflows/deploy.yml` has manual dispatch only and no SSH/rsync/VM restart or push deployment. It has not been pushed, so the remote workflow is unchanged. Any future approved push must include that replacement. No automatic Cloudflare deployment workflow was added.
 
-Latest read-only preflight: B, exit 1 intentionally. API health, Neon health, allowed-origin CORS, R2 metadata read and frontend login page pass. Local tracked-known-secret and retired-workflow checks pass; neither is a full history/untracked secret audit. Production SaaS schema/configuration, Stripe/portal/webhook/redirects, allowances and approved policies remain incomplete. Dashboard, authenticated deployed behavior, formal legal delivery, public rights/cache, final Git/release approval remain manual gates. No production configuration/schema/flag was changed and no paid call, live charge, deployment, commit or push occurred.
+### Unattended production preflight
+
+From this repository, run `node scripts/saas-preflight.mjs --remote` with the
+reviewed production `DATABASE_URL` and server-only settings supplied in the
+process environment. The script does not load `.env` or use
+`TEST_SAAS_DATABASE_URL`. It emits exactly one JSON object on stdout with
+`status`, `scope`, and named `gates`. Redirect stdout to an Autopilot log or
+parse it as JSON. Exit code 0 requires every gate to be `PASS`; otherwise it
+exits 1. Overall status uses severity order `FAIL`, `NOT CONFIGURED`,
+`MANUAL ACTION REQUIRED`, `PASS`. A missing value is never treated as proof of
+readiness. Without `--remote`, public production probes report
+`NOT CONFIGURED`.
+
+The database check uses a short read-only transaction and SELECTs for schema,
+plans, migration markers, superadmin bootstrap, and policy versions. Remote
+checks use public GETs and an R2 metadata listing. The script does not call
+Stripe, Resend, or an AI/music provider, does not write catalog data, and does
+not enable SaaS. Git checks cover only this local repository and currently
+configured known secrets in tracked files. The frontend probe proves only
+that the login page responds; deployed revisions and authenticated behavior
+still require operator evidence. Manual gates remain open even if presence
+checks pass. Keep SaaS disabled until the separate launch approval.
+
+Focused validation: `node --test test/saas_preflight.test.mjs`.

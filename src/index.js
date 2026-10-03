@@ -12,6 +12,7 @@ import fs from "fs";
 import path from "path";
 import os from "os";
 import { spawn } from "child_process";
+import { pipeline } from "node:stream/promises";
 import { UNIVERSAL_RULE_SEED, BUILTIN_PERSONA_SEEDS } from "./aiPersonaSeeds.js";
 import { registerMusicSeoRoutes } from "./musicSeo/routes.mjs";
 import { registerPromotionRoutes } from "./promotion/routes.mjs";
@@ -21,6 +22,27 @@ import { ensureCuratorSchema } from "./curators/schema.mjs";
 import { registerComposerRoutes } from "./composer/routes.mjs";
 import { registerSoundDesignerRoutes } from "./soundDesigner/routes.mjs";
 import { registerStemComposerRoutes } from "./stemComposer/routes.mjs";
+import { createSaasService, AccessError } from "./saas/service.mjs";
+import { registerBillingWebhook } from "./saas/billing.mjs";
+import { registerSaasRoutes, createAccessGate } from "./saas/routes.mjs";
+import { createSessionJobs } from "./saas/jobs.mjs";
+import { createMeteringGate, assertPaidBoundary } from "./saas/metering.mjs";
+import { createGovernance } from "./saas/governance.mjs";
+import { registerRecoveryRoutes } from "./saas/recovery.mjs";
+import { notifySaas } from "./saas/notifications.mjs";
+import { validateReleaseMetadata, applyReleaseMetadata } from "./artists/releaseMetadata.mjs";
+import { registerReleaseLinking } from "./artists/releaseLinking.mjs";
+
+import {
+	R2_ENABLED,
+	R2_BUCKET,
+	putR2Object,
+	headR2Object,
+	getR2Object,
+	copyR2Object,
+	deleteR2Object,
+	getR2SignedUrl,
+} from "./storage/r2.js";
 
 const app = express();
 
@@ -32,23 +54,30 @@ const upload = multer({
 });
 
 const LOCAL_MODE = process.env.LOCAL_MODE !== "0";
+const USE_R2 = !LOCAL_MODE;
+if (USE_R2 && !R2_ENABLED)
+	throw new Error("Production requires R2_ENDPOINT, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY.");
 const LOCAL_STORAGE_ROOT = path.resolve(
-	process.env.LOCAL_STORAGE_DIR || path.join(process.cwd(), "..", "data", "uploads")
+	process.env.LOCAL_STORAGE_DIR || path.join(process.cwd(), "..", "data", "uploads"),
 );
 fs.mkdirSync(LOCAL_STORAGE_ROOT, { recursive: true });
-console.log(`YSong local storage: ${LOCAL_STORAGE_ROOT}`);
+console.log(`YSong storage: ${USE_R2 ? "R2 (local disk is temporary processing storage)" : LOCAL_STORAGE_ROOT}`);
 
 function sanitizeFilename(name) {
-	return String(name || "file")
-		.replace(/[\\/]+/g, "_")
-		.replace(/[<>:\"|?*\u0000-\u001f]/g, "_")
-		.replace(/\s+/g, " ")
-		.trim()
-		.slice(0, 180) || "file";
+	return (
+		String(name || "file")
+			.replace(/[\\/]+/g, "_")
+			.replace(/[<>:\"|?*\u0000-\u001f]/g, "_")
+			.replace(/\s+/g, " ")
+			.trim()
+			.slice(0, 180) || "file"
+	);
 }
 
 function normalizeObjectKey(objectKey) {
-	const key = String(objectKey || "").replace(/\\/g, "/").replace(/^\/+/, "");
+	const key = String(objectKey || "")
+		.replace(/\\/g, "/")
+		.replace(/^\/+/, "");
 	if (!key || key.split("/").some((part) => part === ".." || part === ".")) {
 		throw new Error("invalid_object_key");
 	}
@@ -70,17 +99,113 @@ function metadataPath(objectKey) {
 }
 
 async function writeObjectMetadata(objectKey, metadata) {
+	if (USE_R2) {
+		await putR2Object(normalizeObjectKey(objectKey), fs.createReadStream(objectPath(objectKey)), {
+			contentType: metadata.contentType || "application/octet-stream",
+			metadata,
+			contentLength: (await fs.promises.stat(objectPath(objectKey))).size,
+		});
+		return;
+	}
 	const metaFile = metadataPath(objectKey);
 	await fs.promises.mkdir(path.dirname(metaFile), { recursive: true });
 	await fs.promises.writeFile(metaFile, JSON.stringify(metadata, null, 2), "utf8");
 }
 
 async function readObjectMetadata(objectKey) {
+	if (USE_R2) {
+		const head = await headStoredObject(objectKey);
+		let metadata = {};
+		try {
+			metadata = JSON.parse(Buffer.from(head.Metadata?.ysong || "", "base64").toString("utf8"));
+		} catch {}
+		return {
+			...metadata,
+			contentType: head.ContentType || metadata.contentType || "application/octet-stream",
+			size: head.ContentLength,
+			originalName: metadata.originalName || normalizeObjectKey(objectKey).split("/").pop(),
+		};
+	}
 	try {
 		return JSON.parse(await fs.promises.readFile(metadataPath(objectKey), "utf8"));
 	} catch {
 		return {};
 	}
+}
+
+async function headStoredObject(objectKey) {
+	try {
+		return await headR2Object(normalizeObjectKey(objectKey));
+	} catch (error) {
+		if (error?.$metadata?.httpStatusCode === 404) throw Object.assign(new Error("not_found"), { code: "ENOENT" });
+		throw error;
+	}
+}
+
+async function assertObjectReadable(objectKey) {
+	if (USE_R2) await headStoredObject(objectKey);
+	else await fs.promises.access(objectPath(objectKey), fs.constants.R_OK);
+}
+
+// Native ffmpeg processing still needs a file. R2 remains authoritative; disk is a cache.
+async function materializeObject(objectKey) {
+	const target = objectPath(objectKey);
+	if (USE_R2) {
+		await assertObjectReadable(objectKey);
+		const object = await getR2Object(normalizeObjectKey(objectKey));
+		await fs.promises.mkdir(path.dirname(target), { recursive: true });
+		const temporary = `${target}.${crypto.randomUUID()}.tmp`;
+		try {
+			await pipeline(object.Body, fs.createWriteStream(temporary));
+			await fs.promises.rename(temporary, target);
+		} finally {
+			await fs.promises.unlink(temporary).catch(() => {});
+		}
+	} else await assertObjectReadable(objectKey);
+	return target;
+}
+
+async function streamR2Object(req, res, objectKey, { cache = "private, max-age=300", download = false } = {}) {
+	const head = await headStoredObject(objectKey);
+	const size = Number(head.ContentLength);
+	const meta = await readObjectMetadata(objectKey);
+	res.setHeader("Content-Type", meta.contentType);
+	res.setHeader("Cache-Control", cache);
+	res.setHeader("Accept-Ranges", "bytes");
+	if (download)
+		res.setHeader(
+			"Content-Disposition",
+			`attachment; filename*=UTF-8''${encodeURIComponent(sanitizeFilename(meta.originalName))}`,
+		);
+	let range;
+	if (req.headers.range) {
+		const match = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range).trim());
+		let start = match?.[1] ? Number(match[1]) : 0;
+		let end = match?.[2] ? Number(match[2]) : size - 1;
+		if (match && !match[1] && match[2]) {
+			start = Math.max(0, size - Number(match[2]));
+			end = size - 1;
+		}
+		if (
+			!match ||
+			(!match[1] && !match[2]) ||
+			!Number.isSafeInteger(start) ||
+			!Number.isSafeInteger(end) ||
+			start < 0 ||
+			end < start ||
+			start >= size
+		) {
+			res.setHeader("Content-Range", `bytes */${size}`);
+			return res.status(416).end();
+		}
+		end = Math.min(end, size - 1);
+		range = `bytes=${start}-${end}`;
+		res.status(206);
+		res.setHeader("Content-Range", `bytes ${start}-${end}/${size}`);
+		res.setHeader("Content-Length", end - start + 1);
+	} else res.setHeader("Content-Length", size);
+	const object = await getR2Object(normalizeObjectKey(objectKey), { range });
+	await pipeline(object.Body, res);
 }
 
 function assertOwnedObjectKey(userId, objectKey, { uploadOnly = false } = {}) {
@@ -136,8 +261,8 @@ const corsOptions = {
 		return ok ? cb(null, true) : cb(new Error("Not allowed by CORS"));
 	},
 	methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-	allowedHeaders: ["Content-Type", "Authorization", "Range", "X-YSong-Client-Id"],
-	exposedHeaders: ["Content-Length", "Content-Range", "Accept-Ranges", "Content-Disposition"],
+	allowedHeaders: ["Content-Type", "Authorization", "Range", "X-YSong-Client-Id", "Idempotency-Key"],
+	exposedHeaders: ["Content-Length", "Content-Range", "Accept-Ranges", "Content-Disposition", "X-YSong-Generation-Id", "X-YSong-Object-Key"],
 	credentials: true,
 	maxAge: 86400,
 };
@@ -154,11 +279,38 @@ app.use((_, res, next) => {
 });
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
+
+app.use((err, _req, res, next) => {
+	if (err?.message === "Not allowed by CORS") {
+		return res.status(403).json({ error: "cors_origin_denied" });
+	}
+	return next(err);
+});
+
+const saasEnabled = () => process.env.SAAS_ENABLED === "1";
+const saas = createSaasService(pool);
+// Preserve raw signed bytes; this endpoint must precede the JSON parser.
+registerBillingWebhook(app, express, saas, saasEnabled);
 app.use(express.json());
+app.use(createAccessGate({ service: saas, requireAuth, enabled: saasEnabled }));
+registerSaasRoutes(app, { pool, service: saas, requireAuth, enabled: saasEnabled });
+registerRecoveryRoutes(app,{pool,service:saas,requireAuth,enabled:()=>saasEnabled()||process.env.BILLING_WEBHOOK_ENABLED==='1'});
+const governance=createGovernance({pool,service:saas,enabled:saasEnabled,assertOwnedObjectKey});
+governance.register(app,requireAuth);
+app.use(governance.policyGate(requireAuth));
+app.use(createMeteringGate({ pool, service: saas, requireAuth, enabled: saasEnabled, artworkProvider }));
+const sessionJobs = createSessionJobs({ pool, service: saas, enabled: saasEnabled,
+ provider: () => { const provider = miniMaxProvider(); return { provider, model: provider === "cloudflare" ? cloudflareMusicConfig().model : miniMaxMusicModel() }; },
+ generate: (provider, body) => provider === "audio_cpp" ? generateWithAudioCpp(body) : provider === "cloudflare" ? generateWithCloudflareMusic(body) : generateWithMiniMaxHttp(body),
+ persist: persistGenerationAudio,
+ inspectArtifact: async key => { const audio=await fs.promises.readFile(await materializeObject(key));if(!audio.length)throw new Error('empty_artifact');return {bytes:audio.length,hash:crypto.createHash('sha256').update(audio).digest('hex')}; } });
+sessionJobs.register(app, requireAuth);
 
 // -------------------- Artwork Studio: server-side image generation --------------------
 function artworkProvider() {
-	const requested = String(process.env.ARTWORK_AI_PROVIDER || "").trim().toLowerCase();
+	const requested = String(process.env.ARTWORK_AI_PROVIDER || "")
+		.trim()
+		.toLowerCase();
 	if (requested === "openai" || requested === "xai") return requested;
 	if (String(process.env.OPENAI_API_KEY || "").trim()) return "openai";
 	if (String(process.env.XAI_API_KEY || "").trim()) return "xai";
@@ -179,6 +331,7 @@ function openAiArtworkSize(width, height) {
 }
 
 async function generateArtworkWithOpenAI({ prompt, width, height }) {
+    if(saasEnabled())assertPaidBoundary();
 	const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
 	if (!apiKey) {
 		const error = new Error("artwork_generation_not_configured");
@@ -187,18 +340,33 @@ async function generateArtworkWithOpenAI({ prompt, width, height }) {
 	}
 	const { orientation } = artworkCanvasDescription(width, height);
 	const model = String(process.env.OPENAI_IMAGE_MODEL || "gpt-image-2.5-sunburst").trim();
-	const configuredQuality = String(process.env.OPENAI_IMAGE_QUALITY || "auto").trim().toLowerCase();
-	const quality = ["low", "medium", "high", "xhigh", "max", "auto"].includes(configuredQuality) ? configuredQuality : "auto";
+	const configuredQuality = String(process.env.OPENAI_IMAGE_QUALITY || "auto")
+		.trim()
+		.toLowerCase();
+	const quality = ["low", "medium", "high", "xhigh", "max", "auto"].includes(configuredQuality)
+		? configuredQuality
+		: "auto";
 	const size = openAiArtworkSize(width, height);
 	const fullPrompt = `${prompt}\n\nYSong Artwork Studio canvas: ${Math.round(width)}x${Math.round(height)} (${orientation}). Compose for this ${orientation} release-art canvas and leave intentional safe space for any requested typography. Do not add unrelated text.`;
 	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), Math.max(15000, Number(process.env.OPENAI_IMAGE_TIMEOUT_MS || 120000)));
+	const timer = setTimeout(
+		() => controller.abort(),
+		Math.max(15000, Number(process.env.OPENAI_IMAGE_TIMEOUT_MS || 120000)),
+	);
 	try {
 		const response = await fetch("https://api.openai.com/v1/images/generations", {
 			method: "POST",
 			signal: controller.signal,
 			headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-			body: JSON.stringify({ model, prompt: fullPrompt, n: 1, size, quality, output_format: "png", background: "opaque" }),
+			body: JSON.stringify({
+				model,
+				prompt: fullPrompt,
+				n: 1,
+				size,
+				quality,
+				output_format: "png",
+				background: "opaque",
+			}),
 		});
 		const payload = await response.json().catch(() => ({}));
 		if (!response.ok) {
@@ -221,6 +389,7 @@ async function generateArtworkWithOpenAI({ prompt, width, height }) {
 }
 
 async function generateArtworkWithXai({ prompt, width, height }) {
+    if(saasEnabled())assertPaidBoundary();
 	const apiKey = String(process.env.XAI_API_KEY || "").trim();
 	if (!apiKey) {
 		const error = new Error("artwork_generation_not_configured");
@@ -229,25 +398,51 @@ async function generateArtworkWithXai({ prompt, width, height }) {
 	}
 	const { ratio, orientation } = artworkCanvasDescription(width, height);
 	const supportedRatios = [
-		["1:1", 1], ["16:9", 16 / 9], ["9:16", 9 / 16], ["4:3", 4 / 3], ["3:4", 3 / 4],
-		["3:2", 3 / 2], ["2:3", 2 / 3], ["2:1", 2], ["1:2", 1 / 2], ["19.5:9", 19.5 / 9],
-		["9:19.5", 9 / 19.5], ["20:9", 20 / 9], ["9:20", 9 / 20], ["21:9", 21 / 9], ["5:2", 5 / 2],
+		["1:1", 1],
+		["16:9", 16 / 9],
+		["9:16", 9 / 16],
+		["4:3", 4 / 3],
+		["3:4", 3 / 4],
+		["3:2", 3 / 2],
+		["2:3", 2 / 3],
+		["2:1", 2],
+		["1:2", 1 / 2],
+		["19.5:9", 19.5 / 9],
+		["9:19.5", 9 / 19.5],
+		["20:9", 20 / 9],
+		["9:20", 9 / 20],
+		["21:9", 21 / 9],
+		["5:2", 5 / 2],
 	];
 	const aspectRatio = supportedRatios.reduce((best, candidate) =>
-		Math.abs(Math.log(ratio / candidate[1])) < Math.abs(Math.log(ratio / best[1])) ? candidate : best
+		Math.abs(Math.log(ratio / candidate[1])) < Math.abs(Math.log(ratio / best[1])) ? candidate : best,
 	)[0];
 	const resolution = Math.max(width, height) > 1200 ? "2k" : "1k";
-	const qualitySetting = String(process.env.XAI_IMAGE_QUALITY || "auto").trim().toLowerCase();
+	const qualitySetting = String(process.env.XAI_IMAGE_QUALITY || "auto")
+		.trim()
+		.toLowerCase();
 	const quality = ["low", "medium", "auto"].includes(qualitySetting) ? qualitySetting : "auto";
 	const model = String(process.env.XAI_IMAGE_MODEL || "grok-imagine-image-2.0").trim();
 	const fullPrompt = `${prompt}\n\nYSong Artwork Studio canvas: ${Math.round(width)}x${Math.round(height)} (${orientation}). Compose for that aspect/orientation and leave intentional safe space for any requested typography.`;
 	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), Math.max(15000, Number(process.env.XAI_IMAGE_TIMEOUT_MS || 120000)));
+	const timer = setTimeout(
+		() => controller.abort(),
+		Math.max(15000, Number(process.env.XAI_IMAGE_TIMEOUT_MS || 120000)),
+	);
 	try {
 		const response = await fetch("https://api.x.ai/v1/images/generations", {
-			method: "POST", signal: controller.signal,
+			method: "POST",
+			signal: controller.signal,
 			headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-			body: JSON.stringify({ model, prompt: fullPrompt, n: 1, aspect_ratio: aspectRatio, resolution, quality, response_format: "b64_json" }),
+			body: JSON.stringify({
+				model,
+				prompt: fullPrompt,
+				n: 1,
+				aspect_ratio: aspectRatio,
+				resolution,
+				quality,
+				response_format: "b64_json",
+			}),
 		});
 		const payload = await response.json().catch(() => ({}));
 		if (!response.ok) {
@@ -281,16 +476,19 @@ async function generateArtworkWithXai({ prompt, width, height }) {
 }
 
 app.post("/api/artwork/generate", requireAuth, async (req, res) => {
-	const prompt = String(req.body?.prompt || "").trim().slice(0, 12000);
+	const prompt = String(req.body?.prompt || "")
+		.trim()
+		.slice(0, 12000);
 	if (!prompt) return res.status(400).json({ error: "artwork_prompt_required" });
 	const width = Math.max(256, Math.min(4096, Number(req.body?.width) || 1000));
 	const height = Math.max(256, Math.min(4096, Number(req.body?.height) || 1000));
 	const provider = artworkProvider();
 	if (provider === "none") return res.status(503).json({ error: "artwork_generation_not_configured" });
 	try {
-		const result = provider === "xai"
-			? await generateArtworkWithXai({ prompt, width, height })
-			: await generateArtworkWithOpenAI({ prompt, width, height });
+		const result =
+			provider === "xai"
+				? await generateArtworkWithXai({ prompt, width, height })
+				: await generateArtworkWithOpenAI({ prompt, width, height });
 		return res.json({
 			imageDataUrl: `data:${result.mimeType};base64,${result.base64}`,
 			mimeType: result.mimeType,
@@ -299,7 +497,8 @@ app.post("/api/artwork/generate", requireAuth, async (req, res) => {
 		});
 	} catch (error) {
 		console.error("Artwork generation failed", error);
-		const code = error?.code || (error?.name === "AbortError" ? "artwork_generation_timeout" : "artwork_generation_failed");
+		const code =
+			error?.code || (error?.name === "AbortError" ? "artwork_generation_timeout" : "artwork_generation_failed");
 		const status = code === "artwork_generation_not_configured" ? 503 : 502;
 		return res.status(status).json({ error: code });
 	}
@@ -309,7 +508,15 @@ app.post("/api/artwork/generate", requireAuth, async (req, res) => {
 registerMusicSeoRoutes(app, { requireAuth });
 
 // -------------------- YSong Tools: Promotion Center --------------------
-registerPromotionRoutes(app, { requireAuth, objectPath, readObjectMetadata, writeObjectMetadata, assertOwnedObjectKey });
+registerPromotionRoutes(app, {
+	requireAuth,
+	objectPath,
+	readObjectMetadata,
+	writeObjectMetadata,
+	assertOwnedObjectKey,
+	materializeObject,
+	streamWorldObject,
+});
 
 // -------------------- YSong Tools: Curator Marketplace --------------------
 registerCuratorRoutes(app, { requireAuth });
@@ -331,7 +538,7 @@ const SignupSchema = z.object({
 	city: z.string().trim().max(120).optional().default(""),
 });
 
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
 	try {
 		const header = req.get("authorization") || "";
 		const token = header.startsWith("Bearer ") ? header.slice(7) : null;
@@ -340,9 +547,12 @@ function requireAuth(req, res, next) {
 		const payload = jwt.verify(token, process.env.JWT_SECRET);
 		const userId = payload.uid || payload.id;
 		if (!userId) return res.status(401).json({ error: "invalid_token" });
-		req.user = { id: userId, email: payload.email };
+		req.user = { id: userId, email: payload.email, issuedAt: payload.iat };
+		if (saasEnabled()) await saas.access(userId, payload.iat);
 		next();
-	} catch {
+	} catch (error) {
+		if (error instanceof AccessError) return res.status(error.status).json({ error: error.code });
+		if (saasEnabled() && req.user) return res.status(503).json({ error: "account_service_unavailable" });
 		return res.status(401).json({ error: "unauthorized" });
 	}
 }
@@ -390,7 +600,11 @@ function broadcastToUser(userId, payload) {
 	if (!clients || clients.size === 0) return;
 	const line = `data: ${JSON.stringify(payload)}\n\n`;
 	for (const res of [...clients]) {
-		try { res.write(line); } catch { clients.delete(res); }
+		try {
+			res.write(line);
+		} catch {
+			clients.delete(res);
+		}
 	}
 }
 
@@ -420,7 +634,9 @@ app.get("/api/sync/events", (req, res) => {
 
 	const remove = addSyncClient(user.id, res);
 	const heartbeat = setInterval(() => {
-		try { res.write(`: ysong-heartbeat ${Date.now()}\n\n`); } catch {}
+		try {
+			res.write(`: ysong-heartbeat ${Date.now()}\n\n`);
+		} catch {}
 	}, 25000);
 
 	req.on("close", () => {
@@ -448,10 +664,9 @@ app.post("/api/sync/action", requireAuth, (req, res) => {
 // different authenticated device can hydrate before/after a realtime refresh.
 app.get("/api/client-state", requireAuth, async (req, res) => {
 	try {
-		const { rows } = await pool.query(
-			`SELECT state FROM user_client_state WHERE user_id = $1 LIMIT 1`,
-			[req.user.id]
-		);
+		const { rows } = await pool.query(`SELECT state FROM user_client_state WHERE user_id = $1 LIMIT 1`, [
+			req.user.id,
+		]);
 		return res.json({ state: rows[0]?.state && typeof rows[0].state === "object" ? rows[0].state : {} });
 	} catch (e) {
 		console.error("GET /api/client-state ERROR", e);
@@ -472,20 +687,20 @@ app.post("/api/client-state", requireAuth, async (req, res) => {
 			`INSERT INTO user_client_state (user_id, state, updated_at)
 			 VALUES ($1, '{}'::jsonb, now())
 			 ON CONFLICT (user_id) DO NOTHING`,
-			[req.user.id]
+			[req.user.id],
 		);
 
 		if (remove) {
-			await pool.query(
-				`UPDATE user_client_state SET state = state - $2, updated_at = now() WHERE user_id = $1`,
-				[req.user.id, key]
-			);
+			await pool.query(`UPDATE user_client_state SET state = state - $2, updated_at = now() WHERE user_id = $1`, [
+				req.user.id,
+				key,
+			]);
 		} else {
 			await pool.query(
 				`UPDATE user_client_state
 				 SET state = jsonb_set(state, ARRAY[$2]::text[], to_jsonb($3::text), true), updated_at = now()
 				 WHERE user_id = $1`,
-				[req.user.id, key, value]
+				[req.user.id, key, value],
 			);
 		}
 		return res.json({ ok: true });
@@ -504,6 +719,28 @@ app.post("/api/uploads", requireAuth, upload.single("file"), async (req, res) =>
 
 		const safeName = sanitizeFilename(file.originalname);
 		const objectKey = `user-uploads/${userId}/${Date.now()}-${safeName}`;
+        await governance.recordUpload(userId,objectKey,file.buffer,file.mimetype||'application/octet-stream');
+		if (USE_R2) {
+			await putR2Object(objectKey, file.buffer, {
+				contentType: file.mimetype || "application/octet-stream",
+				metadata: {
+					userId: String(userId),
+					originalName: file.originalname,
+					size: file.size,
+					createdAt: new Date().toISOString(),
+				},
+			});
+			return res
+				.status(201)
+				.json({
+					filename: file.originalname,
+					size: file.size,
+					contentType: file.mimetype,
+					bucket: R2_BUCKET,
+					objectKey,
+					publicUrl: null,
+				});
+		}
 		const dest = objectPath(objectKey);
 		await fs.promises.mkdir(path.dirname(dest), { recursive: true });
 		await fs.promises.writeFile(dest, file.buffer);
@@ -537,12 +774,25 @@ app.post("/api/uploads/copy", requireAuth, async (req, res) => {
 		if (!projectId || typeof projectId !== "string") return res.status(400).json({ error: "missing_projectId" });
 
 		const sourceKey = assertOwnedObjectKey(userId, objectKey, { uploadOnly: true });
+		if (USE_R2) {
+			const meta = await readObjectMetadata(sourceKey);
+			const safeProjectId =
+				String(projectId)
+					.replace(/[^a-zA-Z0-9_-]/g, "_")
+					.slice(0, 100) || "project";
+			const destKey = `project-assets/${userId}/${safeProjectId}/${Date.now()}-${sanitizeFilename(meta.originalName || "file")}`;
+			await copyR2Object(sourceKey, destKey);
+			return res.json({ ok: true, local: false, objectKey: destKey });
+		}
 		const src = objectPath(sourceKey);
 		await fs.promises.access(src, fs.constants.R_OK);
 
 		const meta = await readObjectMetadata(sourceKey);
 		const safeName = sanitizeFilename(meta.originalName || sourceKey.split("/").pop() || "file");
-		const safeProjectId = String(projectId).replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 100) || "project";
+		const safeProjectId =
+			String(projectId)
+				.replace(/[^a-zA-Z0-9_-]/g, "_")
+				.slice(0, 100) || "project";
 		const destKey = `project-assets/${userId}/${safeProjectId}/${Date.now()}-${safeName}`;
 		const dest = objectPath(destKey);
 		await fs.promises.mkdir(path.dirname(dest), { recursive: true });
@@ -572,7 +822,7 @@ app.post("/api/uploads/delete", requireAuth, async (req, res) => {
 				 UNION ALL
 				 SELECT 1 FROM world_releases WHERE artwork_object_key = $1
 				 LIMIT 1`,
-				[key]
+				[key],
 			);
 			if (inUse.rows[0]) return res.status(409).json({ error: "asset_is_published" });
 		} catch (schemaErr) {
@@ -580,8 +830,16 @@ app.post("/api/uploads/delete", requireAuth, async (req, res) => {
 			// still behave exactly as it did before this pre-alpha feature.
 			if (schemaErr?.code !== "42P01") throw schemaErr;
 		}
+		if (USE_R2) {
+			await deleteR2Object(key);
+			return res.json({ ok: true, local: false });
+		}
 		for (const target of [objectPath(key), metadataPath(key)]) {
-			try { await fs.promises.unlink(target); } catch (e) { if (e?.code !== "ENOENT") throw e; }
+			try {
+				await fs.promises.unlink(target);
+			} catch (e) {
+				if (e?.code !== "ENOENT") throw e;
+			}
 		}
 		return res.json({ ok: true, local: true });
 	} catch (e) {
@@ -598,9 +856,13 @@ app.get("/api/uploads/signed-url", requireAuth, async (req, res) => {
 		const userId = req.user.id;
 		const objectKey = assertOwnedObjectKey(userId, String(req.query.objectKey || ""));
 		const mode = String(req.query.mode || "play") === "download" ? "download" : "play";
-		await fs.promises.access(objectPath(objectKey), fs.constants.R_OK);
+		await assertObjectReadable(objectKey);
 		const meta = await readObjectMetadata(objectKey);
 		const expiresAt = Date.now() + 2 * 60 * 60 * 1000;
+		if (USE_R2) {
+			const url = await getR2SignedUrl(objectKey, { download: mode === "download", filename: meta.originalName });
+			return res.json({ url, contentType: meta.contentType, expiresAt, objectKey, mode, local: false });
+		}
 		const sig = makeLocalFileSignature(objectKey, mode, expiresAt);
 		const base = `${req.protocol}://${req.get("host")}`;
 		const url = `${base}/api/uploads/file?objectKey=${encodeURIComponent(objectKey)}&mode=${encodeURIComponent(mode)}&expires=${expiresAt}&sig=${sig}`;
@@ -630,6 +892,7 @@ app.get("/api/uploads/file", async (req, res) => {
 			return res.status(403).json({ error: "invalid_or_expired_file_link" });
 		}
 
+		if (USE_R2) return await streamR2Object(req, res, objectKey, { download: mode === "download" });
 		const filePath = objectPath(objectKey);
 		const stat = await fs.promises.stat(filePath);
 		if (!stat.isFile()) return res.status(404).end();
@@ -674,7 +937,6 @@ app.get("/api/uploads/file", async (req, res) => {
 	}
 });
 
-
 // -------------------- API: YSong World (pre-alpha) --------------------
 // The pre-alpha keeps public catalog metadata in Neon while audio/artwork are
 // still served from YSong's local object store. Production can swap these
@@ -688,6 +950,9 @@ function worldRow(row) {
 		artistName: row.artist_name,
 		albumName: row.album_name,
 		releaseType: row.release_type,
+		releaseDate: row.release_date || null,
+		recordLabel: row.record_label || "",
+		artworkVersion: row.artwork_object_key ? crypto.createHash("sha256").update(row.artwork_object_key).digest("hex").slice(0,16) : "",
 		genre: row.genre || "Other",
 		tags: Array.isArray(row.tags) ? row.tags : [],
 		description: row.description || "",
@@ -712,7 +977,9 @@ function worldRow(row) {
 }
 
 function normalizeIsrc(value) {
-	const compact = String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+	const compact = String(value || "")
+		.toUpperCase()
+		.replace(/[^A-Z0-9]/g, "");
 	if (!compact) return "";
 	return compact;
 }
@@ -722,31 +989,224 @@ function validIsrc(value) {
 }
 
 const ACHIEVEMENT_DEFINITIONS = [
-	{ key: "publish-first", category: "Publishing", icon: "🚀", title: "First Release", description: "Publish your first song to YSong World.", metric: "tracksPublished", target: 1, points: 10 },
-	{ key: "publish-ten", category: "Publishing", icon: "💿", title: "Catalog Builder", description: "Publish 10 songs to YSong World.", metric: "tracksPublished", target: 10, points: 25 },
-	{ key: "publish-album", category: "Publishing", icon: "📀", title: "Long Player", description: "Publish your first album.", metric: "albumsPublished", target: 1, points: 20 },
-	{ key: "like-first", category: "Discovery", icon: "❤️", title: "First Impression", description: "Like your first song.", metric: "likesGiven", target: 1, points: 5 },
-	{ key: "like-25", category: "Discovery", icon: "🎧", title: "Taste Maker I", description: "Like 25 songs.", metric: "likesGiven", target: 25, points: 10 },
-	{ key: "like-100", category: "Discovery", icon: "✨", title: "Taste Maker II", description: "Like 100 songs.", metric: "likesGiven", target: 100, points: 20 },
-	{ key: "genres-five", category: "Discovery", icon: "🧭", title: "Open Ears", description: "Like songs across 5 different genres.", metric: "genresLiked", target: 5, points: 15 },
-	{ key: "save-song-first", category: "Collection", icon: "🔖", title: "Keep That One", description: "Save your first song.", metric: "tracksSaved", target: 1, points: 5 },
-	{ key: "save-song-25", category: "Collection", icon: "🎵", title: "Song Collector", description: "Save 25 songs.", metric: "tracksSaved", target: 25, points: 15 },
-	{ key: "save-album-first", category: "Collection", icon: "📚", title: "Album Hunter", description: "Save your first album or release.", metric: "releasesSaved", target: 1, points: 5 },
-	{ key: "save-album-ten", category: "Collection", icon: "🗃️", title: "Record Collector", description: "Save 10 albums or releases.", metric: "releasesSaved", target: 10, points: 15 },
-	{ key: "follow-first", category: "Fandom", icon: "⭐", title: "Found a Favorite", description: "Favorite your first artist.", metric: "artistsFollowed", target: 1, points: 5 },
-	{ key: "follow-ten", category: "Fandom", icon: "🌟", title: "Fan Club", description: "Favorite 10 artists.", metric: "artistsFollowed", target: 10, points: 15 },
-	{ key: "comment-first", category: "Community", icon: "💬", title: "Say Something", description: "Leave your first song comment.", metric: "commentsMade", target: 1, points: 5 },
-	{ key: "comment-25", category: "Community", icon: "🗣️", title: "Community Voice", description: "Leave 25 comments.", metric: "commentsMade", target: 25, points: 15 },
-	{ key: "playlist-first", category: "Playlists", icon: "📋", title: "Curator", description: "Create your first playlist.", metric: "playlistsCreated", target: 1, points: 10 },
-	{ key: "playlist-five", category: "Playlists", icon: "🎚️", title: "Curator II", description: "Create 5 playlists.", metric: "playlistsCreated", target: 5, points: 20 },
-	{ key: "creator-first-save", category: "Creator", icon: "🥇", title: "First Fan", description: "Have another listener save one of your songs.", metric: "receivedTrackSaves", target: 1, points: 10 },
-	{ key: "creator-playlisted", category: "Creator", icon: "🎶", title: "Playlisted", description: "Have one of your songs added to somebody else's playlist.", metric: "receivedPlaylistAdds", target: 1, points: 15 },
-	{ key: "creator-100-plays", category: "Creator", icon: "📈", title: "On Repeat", description: "Reach 100 total plays across your published songs.", metric: "creatorPlays", target: 100, points: 15 },
-	{ key: "creator-1000-plays", category: "Creator", icon: "🔥", title: "Rising", description: "Reach 1,000 total plays across your published songs.", metric: "creatorPlays", target: 1000, points: 30 },
+	{
+		key: "publish-first",
+		category: "Publishing",
+		icon: "🚀",
+		title: "First Release",
+		description: "Publish your first song to YSong World.",
+		metric: "tracksPublished",
+		target: 1,
+		points: 10,
+	},
+	{
+		key: "publish-ten",
+		category: "Publishing",
+		icon: "💿",
+		title: "Catalog Builder",
+		description: "Publish 10 songs to YSong World.",
+		metric: "tracksPublished",
+		target: 10,
+		points: 25,
+	},
+	{
+		key: "publish-album",
+		category: "Publishing",
+		icon: "📀",
+		title: "Long Player",
+		description: "Publish your first album.",
+		metric: "albumsPublished",
+		target: 1,
+		points: 20,
+	},
+	{
+		key: "like-first",
+		category: "Discovery",
+		icon: "❤️",
+		title: "First Impression",
+		description: "Like your first song.",
+		metric: "likesGiven",
+		target: 1,
+		points: 5,
+	},
+	{
+		key: "like-25",
+		category: "Discovery",
+		icon: "🎧",
+		title: "Taste Maker I",
+		description: "Like 25 songs.",
+		metric: "likesGiven",
+		target: 25,
+		points: 10,
+	},
+	{
+		key: "like-100",
+		category: "Discovery",
+		icon: "✨",
+		title: "Taste Maker II",
+		description: "Like 100 songs.",
+		metric: "likesGiven",
+		target: 100,
+		points: 20,
+	},
+	{
+		key: "genres-five",
+		category: "Discovery",
+		icon: "🧭",
+		title: "Open Ears",
+		description: "Like songs across 5 different genres.",
+		metric: "genresLiked",
+		target: 5,
+		points: 15,
+	},
+	{
+		key: "save-song-first",
+		category: "Collection",
+		icon: "🔖",
+		title: "Keep That One",
+		description: "Save your first song.",
+		metric: "tracksSaved",
+		target: 1,
+		points: 5,
+	},
+	{
+		key: "save-song-25",
+		category: "Collection",
+		icon: "🎵",
+		title: "Song Collector",
+		description: "Save 25 songs.",
+		metric: "tracksSaved",
+		target: 25,
+		points: 15,
+	},
+	{
+		key: "save-album-first",
+		category: "Collection",
+		icon: "📚",
+		title: "Album Hunter",
+		description: "Save your first album or release.",
+		metric: "releasesSaved",
+		target: 1,
+		points: 5,
+	},
+	{
+		key: "save-album-ten",
+		category: "Collection",
+		icon: "🗃️",
+		title: "Record Collector",
+		description: "Save 10 albums or releases.",
+		metric: "releasesSaved",
+		target: 10,
+		points: 15,
+	},
+	{
+		key: "follow-first",
+		category: "Fandom",
+		icon: "⭐",
+		title: "Found a Favorite",
+		description: "Favorite your first artist.",
+		metric: "artistsFollowed",
+		target: 1,
+		points: 5,
+	},
+	{
+		key: "follow-ten",
+		category: "Fandom",
+		icon: "🌟",
+		title: "Fan Club",
+		description: "Favorite 10 artists.",
+		metric: "artistsFollowed",
+		target: 10,
+		points: 15,
+	},
+	{
+		key: "comment-first",
+		category: "Community",
+		icon: "💬",
+		title: "Say Something",
+		description: "Leave your first song comment.",
+		metric: "commentsMade",
+		target: 1,
+		points: 5,
+	},
+	{
+		key: "comment-25",
+		category: "Community",
+		icon: "🗣️",
+		title: "Community Voice",
+		description: "Leave 25 comments.",
+		metric: "commentsMade",
+		target: 25,
+		points: 15,
+	},
+	{
+		key: "playlist-first",
+		category: "Playlists",
+		icon: "📋",
+		title: "Curator",
+		description: "Create your first playlist.",
+		metric: "playlistsCreated",
+		target: 1,
+		points: 10,
+	},
+	{
+		key: "playlist-five",
+		category: "Playlists",
+		icon: "🎚️",
+		title: "Curator II",
+		description: "Create 5 playlists.",
+		metric: "playlistsCreated",
+		target: 5,
+		points: 20,
+	},
+	{
+		key: "creator-first-save",
+		category: "Creator",
+		icon: "🥇",
+		title: "First Fan",
+		description: "Have another listener save one of your songs.",
+		metric: "receivedTrackSaves",
+		target: 1,
+		points: 10,
+	},
+	{
+		key: "creator-playlisted",
+		category: "Creator",
+		icon: "🎶",
+		title: "Playlisted",
+		description: "Have one of your songs added to somebody else's playlist.",
+		metric: "receivedPlaylistAdds",
+		target: 1,
+		points: 15,
+	},
+	{
+		key: "creator-100-plays",
+		category: "Creator",
+		icon: "📈",
+		title: "On Repeat",
+		description: "Reach 100 total plays across your published songs.",
+		metric: "creatorPlays",
+		target: 100,
+		points: 15,
+	},
+	{
+		key: "creator-1000-plays",
+		category: "Creator",
+		icon: "🔥",
+		title: "Rising",
+		description: "Reach 1,000 total plays across your published songs.",
+		metric: "creatorPlays",
+		target: 1000,
+		points: 30,
+	},
 ];
 
 function fallbackPublicName(userId) {
-	const suffix = String(userId || "user").replace(/[^a-z0-9]/gi, "").slice(0, 6).toUpperCase() || "USER";
+	const suffix =
+		String(userId || "user")
+			.replace(/[^a-z0-9]/gi, "")
+			.slice(0, 6)
+			.toUpperCase() || "USER";
 	return `YSong User ${suffix}`;
 }
 
@@ -766,16 +1226,19 @@ async function publicNameForUserId(userId) {
 	}
 }
 
-async function createNotification(userId, {
-	actorUserId = null,
-	kind,
-	entityType = null,
-	entityId = null,
-	title,
-	body = "",
-	href = "/app",
-	email = true,
-} = {}) {
+async function createNotification(
+	userId,
+	{
+		actorUserId = null,
+		kind,
+		entityType = null,
+		entityId = null,
+		title,
+		body = "",
+		href = "/app",
+		email = true,
+	} = {},
+) {
 	if (!userId) return null;
 	if (actorUserId && String(actorUserId) === String(userId) && kind !== "achievement") return null;
 	const id = crypto.randomUUID();
@@ -783,7 +1246,17 @@ async function createNotification(userId, {
 		`INSERT INTO ysong_notifications
 		 (id, user_id, actor_user_id, kind, entity_type, entity_id, title, body, href)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-		[id, userId, actorUserId, String(kind || "activity"), entityType, entityId ? String(entityId) : null, String(title || "YSong activity").slice(0, 220), String(body || "").slice(0, 1000), String(href || "/app").slice(0, 1000)]
+		[
+			id,
+			userId,
+			actorUserId,
+			String(kind || "activity"),
+			entityType,
+			entityId ? String(entityId) : null,
+			String(title || "YSong activity").slice(0, 220),
+			String(body || "").slice(0, 1000),
+			String(href || "/app").slice(0, 1000),
+		],
 	);
 
 	if (email) {
@@ -792,7 +1265,8 @@ async function createNotification(userId, {
 				`SELECT u.email, COALESCE(p.email_enabled, false) AS email_enabled
 				 FROM users u
 				 LEFT JOIN ysong_notification_preferences p ON p.user_id = u.id
-				 WHERE u.id = $1 LIMIT 1`, [userId]
+				 WHERE u.id = $1 LIMIT 1`,
+				[userId],
 			);
 			if (rows[0]?.email_enabled && rows[0]?.email) {
 				await sendSocialNotificationEmail(rows[0].email, { title, body, href });
@@ -805,7 +1279,8 @@ async function createNotification(userId, {
 }
 
 async function getAchievementStats(userId) {
-	const { rows } = await pool.query(`
+	const { rows } = await pool.query(
+		`
 		SELECT
 			(SELECT count(*) FROM world_tracks WHERE owner_user_id = $1 AND status = 'published')::int AS tracks_published,
 			(SELECT count(*) FROM world_releases WHERE owner_user_id = $1 AND release_type = 'album')::int AS albums_published,
@@ -819,7 +1294,9 @@ async function getAchievementStats(userId) {
 			(SELECT count(*) FROM world_saved_tracks s JOIN world_tracks t ON t.id = s.track_id WHERE t.owner_user_id = $1 AND s.user_id <> $1)::int AS received_track_saves,
 			(SELECT count(*) FROM world_playlist_tracks pt JOIN world_tracks t ON t.id = pt.track_id JOIN world_playlists p ON p.id = pt.playlist_id WHERE t.owner_user_id = $1 AND p.owner_user_id <> $1)::int AS received_playlist_adds,
 			COALESCE((SELECT sum(play_count) FROM world_tracks WHERE owner_user_id = $1 AND status = 'published'), 0)::bigint AS creator_plays
-	`, [userId]);
+	`,
+		[userId],
+	);
 	const r = rows[0] || {};
 	return {
 		tracksPublished: Number(r.tracks_published || 0),
@@ -840,7 +1317,10 @@ async function getAchievementStats(userId) {
 async function syncAchievementsForUser(userId, { notify = true } = {}) {
 	if (!userId) return { stats: {}, unlocked: new Map(), newlyUnlocked: [] };
 	const stats = await getAchievementStats(userId);
-	const unlockedRows = await pool.query(`SELECT achievement_key, unlocked_at FROM user_achievements WHERE user_id = $1`, [userId]);
+	const unlockedRows = await pool.query(
+		`SELECT achievement_key, unlocked_at FROM user_achievements WHERE user_id = $1`,
+		[userId],
+	);
 	const unlocked = new Map(unlockedRows.rows.map((r) => [r.achievement_key, r.unlocked_at]));
 	const newlyUnlocked = [];
 	for (const def of ACHIEVEMENT_DEFINITIONS) {
@@ -849,7 +1329,7 @@ async function syncAchievementsForUser(userId, { notify = true } = {}) {
 		const inserted = await pool.query(
 			`INSERT INTO user_achievements (user_id, achievement_key, unlocked_at)
 			 VALUES ($1,$2,now()) ON CONFLICT (user_id, achievement_key) DO NOTHING RETURNING unlocked_at`,
-			[userId, def.key]
+			[userId, def.key],
 		);
 		if (!inserted.rows[0]) continue;
 		unlocked.set(def.key, inserted.rows[0].unlocked_at);
@@ -881,7 +1361,9 @@ async function initializeAchievementBaselines() {
 			// v20 could award old history the first time any action happened and flood the bell.
 			// During this one-time baseline migration, keep the achievements but clear that legacy noise.
 			await pool.query(`DELETE FROM ysong_notifications WHERE user_id=$1 AND kind='achievement'`, [row.id]);
-			await pool.query(`INSERT INTO ysong_achievement_state (user_id) VALUES ($1) ON CONFLICT DO NOTHING`, [row.id]);
+			await pool.query(`INSERT INTO ysong_achievement_state (user_id) VALUES ($1) ON CONFLICT DO NOTHING`, [
+				row.id,
+			]);
 		} catch (e) {
 			console.warn("Achievement baseline backfill failed", row.id, e?.message || e);
 		}
@@ -1107,6 +1589,8 @@ async function ensureWorldSchema() {
 			created_at timestamptz NOT NULL DEFAULT now(),
 			published_at timestamptz NOT NULL DEFAULT now()
 		);
+		ALTER TABLE world_releases ADD COLUMN IF NOT EXISTS release_date date;
+		ALTER TABLE world_releases ADD COLUMN IF NOT EXISTS record_label text NOT NULL DEFAULT '';
 		ALTER TABLE world_releases ADD COLUMN IF NOT EXISTS artist_id uuid REFERENCES artists(id) ON DELETE RESTRICT;
 		CREATE INDEX IF NOT EXISTS world_releases_artist_idx ON world_releases(artist_id);
 		CREATE INDEX IF NOT EXISTS world_releases_owner_idx ON world_releases(owner_user_id);
@@ -1287,7 +1771,6 @@ async function ensureWorldSchema() {
 			baseline_initialized_at timestamptz NOT NULL DEFAULT now()
 		);
 	`);
-
 }
 
 async function ensureAiRuleSeeds() {
@@ -1297,7 +1780,7 @@ async function ensureAiRuleSeeds() {
 			`INSERT INTO ysong_ai_rule_sets (id, kind, name, version, is_active, content, metadata, updated_at)
 			 VALUES ($1, $2, $3, $4, TRUE, $5, $6::jsonb, now())
 			 ON CONFLICT (id) DO NOTHING`,
-			[seed.id, seed.kind, seed.name, seed.version || 1, seed.content || "", JSON.stringify(seed.metadata || {})]
+			[seed.id, seed.kind, seed.name, seed.version || 1, seed.content || "", JSON.stringify(seed.metadata || {})],
 		);
 		// Metadata is safe to enrich on an existing row, while its prompt text remains
 		// exactly whatever the owner already has in Neon.
@@ -1306,30 +1789,53 @@ async function ensureAiRuleSeeds() {
 			 SET metadata = $2::jsonb || COALESCE(metadata, '{}'::jsonb),
 			     updated_at = CASE WHEN COALESCE(metadata, '{}'::jsonb) = '{}'::jsonb THEN now() ELSE updated_at END
 			 WHERE id = $1`,
-			[seed.id, JSON.stringify(seed.metadata || {})]
+			[seed.id, JSON.stringify(seed.metadata || {})],
 		);
 	}
 }
 
 app.post("/api/world/publish", requireAuth, async (req, res) => {
-
+	let client;
 	try {
 		const body = req.body ?? {};
-		const title = String(body.title || "").trim().slice(0, 180);
+		const releaseMetadata = await validateReleaseMetadata(
+			{ releaseDate: body.releaseDate, recordLabel: body.recordLabel }, req.user.id,
+			{ assertOwnedObjectKey, readObjectMetadata },
+		);
+		const title = String(body.title || "")
+			.trim()
+			.slice(0, 180);
 		const artistId = String(body.artistId || "");
-		const artistResult = await pool.query(`SELECT id, name FROM artists WHERE id=$1 AND owner_user_id=$2 LIMIT 1`, [artistId, req.user.id]);
+		const artistResult = await pool.query(`SELECT id, name FROM artists WHERE id=$1 AND owner_user_id=$2 LIMIT 1`, [
+			artistId,
+			req.user.id,
+		]);
 		if (!artistResult.rows[0]) return res.status(400).json({ error: "artist_required" });
-		const artistName = String(artistResult.rows[0].name || "").trim().slice(0, 180);
+		const artistName = String(artistResult.rows[0].name || "")
+			.trim()
+			.slice(0, 180);
 		const releaseType = body.releaseType === "album" ? "album" : "single";
-		const albumTitle = String(body.albumTitle || title).trim().slice(0, 180);
-		const genre = String(body.genre || "Other").trim().slice(0, 80) || "Other";
+		const albumTitle = String(body.albumTitle || title)
+			.trim()
+			.slice(0, 180);
+		const genre =
+			String(body.genre || "Other")
+				.trim()
+				.slice(0, 80) || "Other";
 		const tags = Array.isArray(body.tags)
-			? body.tags.map((x) => String(x).trim().slice(0, 60)).filter(Boolean).slice(0, 20)
+			? body.tags
+					.map((x) => String(x).trim().slice(0, 60))
+					.filter(Boolean)
+					.slice(0, 20)
 			: [];
-		const description = String(body.description || "").trim().slice(0, 4000);
+		const description = String(body.description || "")
+			.trim()
+			.slice(0, 4000);
 		const explicit = !!body.explicit;
 		const trackNumber = Math.max(1, Math.min(999, Number(body.trackNumber || 1) || 1));
-		const durationSeconds = Number.isFinite(Number(body.durationSeconds)) ? Math.max(0, Number(body.durationSeconds)) : null;
+		const durationSeconds = Number.isFinite(Number(body.durationSeconds))
+			? Math.max(0, Number(body.durationSeconds))
+			: null;
 		const previouslyReleased = !!body.previouslyReleased;
 		const isrc = normalizeIsrc(body.isrc);
 		const rightsConfirmed = body.rightsConfirmed === true;
@@ -1340,12 +1846,16 @@ app.post("/api/world/publish", requireAuth, async (req, res) => {
 		if (previouslyReleased && !isrc) return res.status(400).json({ error: "isrc_required_for_released_track" });
 		if (isrc && !validIsrc(isrc)) return res.status(400).json({ error: "invalid_isrc" });
 
-		const audioObjectKey = assertOwnedObjectKey(req.user.id, String(body.audioObjectKey || ""), { uploadOnly: true });
+		const audioObjectKey = assertOwnedObjectKey(req.user.id, String(body.audioObjectKey || ""), {
+			uploadOnly: true,
+		});
 		const artworkObjectKey = body.artworkObjectKey
 			? assertOwnedObjectKey(req.user.id, String(body.artworkObjectKey), { uploadOnly: true })
 			: null;
 
-		await fs.promises.access(objectPath(audioObjectKey), fs.constants.R_OK);
+		await assertObjectReadable(audioObjectKey);
+        await governance.assertPublic(audioObjectKey);
+        if(artworkObjectKey)await governance.assertPublic(artworkObjectKey);
 		const audioMeta = await readObjectMetadata(audioObjectKey);
 		const audioType = String(audioMeta.contentType || "");
 		const audioName = String(audioMeta.originalName || audioObjectKey);
@@ -1353,80 +1863,124 @@ app.post("/api/world/publish", requireAuth, async (req, res) => {
 			return res.status(400).json({ error: "audio_file_required" });
 		}
 		if (artworkObjectKey) {
-			await fs.promises.access(objectPath(artworkObjectKey), fs.constants.R_OK);
+			await assertObjectReadable(artworkObjectKey);
 			const artMeta = await readObjectMetadata(artworkObjectKey);
 			if (!String(artMeta.contentType || "").startsWith("image/")) {
 				return res.status(400).json({ error: "image_file_required" });
 			}
 		}
 
+		client = await pool.connect();
+		await client.query("BEGIN");
 		let releaseId = null;
 		if (releaseType === "album") {
-			const existing = await pool.query(
+			const existing = await client.query(
 				`SELECT id, artwork_object_key FROM world_releases
 				 WHERE owner_user_id = $1 AND release_type = 'album'
 				   AND artist_id = $2 AND lower(title) = lower($3)
 				 ORDER BY created_at ASC LIMIT 1`,
-				[req.user.id, artistId, albumTitle]
+				[req.user.id, artistId, albumTitle],
 			);
 			if (existing.rows[0]) {
 				releaseId = existing.rows[0].id;
 				if (artworkObjectKey) {
-					await pool.query(`UPDATE world_releases SET artwork_object_key = $2, genre = $3 WHERE id = $1`, [releaseId, artworkObjectKey, genre]);
+					await client.query(`UPDATE world_releases SET artwork_object_key = $2, genre = $3 WHERE id = $1`, [
+						releaseId,
+						artworkObjectKey,
+						genre,
+					]);
 				}
 			}
 		}
 
 		if (!releaseId) {
 			releaseId = crypto.randomUUID();
-			await pool.query(
+			await client.query(
 				`INSERT INTO world_releases (id, owner_user_id, artist_id, artist_name, title, release_type, genre, artwork_object_key)
 				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-				[releaseId, req.user.id, artistId, artistName, releaseType === "album" ? albumTitle : title, releaseType, genre, artworkObjectKey]
+				[
+					releaseId,
+					req.user.id,
+					artistId,
+					artistName,
+					releaseType === "album" ? albumTitle : title,
+					releaseType,
+					genre,
+					artworkObjectKey,
+				],
 			);
 		}
 
 		const trackId = crypto.randomUUID();
-		await pool.query(
+		await applyReleaseMetadata(client, releaseId, req.user.id, releaseMetadata);
+		await client.query(
 			`INSERT INTO world_tracks
 			 (id, release_id, owner_user_id, artist_id, title, track_number, audio_object_key, genre, tags, description, explicit, duration_seconds, isrc, previously_released, status)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, 'published')`,
-			[trackId, releaseId, req.user.id, artistId, title, trackNumber, audioObjectKey, genre, JSON.stringify(tags), description, explicit, durationSeconds, isrc || null, previouslyReleased]
+			[
+				trackId,
+				releaseId,
+				req.user.id,
+				artistId,
+				title,
+				trackNumber,
+				audioObjectKey,
+				genre,
+				JSON.stringify(tags),
+				description,
+				explicit,
+				durationSeconds,
+				isrc || null,
+				previouslyReleased,
+			],
 		);
 
-		const { rows } = await pool.query(
-			`SELECT t.*, r.artist_name, r.title AS album_name, r.release_type,
+		const { rows } = await client.query(
+			`SELECT t.*, r.release_date::text AS release_date, r.record_label, r.artwork_object_key, r.artist_name, r.title AS album_name, r.release_type,
 			        (r.artwork_object_key IS NOT NULL) AS has_artwork,
 			        true AS is_owner,
 			        0::bigint AS likes, 0::bigint AS dislikes, 0::smallint AS my_reaction
 			 FROM world_tracks t JOIN world_releases r ON r.id = t.release_id WHERE t.id = $1`,
-			[trackId]
+			[trackId],
 		);
-		await syncAchievementsForUser(req.user.id).catch((e) => console.warn("achievement sync after publish failed", e?.message || e));
-		return res.status(201).json({ ok: true, track: worldRow(rows[0]), releaseId: String(releaseId) });
+		const publishedTrack = worldRow(rows[0]);
+		await client.query("COMMIT");
+		await syncAchievementsForUser(req.user.id).catch((e) =>
+			console.warn("achievement sync after publish failed", e?.message || e),
+		);
+		return res.status(201).json({ ok: true, track: publishedTrack, releaseId: String(releaseId) });
 	} catch (e) {
+		if (client) await client.query("ROLLBACK").catch(() => {});
 		if (e?.statusCode === 403) return res.status(403).json({ error: "forbidden" });
+		if (e?.statusCode === 400) return res.status(400).json({ error: e.message });
 		if (e?.code === "ENOENT") return res.status(404).json({ error: "uploaded_asset_missing" });
 		console.error("POST /api/world/publish ERROR", e);
 		return res.status(500).json({ error: "publish_failed", message: e?.message });
+	} finally {
+		client?.release();
 	}
 });
 
 app.get("/api/world/tracks", async (req, res) => {
 	try {
 		const user = verifyTokenString(authFromHeader(req));
-		const search = String(req.query.search || "").trim().slice(0, 120);
-		const genre = String(req.query.genre || "").trim().slice(0, 80);
+		const search = String(req.query.search || "")
+			.trim()
+			.slice(0, 120);
+		const genre = String(req.query.genre || "")
+			.trim()
+			.slice(0, 80);
 		const sort = ["newest", "popular"].includes(String(req.query.sort)) ? String(req.query.sort) : "algorithm";
-		const orderBy = sort === "newest"
-			? "published_at DESC"
-			: sort === "popular"
-				? "play_count DESC, likes DESC, published_at DESC"
-				: `(ln(play_count + 1) * 1.25 + likes * 3.0 - dislikes * 1.25 + GREATEST(0, 8 - (EXTRACT(EPOCH FROM (now() - published_at)) / 86400.0) / 3.0)) DESC, published_at DESC`;
+		const orderBy =
+			sort === "newest"
+				? "published_at DESC"
+				: sort === "popular"
+					? "play_count DESC, likes DESC, published_at DESC"
+					: `(ln(play_count + 1) * 1.25 + likes * 3.0 - dislikes * 1.25 + GREATEST(0, 8 - (EXTRACT(EPOCH FROM (now() - published_at)) / 86400.0) / 3.0)) DESC, published_at DESC`;
 
 		const { rows } = await pool.query(
 			`WITH base AS (
-				SELECT t.*, r.artist_name, r.title AS album_name, r.release_type,
+				SELECT t.*, r.release_date::text AS release_date, r.record_label, r.artwork_object_key, r.artist_name, r.title AS album_name, r.release_type,
 				       (r.artwork_object_key IS NOT NULL) AS has_artwork,
 				       COALESCE(t.owner_user_id = $1::uuid, false) AS is_owner,
 				       (SELECT count(*) FROM world_track_reactions x WHERE x.track_id = t.id AND x.reaction = 1) AS likes,
@@ -1443,9 +1997,11 @@ app.get("/api/world/tracks", async (req, res) => {
 				  AND ($3 = '' OR lower(t.genre) = lower($3))
 			)
 			SELECT * FROM base ORDER BY ${orderBy} LIMIT 120`,
-			[user?.id || null, search, genre]
+			[user?.id || null, search, genre],
 		);
-		const genreRows = await pool.query(`SELECT DISTINCT genre FROM world_tracks WHERE status = 'published' AND genre <> '' ORDER BY genre LIMIT 100`);
+		const genreRows = await pool.query(
+			`SELECT DISTINCT genre FROM world_tracks WHERE status = 'published' AND genre <> '' ORDER BY genre LIMIT 100`,
+		);
 		return res.json({ tracks: rows.map(worldRow), genres: genreRows.rows.map((x) => x.genre) });
 	} catch (e) {
 		console.error("GET /api/world/tracks ERROR", e);
@@ -1456,8 +2012,9 @@ app.get("/api/world/tracks", async (req, res) => {
 app.get("/api/world/tracks/:id", async (req, res) => {
 	try {
 		const user = verifyTokenString(authFromHeader(req));
-		const { rows } = await pool.query(`
-			SELECT t.*, r.artist_name, r.title AS album_name, r.release_type,
+		const { rows } = await pool.query(
+			`
+			SELECT t.*, r.release_date::text AS release_date, r.record_label, r.artwork_object_key, r.artist_name, r.title AS album_name, r.release_type,
 			       (r.artwork_object_key IS NOT NULL) AS has_artwork,
 			       COALESCE(t.owner_user_id = $2::uuid, false) AS is_owner,
 			       (SELECT count(*) FROM world_track_reactions x WHERE x.track_id=t.id AND x.reaction=1) AS likes,
@@ -1468,10 +2025,14 @@ app.get("/api/world/tracks/:id", async (req, res) => {
 			       EXISTS(SELECT 1 FROM world_followed_artists f WHERE f.user_id=$2::uuid AND f.artist_owner_user_id=t.owner_user_id AND f.artist_name=r.artist_name) AS is_artist_followed,
 			       (SELECT count(*) FROM world_track_comments c WHERE c.track_id=t.id AND c.is_deleted=false) AS comment_count
 			FROM world_tracks t JOIN world_releases r ON r.id=t.release_id WHERE t.id=$1 AND t.status='published' LIMIT 1`,
-			[String(req.params.id || ""), user?.id || null]);
-		if (!rows[0]) return res.status(404).json({ error:"track_not_found" });
+			[String(req.params.id || ""), user?.id || null],
+		);
+		if (!rows[0]) return res.status(404).json({ error: "track_not_found" });
 		return res.json({ track: worldRow(rows[0]) });
-	} catch (e) { console.error("GET /api/world/tracks/:id ERROR", e); return res.status(500).json({ error:"track_load_failed" }); }
+	} catch (e) {
+		console.error("GET /api/world/tracks/:id ERROR", e);
+		return res.status(500).json({ error: "track_load_failed" });
+	}
 });
 
 app.get("/api/world/releases/:id", async (req, res) => {
@@ -1479,16 +2040,16 @@ app.get("/api/world/releases/:id", async (req, res) => {
 		const user = verifyTokenString(authFromHeader(req));
 		const releaseId = String(req.params.id || "");
 		const releaseResult = await pool.query(
-			`SELECT id, owner_user_id, artist_id, artist_name, title, release_type, genre, published_at, (artwork_object_key IS NOT NULL) AS has_artwork,
+			`SELECT id, owner_user_id, artist_id, artist_name, title, release_type, genre, release_date::text AS release_date, record_label, published_at, (artwork_object_key IS NOT NULL) AS has_artwork,
 			        COALESCE(owner_user_id = $2::uuid, false) AS is_owner,
 			        EXISTS(SELECT 1 FROM world_saved_releases s WHERE s.release_id = world_releases.id AND s.user_id = $2::uuid) AS is_saved,
 			        EXISTS(SELECT 1 FROM world_followed_artists f WHERE f.user_id = $2::uuid AND f.artist_owner_user_id = world_releases.owner_user_id AND f.artist_name = world_releases.artist_name) AS is_artist_followed
 			 FROM world_releases WHERE id = $1 LIMIT 1`,
-			[releaseId, user?.id || null]
+			[releaseId, user?.id || null],
 		);
 		if (!releaseResult.rows[0]) return res.status(404).json({ error: "release_not_found" });
 		const tracksResult = await pool.query(
-			`SELECT t.*, r.artist_name, r.title AS album_name, r.release_type,
+			`SELECT t.*, r.release_date::text AS release_date, r.record_label, r.artwork_object_key, r.artist_name, r.title AS album_name, r.release_type,
 			        (r.artwork_object_key IS NOT NULL) AS has_artwork,
 			        COALESCE(t.owner_user_id = $2::uuid, false) AS is_owner,
 			        (SELECT count(*) FROM world_track_reactions x WHERE x.track_id = t.id AND x.reaction = 1) AS likes,
@@ -1501,13 +2062,25 @@ app.get("/api/world/releases/:id", async (req, res) => {
 			 FROM world_tracks t JOIN world_releases r ON r.id = t.release_id
 			 WHERE t.release_id = $1 AND t.status = 'published'
 			 ORDER BY t.track_number ASC, t.published_at ASC`,
-			[releaseId, user?.id || null]
+			[releaseId, user?.id || null],
 		);
 		const r = releaseResult.rows[0];
 		return res.json({
-			id: String(r.id), ownerUserId: String(r.owner_user_id || ""), artistId: r.artist_id ? String(r.artist_id) : "", artistName: r.artist_name, title: r.title, releaseType: r.release_type,
-			genre: r.genre || "Other", publishedAt: r.published_at, hasArtwork: !!r.has_artwork, isOwner: !!r.is_owner,
-			isSaved: !!r.is_saved, isArtistFollowed: !!r.is_artist_followed, tracks: tracksResult.rows.map(worldRow),
+			id: String(r.id),
+			ownerUserId: String(r.owner_user_id || ""),
+			artistId: r.artist_id ? String(r.artist_id) : "",
+			artistName: r.artist_name,
+			title: r.title,
+			releaseType: r.release_type,
+			genre: r.genre || "Other",
+			publishedAt: r.published_at,
+				releaseDate: r.release_date || null,
+				recordLabel: r.record_label || "",
+			hasArtwork: !!r.has_artwork,
+			isOwner: !!r.is_owner,
+			isSaved: !!r.is_saved,
+			isArtistFollowed: !!r.is_artist_followed,
+			tracks: tracksResult.rows.map(worldRow),
 		});
 	} catch (e) {
 		console.error("GET /api/world/releases/:id ERROR", e);
@@ -1515,45 +2088,93 @@ app.get("/api/world/releases/:id", async (req, res) => {
 	}
 });
 
-
 app.patch("/api/world/tracks/:id", requireAuth, async (req, res) => {
+	let client;
 	try {
 		const trackId = String(req.params.id || "");
 		const existing = await pool.query(
-			`SELECT t.*, r.artist_name, r.title AS album_name, r.release_type, r.artwork_object_key
+			`SELECT t.*, r.release_date::text AS release_date, r.record_label, r.artwork_object_key, r.artist_name, r.title AS album_name, r.release_type, r.artwork_object_key
 			 FROM world_tracks t JOIN world_releases r ON r.id = t.release_id
 			 WHERE t.id = $1 AND t.owner_user_id = $2 LIMIT 1`,
-			[trackId, req.user.id]
+			[trackId, req.user.id],
 		);
 		if (!existing.rows[0]) return res.status(404).json({ error: "track_not_found_or_not_owner" });
 		const current = existing.rows[0];
 		const body = req.body ?? {};
-		const title = body.title === undefined ? current.title : String(body.title || "").trim().slice(0, 180);
-		const genre = body.genre === undefined ? current.genre : (String(body.genre || "Other").trim().slice(0, 80) || "Other");
-		const tags = body.tags === undefined
-			? (Array.isArray(current.tags) ? current.tags : [])
-			: (Array.isArray(body.tags) ? body.tags.map((x) => String(x).trim().slice(0, 60)).filter(Boolean).slice(0, 20) : []);
-		const description = body.description === undefined ? current.description : String(body.description || "").trim().slice(0, 4000);
+		const title =
+			body.title === undefined
+				? current.title
+				: String(body.title || "")
+						.trim()
+						.slice(0, 180);
+		const genre =
+			body.genre === undefined
+				? current.genre
+				: String(body.genre || "Other")
+						.trim()
+						.slice(0, 80) || "Other";
+		const tags =
+			body.tags === undefined
+				? Array.isArray(current.tags)
+					? current.tags
+					: []
+				: Array.isArray(body.tags)
+					? body.tags
+							.map((x) => String(x).trim().slice(0, 60))
+							.filter(Boolean)
+							.slice(0, 20)
+					: [];
+		const description =
+			body.description === undefined
+				? current.description
+				: String(body.description || "")
+						.trim()
+						.slice(0, 4000);
 		const explicit = body.explicit === undefined ? !!current.explicit : !!body.explicit;
-		const trackNumber = body.trackNumber === undefined ? Number(current.track_number || 1) : Math.max(1, Math.min(999, Number(body.trackNumber || 1) || 1));
-		const previouslyReleased = body.previouslyReleased === undefined ? !!current.previously_released : !!body.previouslyReleased;
+		const trackNumber =
+			body.trackNumber === undefined
+				? Number(current.track_number || 1)
+				: Math.max(1, Math.min(999, Number(body.trackNumber || 1) || 1));
+		const previouslyReleased =
+			body.previouslyReleased === undefined ? !!current.previously_released : !!body.previouslyReleased;
 		const isrc = body.isrc === undefined ? String(current.isrc || "") : normalizeIsrc(body.isrc);
 		if (!title) return res.status(400).json({ error: "title_required" });
 		if (previouslyReleased && !isrc) return res.status(400).json({ error: "isrc_required_for_released_track" });
 		if (isrc && !validIsrc(isrc)) return res.status(400).json({ error: "invalid_isrc" });
 
-		await pool.query(
+		const releasePatch = await validateReleaseMetadata(body, req.user.id, {assertOwnedObjectKey,readObjectMetadata});
+		client = await pool.connect();
+		await client.query("BEGIN");
+		await applyReleaseMetadata(client, current.release_id, req.user.id, releasePatch);
+		const updated = await client.query(
 			`UPDATE world_tracks
 			 SET title = $3, genre = $4, tags = $5::jsonb, description = $6, explicit = $7,
 			     track_number = $8, isrc = $9, previously_released = $10
 			 WHERE id = $1 AND owner_user_id = $2`,
-			[trackId, req.user.id, title, genre, JSON.stringify(tags), description, explicit, trackNumber, isrc || null, previouslyReleased]
+			[
+				trackId,
+				req.user.id,
+				title,
+				genre,
+				JSON.stringify(tags),
+				description,
+				explicit,
+				trackNumber,
+				isrc || null,
+				previouslyReleased,
+			],
 		);
+		if (updated.rowCount !== 1) throw new Error("track_update_failed");
 		if (current.release_type === "single") {
-			await pool.query(`UPDATE world_releases SET title = $3, genre = $4 WHERE id = $1 AND owner_user_id = $2`, [current.release_id, req.user.id, title, genre]);
+			await client.query(`UPDATE world_releases SET title = $3, genre = $4 WHERE id = $1 AND owner_user_id = $2`, [
+				current.release_id,
+				req.user.id,
+				title,
+				genre,
+			]);
 		}
-		const { rows } = await pool.query(
-			`SELECT t.*, r.artist_name, r.title AS album_name, r.release_type,
+		const { rows } = await client.query(
+			`SELECT t.*, r.release_date::text AS release_date, r.record_label, r.artwork_object_key, r.artist_name, r.title AS album_name, r.release_type,
 			        (r.artwork_object_key IS NOT NULL) AS has_artwork, true AS is_owner,
 			        (SELECT count(*) FROM world_track_reactions x WHERE x.track_id = t.id AND x.reaction = 1) AS likes,
 			        (SELECT count(*) FROM world_track_reactions x WHERE x.track_id = t.id AND x.reaction = -1) AS dislikes,
@@ -1563,32 +2184,73 @@ app.patch("/api/world/tracks/:id", requireAuth, async (req, res) => {
 			        EXISTS(SELECT 1 FROM world_followed_artists f WHERE f.user_id = $2::uuid AND f.artist_owner_user_id = t.owner_user_id AND f.artist_name = r.artist_name) AS is_artist_followed,
 			        (SELECT count(*) FROM world_track_comments c WHERE c.track_id = t.id AND c.is_deleted = false) AS comment_count
 			 FROM world_tracks t JOIN world_releases r ON r.id = t.release_id WHERE t.id = $1`,
-			[trackId, req.user.id]
+			[trackId, req.user.id],
 		);
-		return res.json({ ok: true, track: worldRow(rows[0]) });
+		const updatedTrack = worldRow(rows[0]);
+		await client.query("COMMIT");
+		return res.json({ ok: true, track: updatedTrack });
 	} catch (e) {
+		if (client) await client.query("ROLLBACK").catch(() => {});
+		if (e?.statusCode) return res.status(e.statusCode).json({error:e.message});
 		console.error("PATCH /api/world/tracks/:id ERROR", e);
 		return res.status(500).json({ error: "track_update_failed" });
-	}
+	} finally { client?.release(); }
 });
 
 app.patch("/api/world/releases/:id", requireAuth, async (req, res) => {
 	try {
 		const releaseId = String(req.params.id || "");
-		const existing = await pool.query(`SELECT * FROM world_releases WHERE id = $1 AND owner_user_id = $2 LIMIT 1`, [releaseId, req.user.id]);
+		const existing = await pool.query(`SELECT * FROM world_releases WHERE id = $1 AND owner_user_id = $2 LIMIT 1`, [
+			releaseId,
+			req.user.id,
+		]);
 		if (!existing.rows[0]) return res.status(404).json({ error: "release_not_found_or_not_owner" });
 		const current = existing.rows[0];
 		const body = req.body ?? {};
-		const linkedArtist = current.artist_id ? await pool.query(`SELECT name FROM artists WHERE id=$1 AND owner_user_id=$2 LIMIT 1`, [current.artist_id, req.user.id]) : null;
+		const linkedArtist = current.artist_id
+			? await pool.query(`SELECT name FROM artists WHERE id=$1 AND owner_user_id=$2 LIMIT 1`, [
+					current.artist_id,
+					req.user.id,
+				])
+			: null;
 		const artistName = String(linkedArtist?.rows?.[0]?.name || current.artist_name || "").trim();
-		const title = body.title === undefined ? current.title : String(body.title || "").trim().slice(0, 180);
-		const genre = body.genre === undefined ? current.genre : (String(body.genre || "Other").trim().slice(0, 80) || "Other");
+		const title =
+			body.title === undefined
+				? current.title
+				: String(body.title || "")
+						.trim()
+						.slice(0, 180);
+		const genre =
+			body.genre === undefined
+				? current.genre
+				: String(body.genre || "Other")
+						.trim()
+						.slice(0, 80) || "Other";
 		if (!title) return res.status(400).json({ error: "title_required" });
-		await pool.query(`UPDATE world_releases SET artist_name = $3, title = $4, genre = $5 WHERE id = $1 AND owner_user_id = $2`, [releaseId, req.user.id, artistName, title, genre]);
+		await pool.query(
+			`UPDATE world_releases SET artist_name = $3, title = $4, genre = $5 WHERE id = $1 AND owner_user_id = $2`,
+			[releaseId, req.user.id, artistName, title, genre],
+		);
 		if (current.release_type === "single") {
-			await pool.query(`UPDATE world_tracks SET title = $3, genre = $4 WHERE release_id = $1 AND owner_user_id = $2`, [releaseId, req.user.id, title, genre]);
+			await pool.query(
+				`UPDATE world_tracks SET title = $3, genre = $4 WHERE release_id = $1 AND owner_user_id = $2`,
+				[releaseId, req.user.id, title, genre],
+			);
 		}
-		return res.json({ ok: true, release: { id: releaseId, artistName, title, releaseType: current.release_type, genre, publishedAt: current.published_at, hasArtwork: !!current.artwork_object_key, isOwner: true, tracks: [] } });
+		return res.json({
+			ok: true,
+			release: {
+				id: releaseId,
+				artistName,
+				title,
+				releaseType: current.release_type,
+				genre,
+				publishedAt: current.published_at,
+				hasArtwork: !!current.artwork_object_key,
+				isOwner: true,
+				tracks: [],
+			},
+		});
 	} catch (e) {
 		console.error("PATCH /api/world/releases/:id ERROR", e);
 		return res.status(500).json({ error: "release_update_failed" });
@@ -1602,20 +2264,33 @@ app.delete("/api/world/tracks/:id", requireAuth, async (req, res) => {
 	try {
 		const trackId = String(req.params.id || "");
 		await client.query("BEGIN");
-		const found = await client.query(`SELECT id, release_id FROM world_tracks WHERE id=$1 AND owner_user_id=$2 FOR UPDATE`, [trackId, req.user.id]);
-		if (!found.rows[0]) { await client.query("ROLLBACK"); return res.status(404).json({ error:"track_not_found_or_not_owner" }); }
+		const found = await client.query(
+			`SELECT id, release_id FROM world_tracks WHERE id=$1 AND owner_user_id=$2 FOR UPDATE`,
+			[trackId, req.user.id],
+		);
+		if (!found.rows[0]) {
+			await client.query("ROLLBACK");
+			return res.status(404).json({ error: "track_not_found_or_not_owner" });
+		}
 		const releaseId = String(found.rows[0].release_id);
 		await client.query(`DELETE FROM world_tracks WHERE id=$1 AND owner_user_id=$2`, [trackId, req.user.id]);
-		const remaining = await client.query(`SELECT count(*)::int AS count FROM world_tracks WHERE release_id=$1`, [releaseId]);
+		const remaining = await client.query(`SELECT count(*)::int AS count FROM world_tracks WHERE release_id=$1`, [
+			releaseId,
+		]);
 		const releaseDeleted = Number(remaining.rows[0]?.count || 0) === 0;
-		if (releaseDeleted) await client.query(`DELETE FROM world_releases WHERE id=$1 AND owner_user_id=$2`, [releaseId, req.user.id]);
+		if (releaseDeleted)
+			await client.query(`DELETE FROM world_releases WHERE id=$1 AND owner_user_id=$2`, [releaseId, req.user.id]);
 		await client.query("COMMIT");
-		return res.json({ ok:true, releaseDeleted, releaseId });
+		return res.json({ ok: true, releaseDeleted, releaseId });
 	} catch (e) {
-		try { await client.query("ROLLBACK"); } catch {}
+		try {
+			await client.query("ROLLBACK");
+		} catch {}
 		console.error("DELETE /api/world/tracks/:id ERROR", e);
-		return res.status(500).json({ error:"track_remove_failed" });
-	} finally { client.release(); }
+		return res.status(500).json({ error: "track_remove_failed" });
+	} finally {
+		client.release();
+	}
 });
 
 // Remove a complete owner release and all of its World tracks/social records.
@@ -1623,12 +2298,15 @@ app.delete("/api/world/tracks/:id", requireAuth, async (req, res) => {
 app.delete("/api/world/releases/:id", requireAuth, async (req, res) => {
 	try {
 		const releaseId = String(req.params.id || "");
-		const deleted = await pool.query(`DELETE FROM world_releases WHERE id=$1 AND owner_user_id=$2 RETURNING id`, [releaseId, req.user.id]);
-		if (!deleted.rows[0]) return res.status(404).json({ error:"release_not_found_or_not_owner" });
-		return res.json({ ok:true, deleted:true });
+		const deleted = await pool.query(`DELETE FROM world_releases WHERE id=$1 AND owner_user_id=$2 RETURNING id`, [
+			releaseId,
+			req.user.id,
+		]);
+		if (!deleted.rows[0]) return res.status(404).json({ error: "release_not_found_or_not_owner" });
+		return res.json({ ok: true, deleted: true });
 	} catch (e) {
 		console.error("DELETE /api/world/releases/:id ERROR", e);
-		return res.status(500).json({ error:"release_remove_failed" });
+		return res.status(500).json({ error: "release_remove_failed" });
 	}
 });
 
@@ -1640,25 +2318,33 @@ app.post("/api/world/tracks/:id/reaction", requireAuth, async (req, res) => {
 		const exists = await pool.query(
 			`SELECT t.id, t.owner_user_id, t.title, r.artist_name
 			 FROM world_tracks t JOIN world_releases r ON r.id = t.release_id
-			 WHERE t.id = $1 AND t.status = 'published' LIMIT 1`, [trackId]
+			 WHERE t.id = $1 AND t.status = 'published' LIMIT 1`,
+			[trackId],
 		);
 		if (!exists.rows[0]) return res.status(404).json({ error: "track_not_found" });
-		const current = await pool.query(`SELECT reaction FROM world_track_reactions WHERE track_id = $1 AND user_id = $2`, [trackId, req.user.id]);
+		const current = await pool.query(
+			`SELECT reaction FROM world_track_reactions WHERE track_id = $1 AND user_id = $2`,
+			[trackId, req.user.id],
+		);
 		const previous = Number(current.rows[0]?.reaction || 0);
 		let next = reaction;
 		if (previous === reaction) {
-			await pool.query(`DELETE FROM world_track_reactions WHERE track_id = $1 AND user_id = $2`, [trackId, req.user.id]);
+			await pool.query(`DELETE FROM world_track_reactions WHERE track_id = $1 AND user_id = $2`, [
+				trackId,
+				req.user.id,
+			]);
 			next = 0;
 		} else {
 			await pool.query(
 				`INSERT INTO world_track_reactions (track_id, user_id, reaction) VALUES ($1, $2, $3)
 				 ON CONFLICT (track_id, user_id) DO UPDATE SET reaction = EXCLUDED.reaction, updated_at = now()`,
-				[trackId, req.user.id, reaction]
+				[trackId, req.user.id, reaction],
 			);
 		}
 		const counts = await pool.query(
 			`SELECT count(*) FILTER (WHERE reaction = 1) AS likes, count(*) FILTER (WHERE reaction = -1) AS dislikes
-			 FROM world_track_reactions WHERE track_id = $1`, [trackId]
+			 FROM world_track_reactions WHERE track_id = $1`,
+			[trackId],
 		);
 		if (next === 1 && previous !== 1) {
 			const track = exists.rows[0];
@@ -1673,7 +2359,12 @@ app.post("/api/world/tracks/:id/reaction", requireAuth, async (req, res) => {
 			});
 		}
 		await syncAchievementsForUser(req.user.id).catch(() => {});
-		return res.json({ ok: true, reaction: next, likes: Number(counts.rows[0].likes || 0), dislikes: Number(counts.rows[0].dislikes || 0) });
+		return res.json({
+			ok: true,
+			reaction: next,
+			likes: Number(counts.rows[0].likes || 0),
+			dislikes: Number(counts.rows[0].dislikes || 0),
+		});
 	} catch (e) {
 		console.error("POST /api/world/tracks/:id/reaction ERROR", e);
 		return res.status(500).json({ error: "reaction_failed" });
@@ -1682,16 +2373,45 @@ app.post("/api/world/tracks/:id/reaction", requireAuth, async (req, res) => {
 
 app.post("/api/world/tracks/:id/play", async (req, res) => {
 	try {
-		const { rows } = await pool.query(`UPDATE world_tracks SET play_count = play_count + 1 WHERE id = $1 AND status = 'published' RETURNING play_count, owner_user_id`, [String(req.params.id || "")]);
+		const { rows } = await pool.query(
+			`UPDATE world_tracks SET play_count = play_count + 1 WHERE id = $1 AND status = 'published' RETURNING play_count, owner_user_id`,
+			[String(req.params.id || "")],
+		);
 		if (!rows[0]) return res.status(404).json({ error: "track_not_found" });
 		const authUser = verifyTokenString(authFromHeader(req));
 		let profile = null;
-		if (authUser?.id) { const q=await pool.query(`SELECT gender,country,region,city FROM users WHERE id=$1`,[authUser.id]); profile=q.rows[0]||null; }
+		if (authUser?.id) {
+			const q = await pool.query(`SELECT gender,country,region,city FROM users WHERE id=$1`, [authUser.id]);
+			profile = q.rows[0] || null;
+		}
 		const playEventId = crypto.randomUUID();
-		await pool.query(`INSERT INTO world_play_events (id,track_id,owner_user_id,listener_user_id,listener_key,gender,country,region,city,source,listen_seconds,completed,synthetic) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,false)`,[playEventId,String(req.params.id||""),rows[0].owner_user_id,authUser?.id||null,authUser?.id?`u:${authUser.id}`:null,profile?.gender||null,profile?.country||null,profile?.region||null,profile?.city||null,String(req.body?.source||"ysong_world").slice(0,80),Number.isFinite(Number(req.body?.listenSeconds))?Number(req.body.listenSeconds):null,req.body?.completed===true]);
+		await pool.query(
+			`INSERT INTO world_play_events (id,track_id,owner_user_id,listener_user_id,listener_key,gender,country,region,city,source,listen_seconds,completed,synthetic) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,false)`,
+			[
+				playEventId,
+				String(req.params.id || ""),
+				rows[0].owner_user_id,
+				authUser?.id || null,
+				authUser?.id ? `u:${authUser.id}` : null,
+				profile?.gender || null,
+				profile?.country || null,
+				profile?.region || null,
+				profile?.city || null,
+				String(req.body?.source || "ysong_world").slice(0, 80),
+				Number.isFinite(Number(req.body?.listenSeconds)) ? Number(req.body.listenSeconds) : null,
+				req.body?.completed === true,
+			],
+		);
 		syncAchievementsForUser(rows[0].owner_user_id).catch(() => {});
-		return res.json({ ok: true, playCount: Number(rows[0].play_count || 0), playEventId: authUser?.id ? playEventId : null });
-	} catch (e) { console.error("POST /api/world/tracks/:id/play ERROR", e); return res.status(500).json({ error: "play_count_failed" }); }
+		return res.json({
+			ok: true,
+			playCount: Number(rows[0].play_count || 0),
+			playEventId: authUser?.id ? playEventId : null,
+		});
+	} catch (e) {
+		console.error("POST /api/world/tracks/:id/play ERROR", e);
+		return res.status(500).json({ error: "play_count_failed" });
+	}
 });
 
 app.post("/api/world/play-events/:id/progress", requireAuth, async (req, res) => {
@@ -1705,43 +2425,129 @@ app.post("/api/world/play-events/:id/progress", requireAuth, async (req, res) =>
 			     completed = completed OR $4
 			 WHERE id=$1 AND listener_user_id=$2 AND synthetic=false
 			 RETURNING id, listen_seconds, completed`,
-			[String(req.params.id || ""), req.user.id, listenSeconds, completed]
+			[String(req.params.id || ""), req.user.id, listenSeconds, completed],
 		);
 		if (!rows[0]) return res.status(404).json({ error: "play_event_not_found" });
-		return res.json({ ok: true, playEventId: rows[0].id, listenSeconds: Number(rows[0].listen_seconds || 0), completed: !!rows[0].completed });
+		return res.json({
+			ok: true,
+			playEventId: rows[0].id,
+			listenSeconds: Number(rows[0].listen_seconds || 0),
+			completed: !!rows[0].completed,
+		});
 	} catch (e) {
 		console.error("POST /api/world/play-events/:id/progress ERROR", e);
 		return res.status(500).json({ error: "play_progress_failed" });
 	}
 });
 
-
 // -------------------- Creator analytics --------------------
-app.get("/api/analytics/creator", requireAuth, async (req,res)=>{
+app.get("/api/analytics/creator", requireAuth, async (req, res) => {
 	try {
-		const days=Math.max(7,Math.min(365,Number(req.query.days||30)||30));
-		const daily=await pool.query(`SELECT to_char(series.day::date,'YYYY-MM-DD') AS day, COALESCE(count(e.id),0)::int AS plays, COALESCE(count(DISTINCT e.listener_key),0)::int AS listeners FROM generate_series(current_date-($2::int-1),current_date,'1 day') AS series(day) LEFT JOIN world_play_events e ON e.owner_user_id=$1 AND e.occurred_at>=series.day AND e.occurred_at<series.day+interval '1 day' GROUP BY series.day ORDER BY series.day`,[req.user.id,days]);
-		const totals=await pool.query(`SELECT count(*)::int plays,count(DISTINCT listener_key)::int listeners,count(*) FILTER (WHERE synthetic)::int synthetic_plays FROM world_play_events WHERE owner_user_id=$1 AND occurred_at>=now()-($2::text||' days')::interval`,[req.user.id,String(days)]);
-		const countries=await pool.query(`SELECT COALESCE(NULLIF(country,''),'Unknown') name,count(*)::int value FROM world_play_events WHERE owner_user_id=$1 AND occurred_at>=now()-($2::text||' days')::interval GROUP BY 1 ORDER BY value DESC LIMIT 8`,[req.user.id,String(days)]);
-		const genders=await pool.query(`SELECT COALESCE(NULLIF(gender,''),'Unknown') name,count(*)::int value FROM world_play_events WHERE owner_user_id=$1 AND occurred_at>=now()-($2::text||' days')::interval GROUP BY 1 ORDER BY value DESC`,[req.user.id,String(days)]);
-		return res.json({days,daily:daily.rows.map(r=>({day:r.day,plays:Number(r.plays),listeners:Number(r.listeners)})),totals:totals.rows[0]||{plays:0,listeners:0,synthetic_plays:0},countries:countries.rows,genders:genders.rows});
-	}catch(e){console.error("GET /api/analytics/creator ERROR",e);return res.status(500).json({error:"analytics_failed"});}
+		const days = Math.max(7, Math.min(365, Number(req.query.days || 30) || 30));
+		const daily = await pool.query(
+			`SELECT to_char(series.day::date,'YYYY-MM-DD') AS day, COALESCE(count(e.id),0)::int AS plays, COALESCE(count(DISTINCT e.listener_key),0)::int AS listeners FROM generate_series(current_date-($2::int-1),current_date,'1 day') AS series(day) LEFT JOIN world_play_events e ON e.owner_user_id=$1 AND e.occurred_at>=series.day AND e.occurred_at<series.day+interval '1 day' GROUP BY series.day ORDER BY series.day`,
+			[req.user.id, days],
+		);
+		const totals = await pool.query(
+			`SELECT count(*)::int plays,count(DISTINCT listener_key)::int listeners,count(*) FILTER (WHERE synthetic)::int synthetic_plays FROM world_play_events WHERE owner_user_id=$1 AND occurred_at>=now()-($2::text||' days')::interval`,
+			[req.user.id, String(days)],
+		);
+		const countries = await pool.query(
+			`SELECT COALESCE(NULLIF(country,''),'Unknown') name,count(*)::int value FROM world_play_events WHERE owner_user_id=$1 AND occurred_at>=now()-($2::text||' days')::interval GROUP BY 1 ORDER BY value DESC LIMIT 8`,
+			[req.user.id, String(days)],
+		);
+		const genders = await pool.query(
+			`SELECT COALESCE(NULLIF(gender,''),'Unknown') name,count(*)::int value FROM world_play_events WHERE owner_user_id=$1 AND occurred_at>=now()-($2::text||' days')::interval GROUP BY 1 ORDER BY value DESC`,
+			[req.user.id, String(days)],
+		);
+		return res.json({
+			days,
+			daily: daily.rows.map((r) => ({ day: r.day, plays: Number(r.plays), listeners: Number(r.listeners) })),
+			totals: totals.rows[0] || { plays: 0, listeners: 0, synthetic_plays: 0 },
+			countries: countries.rows,
+			genders: genders.rows,
+		});
+	} catch (e) {
+		console.error("GET /api/analytics/creator ERROR", e);
+		return res.status(500).json({ error: "analytics_failed" });
+	}
 });
 
-app.post("/api/analytics/dev/seed", requireAuth, async (req,res)=>{
+app.post("/api/analytics/dev/seed", requireAuth, async (req, res) => {
 	try {
-		if(!LOCAL_MODE && process.env.ALLOW_SYNTHETIC_ANALYTICS!=="1") return res.status(403).json({error:"dev_analytics_disabled"});
-		const days=Math.max(7,Math.min(90,Number(req.body?.days||30)||30)); const total=Math.max(1,Math.min(50000,Number(req.body?.total||1000)||1000)); const preset=["steady","viral","release","slowburn"].includes(String(req.body?.preset))?String(req.body.preset):"steady";
-		const tracks=await pool.query(`SELECT id FROM world_tracks WHERE owner_user_id=$1 AND status='published'`,[req.user.id]); if(!tracks.rows.length)return res.status(400).json({error:"publish_track_first"});
-		const countries=["United States","Argentina","United Kingdom","Canada","Germany","Brazil","Mexico","Japan"]; const genders=["female","male","nonbinary","other","prefer_not_to_say"];
-		const vals=[];
-		for(let i=0;i<total;i++){ const x=Math.random(); let age; if(preset==="viral") age=Math.pow(x,3)*days; else if(preset==="release") age=Math.pow(x,2)*days; else if(preset==="slowburn") age=(1-Math.pow(x,2))*days; else age=x*days; const track=tracks.rows[i%tracks.rows.length].id; vals.push([crypto.randomUUID(),track,req.user.id,`synthetic:${Math.floor(i/1.7)}`,genders[i%genders.length],countries[i%countries.length],new Date(Date.now()-age*86400000)]); }
-		for(let i=0;i<vals.length;i+=500){const batch=vals.slice(i,i+500);const ph=[];const args=[];batch.forEach((v,j)=>{const b=j*7;ph.push(`($${b+1},$${b+2},$${b+3},$${b+4},$${b+5},$${b+6},'synthetic',true,$${b+7})`);args.push(...v)});await pool.query(`INSERT INTO world_play_events (id,track_id,owner_user_id,listener_key,gender,country,source,synthetic,occurred_at) VALUES ${ph.join(',')}`,args);}
-		return res.json({ok:true,created:total});
-	}catch(e){console.error("POST /api/analytics/dev/seed ERROR",e);return res.status(500).json({error:"analytics_seed_failed"});}
+		if (!LOCAL_MODE && process.env.ALLOW_SYNTHETIC_ANALYTICS !== "1")
+			return res.status(403).json({ error: "dev_analytics_disabled" });
+		const days = Math.max(7, Math.min(90, Number(req.body?.days || 30) || 30));
+		const total = Math.max(1, Math.min(50000, Number(req.body?.total || 1000) || 1000));
+		const preset = ["steady", "viral", "release", "slowburn"].includes(String(req.body?.preset))
+			? String(req.body.preset)
+			: "steady";
+		const tracks = await pool.query(`SELECT id FROM world_tracks WHERE owner_user_id=$1 AND status='published'`, [
+			req.user.id,
+		]);
+		if (!tracks.rows.length) return res.status(400).json({ error: "publish_track_first" });
+		const countries = [
+			"United States",
+			"Argentina",
+			"United Kingdom",
+			"Canada",
+			"Germany",
+			"Brazil",
+			"Mexico",
+			"Japan",
+		];
+		const genders = ["female", "male", "nonbinary", "other", "prefer_not_to_say"];
+		const vals = [];
+		for (let i = 0; i < total; i++) {
+			const x = Math.random();
+			let age;
+			if (preset === "viral") age = Math.pow(x, 3) * days;
+			else if (preset === "release") age = Math.pow(x, 2) * days;
+			else if (preset === "slowburn") age = (1 - Math.pow(x, 2)) * days;
+			else age = x * days;
+			const track = tracks.rows[i % tracks.rows.length].id;
+			vals.push([
+				crypto.randomUUID(),
+				track,
+				req.user.id,
+				`synthetic:${Math.floor(i / 1.7)}`,
+				genders[i % genders.length],
+				countries[i % countries.length],
+				new Date(Date.now() - age * 86400000),
+			]);
+		}
+		for (let i = 0; i < vals.length; i += 500) {
+			const batch = vals.slice(i, i + 500);
+			const ph = [];
+			const args = [];
+			batch.forEach((v, j) => {
+				const b = j * 7;
+				ph.push(`($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},'synthetic',true,$${b + 7})`);
+				args.push(...v);
+			});
+			await pool.query(
+				`INSERT INTO world_play_events (id,track_id,owner_user_id,listener_key,gender,country,source,synthetic,occurred_at) VALUES ${ph.join(",")}`,
+				args,
+			);
+		}
+		return res.json({ ok: true, created: total });
+	} catch (e) {
+		console.error("POST /api/analytics/dev/seed ERROR", e);
+		return res.status(500).json({ error: "analytics_seed_failed" });
+	}
 });
-app.post("/api/analytics/dev/reset", requireAuth, async (req,res)=>{try{if(!LOCAL_MODE&&process.env.ALLOW_SYNTHETIC_ANALYTICS!=="1")return res.status(403).json({error:"dev_analytics_disabled"});const r=await pool.query(`DELETE FROM world_play_events WHERE owner_user_id=$1 AND synthetic=true`,[req.user.id]);return res.json({ok:true,deleted:r.rowCount||0});}catch(e){return res.status(500).json({error:"analytics_reset_failed"});}});
-
+app.post("/api/analytics/dev/reset", requireAuth, async (req, res) => {
+	try {
+		if (!LOCAL_MODE && process.env.ALLOW_SYNTHETIC_ANALYTICS !== "1")
+			return res.status(403).json({ error: "dev_analytics_disabled" });
+		const r = await pool.query(`DELETE FROM world_play_events WHERE owner_user_id=$1 AND synthetic=true`, [
+			req.user.id,
+		]);
+		return res.json({ ok: true, deleted: r.rowCount || 0 });
+	} catch (e) {
+		return res.status(500).json({ error: "analytics_reset_failed" });
+	}
+});
 
 // -------------------- Listener Flashback / recaps --------------------
 function flashbackWindow(periodRaw, yearRaw) {
@@ -1791,7 +2597,8 @@ app.get("/api/flashback", requireAuth, async (req, res) => {
 			ELSE LEAST(COALESCE(t.duration_seconds, 30), 30)
 		END`;
 
-		const totals = await pool.query(`
+		const totals = await pool.query(
+			`
 			SELECT count(*)::int AS plays,
 			       count(DISTINCT e.track_id)::int AS unique_tracks,
 			       count(DISTINCT (r.owner_user_id::text || ':' || r.artist_name))::int AS unique_artists,
@@ -1800,9 +2607,12 @@ app.get("/api/flashback", requireAuth, async (req, res) => {
 			FROM world_play_events e
 			JOIN world_tracks t ON t.id=e.track_id
 			JOIN world_releases r ON r.id=t.release_id
-			WHERE e.listener_user_id=$1 AND e.synthetic=false AND e.occurred_at >= $2::timestamptz AND e.occurred_at < $3::timestamptz`, params);
+			WHERE e.listener_user_id=$1 AND e.synthetic=false AND e.occurred_at >= $2::timestamptz AND e.occurred_at < $3::timestamptz`,
+			params,
+		);
 
-		const topTracks = await pool.query(`
+		const topTracks = await pool.query(
+			`
 			SELECT t.id, t.title, r.artist_name, COALESCE(NULLIF(t.genre,''),'Other') AS genre,
 			       count(*)::int AS plays, COALESCE(sum(${secondsExpr}),0)::double precision AS listen_seconds
 			FROM world_play_events e
@@ -1810,9 +2620,12 @@ app.get("/api/flashback", requireAuth, async (req, res) => {
 			JOIN world_releases r ON r.id=t.release_id
 			WHERE e.listener_user_id=$1 AND e.synthetic=false AND e.occurred_at >= $2::timestamptz AND e.occurred_at < $3::timestamptz
 			GROUP BY t.id,t.title,r.artist_name,t.genre
-			ORDER BY plays DESC, listen_seconds DESC, t.title ASC LIMIT 10`, params);
+			ORDER BY plays DESC, listen_seconds DESC, t.title ASC LIMIT 10`,
+			params,
+		);
 
-		const topArtists = await pool.query(`
+		const topArtists = await pool.query(
+			`
 			SELECT r.owner_user_id, r.artist_name AS name, count(*)::int AS plays,
 			       count(DISTINCT e.track_id)::int AS tracks, COALESCE(sum(${secondsExpr}),0)::double precision AS listen_seconds
 			FROM world_play_events e
@@ -1820,25 +2633,34 @@ app.get("/api/flashback", requireAuth, async (req, res) => {
 			JOIN world_releases r ON r.id=t.release_id
 			WHERE e.listener_user_id=$1 AND e.synthetic=false AND e.occurred_at >= $2::timestamptz AND e.occurred_at < $3::timestamptz
 			GROUP BY r.owner_user_id,r.artist_name
-			ORDER BY plays DESC, listen_seconds DESC, name ASC LIMIT 10`, params);
+			ORDER BY plays DESC, listen_seconds DESC, name ASC LIMIT 10`,
+			params,
+		);
 
-		const topGenres = await pool.query(`
+		const topGenres = await pool.query(
+			`
 			SELECT COALESCE(NULLIF(t.genre,''),'Other') AS name, count(*)::int AS plays,
 			       count(DISTINCT e.track_id)::int AS tracks, COALESCE(sum(${secondsExpr}),0)::double precision AS listen_seconds
 			FROM world_play_events e
 			JOIN world_tracks t ON t.id=e.track_id
 			WHERE e.listener_user_id=$1 AND e.synthetic=false AND e.occurred_at >= $2::timestamptz AND e.occurred_at < $3::timestamptz
 			GROUP BY COALESCE(NULLIF(t.genre,''),'Other')
-			ORDER BY plays DESC, listen_seconds DESC, name ASC LIMIT 10`, params);
+			ORDER BY plays DESC, listen_seconds DESC, name ASC LIMIT 10`,
+			params,
+		);
 
-		const days = await pool.query(`
+		const days = await pool.query(
+			`
 			SELECT to_char((e.occurred_at AT TIME ZONE 'UTC')::date,'YYYY-MM-DD') AS day,
 			       count(*)::int AS plays, COALESCE(sum(${secondsExpr}),0)::double precision AS listen_seconds
 			FROM world_play_events e JOIN world_tracks t ON t.id=e.track_id
 			WHERE e.listener_user_id=$1 AND e.synthetic=false AND e.occurred_at >= $2::timestamptz AND e.occurred_at < $3::timestamptz
-			GROUP BY 1 ORDER BY 1`, params);
+			GROUP BY 1 ORDER BY 1`,
+			params,
+		);
 
-		const discoveries = await pool.query(`
+		const discoveries = await pool.query(
+			`
 			WITH first_tracks AS (
 				SELECT e.track_id, min(e.occurred_at) AS first_at
 				FROM world_play_events e WHERE e.listener_user_id=$1 AND e.synthetic=false GROUP BY e.track_id
@@ -1850,14 +2672,23 @@ app.get("/api/flashback", requireAuth, async (req, res) => {
 			)
 			SELECT
 				(SELECT count(*)::int FROM first_tracks WHERE first_at >= $2::timestamptz AND first_at < $3::timestamptz) AS tracks,
-				(SELECT count(*)::int FROM first_artists WHERE first_at >= $2::timestamptz AND first_at < $3::timestamptz) AS artists`, params);
+				(SELECT count(*)::int FROM first_artists WHERE first_at >= $2::timestamptz AND first_at < $3::timestamptz) AS artists`,
+			params,
+		);
 
-		const years = await pool.query(`SELECT DISTINCT extract(year from occurred_at)::int AS year FROM world_play_events WHERE listener_user_id=$1 AND synthetic=false ORDER BY year DESC`, [req.user.id]);
+		const years = await pool.query(
+			`SELECT DISTINCT extract(year from occurred_at)::int AS year FROM world_play_events WHERE listener_user_id=$1 AND synthetic=false ORDER BY year DESC`,
+			[req.user.id],
+		);
 
 		const total = totals.rows[0] || {};
 		const playCount = Number(total.plays || 0);
 		const tracked = Number(total.tracked_events || 0);
-		const daily = days.rows.map((row) => ({ day: row.day, plays: Number(row.plays || 0), listenSeconds: Number(row.listen_seconds || 0) }));
+		const daily = days.rows.map((row) => ({
+			day: row.day,
+			plays: Number(row.plays || 0),
+			listenSeconds: Number(row.listen_seconds || 0),
+		}));
 		return res.json({
 			period: window.period,
 			label: window.label,
@@ -1875,10 +2706,30 @@ app.get("/api/flashback", requireAuth, async (req, res) => {
 				listeningDays: daily.length,
 				longestStreakDays: flashbackLongestStreak(daily.map((row) => row.day)),
 			},
-			discoveries: { tracks: Number(discoveries.rows[0]?.tracks || 0), artists: Number(discoveries.rows[0]?.artists || 0) },
-			topTracks: topTracks.rows.map((row) => ({ id: row.id, title: row.title, artistName: row.artist_name, genre: row.genre, plays: Number(row.plays || 0), listenSeconds: Number(row.listen_seconds || 0) })),
-			topArtists: topArtists.rows.map((row) => ({ name: row.name, plays: Number(row.plays || 0), tracks: Number(row.tracks || 0), listenSeconds: Number(row.listen_seconds || 0) })),
-			topGenres: topGenres.rows.map((row) => ({ name: row.name, plays: Number(row.plays || 0), tracks: Number(row.tracks || 0), listenSeconds: Number(row.listen_seconds || 0) })),
+			discoveries: {
+				tracks: Number(discoveries.rows[0]?.tracks || 0),
+				artists: Number(discoveries.rows[0]?.artists || 0),
+			},
+			topTracks: topTracks.rows.map((row) => ({
+				id: row.id,
+				title: row.title,
+				artistName: row.artist_name,
+				genre: row.genre,
+				plays: Number(row.plays || 0),
+				listenSeconds: Number(row.listen_seconds || 0),
+			})),
+			topArtists: topArtists.rows.map((row) => ({
+				name: row.name,
+				plays: Number(row.plays || 0),
+				tracks: Number(row.tracks || 0),
+				listenSeconds: Number(row.listen_seconds || 0),
+			})),
+			topGenres: topGenres.rows.map((row) => ({
+				name: row.name,
+				plays: Number(row.plays || 0),
+				tracks: Number(row.tracks || 0),
+				listenSeconds: Number(row.listen_seconds || 0),
+			})),
 			daily,
 		});
 	} catch (e) {
@@ -1893,18 +2744,30 @@ app.post("/api/world/tracks/:id/save", requireAuth, async (req, res) => {
 		const trackId = String(req.params.id || "");
 		const found = await pool.query(
 			`SELECT t.id, t.owner_user_id, t.title, r.artist_name FROM world_tracks t
-			 JOIN world_releases r ON r.id = t.release_id WHERE t.id = $1 AND t.status = 'published' LIMIT 1`, [trackId]
+			 JOIN world_releases r ON r.id = t.release_id WHERE t.id = $1 AND t.status = 'published' LIMIT 1`,
+			[trackId],
 		);
 		if (!found.rows[0]) return res.status(404).json({ error: "track_not_found" });
-		const removed = await pool.query(`DELETE FROM world_saved_tracks WHERE user_id = $1 AND track_id = $2 RETURNING track_id`, [req.user.id, trackId]);
+		const removed = await pool.query(
+			`DELETE FROM world_saved_tracks WHERE user_id = $1 AND track_id = $2 RETURNING track_id`,
+			[req.user.id, trackId],
+		);
 		let saved = false;
 		if (!removed.rows[0]) {
-			await pool.query(`INSERT INTO world_saved_tracks (user_id, track_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [req.user.id, trackId]);
+			await pool.query(
+				`INSERT INTO world_saved_tracks (user_id, track_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+				[req.user.id, trackId],
+			);
 			saved = true;
 			const track = found.rows[0];
 			await createNotification(track.owner_user_id, {
-				actorUserId: req.user.id, kind: "track_save", entityType: "track", entityId: trackId,
-				title: `${await publicNameForUserId(req.user.id)} saved your song`, body: `${track.title} • ${track.artist_name}`, href: "/app",
+				actorUserId: req.user.id,
+				kind: "track_save",
+				entityType: "track",
+				entityId: trackId,
+				title: `${await publicNameForUserId(req.user.id)} saved your song`,
+				body: `${track.title} • ${track.artist_name}`,
+				href: "/app",
 			});
 		}
 		await syncAchievementsForUser(req.user.id).catch(() => {});
@@ -1919,17 +2782,31 @@ app.post("/api/world/tracks/:id/save", requireAuth, async (req, res) => {
 app.post("/api/world/releases/:id/save", requireAuth, async (req, res) => {
 	try {
 		const releaseId = String(req.params.id || "");
-		const found = await pool.query(`SELECT id, owner_user_id, title, artist_name FROM world_releases WHERE id = $1 LIMIT 1`, [releaseId]);
+		const found = await pool.query(
+			`SELECT id, owner_user_id, title, artist_name FROM world_releases WHERE id = $1 LIMIT 1`,
+			[releaseId],
+		);
 		if (!found.rows[0]) return res.status(404).json({ error: "release_not_found" });
-		const removed = await pool.query(`DELETE FROM world_saved_releases WHERE user_id = $1 AND release_id = $2 RETURNING release_id`, [req.user.id, releaseId]);
+		const removed = await pool.query(
+			`DELETE FROM world_saved_releases WHERE user_id = $1 AND release_id = $2 RETURNING release_id`,
+			[req.user.id, releaseId],
+		);
 		let saved = false;
 		if (!removed.rows[0]) {
-			await pool.query(`INSERT INTO world_saved_releases (user_id, release_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [req.user.id, releaseId]);
+			await pool.query(
+				`INSERT INTO world_saved_releases (user_id, release_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+				[req.user.id, releaseId],
+			);
 			saved = true;
 			const release = found.rows[0];
 			await createNotification(release.owner_user_id, {
-				actorUserId: req.user.id, kind: "release_save", entityType: "release", entityId: releaseId,
-				title: `${await publicNameForUserId(req.user.id)} saved your release`, body: `${release.title} • ${release.artist_name}`, href: "/app",
+				actorUserId: req.user.id,
+				kind: "release_save",
+				entityType: "release",
+				entityId: releaseId,
+				title: `${await publicNameForUserId(req.user.id)} saved your release`,
+				body: `${release.title} • ${release.artist_name}`,
+				href: "/app",
 			});
 		}
 		await syncAchievementsForUser(req.user.id).catch(() => {});
@@ -1943,18 +2820,34 @@ app.post("/api/world/releases/:id/save", requireAuth, async (req, res) => {
 app.post("/api/world/artists/follow", requireAuth, async (req, res) => {
 	try {
 		const ownerUserId = String(req.body?.ownerUserId || "");
-		const artistName = String(req.body?.artistName || "").trim().slice(0, 180);
+		const artistName = String(req.body?.artistName || "")
+			.trim()
+			.slice(0, 180);
 		if (!ownerUserId || !artistName) return res.status(400).json({ error: "artist_required" });
-		const found = await pool.query(`SELECT 1 FROM world_releases WHERE owner_user_id = $1 AND artist_name = $2 LIMIT 1`, [ownerUserId, artistName]);
+		const found = await pool.query(
+			`SELECT 1 FROM world_releases WHERE owner_user_id = $1 AND artist_name = $2 LIMIT 1`,
+			[ownerUserId, artistName],
+		);
 		if (!found.rows[0]) return res.status(404).json({ error: "artist_not_found" });
-		const removed = await pool.query(`DELETE FROM world_followed_artists WHERE user_id = $1 AND artist_owner_user_id = $2 AND artist_name = $3 RETURNING artist_name`, [req.user.id, ownerUserId, artistName]);
+		const removed = await pool.query(
+			`DELETE FROM world_followed_artists WHERE user_id = $1 AND artist_owner_user_id = $2 AND artist_name = $3 RETURNING artist_name`,
+			[req.user.id, ownerUserId, artistName],
+		);
 		let followed = false;
 		if (!removed.rows[0]) {
-			await pool.query(`INSERT INTO world_followed_artists (user_id, artist_owner_user_id, artist_name) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, [req.user.id, ownerUserId, artistName]);
+			await pool.query(
+				`INSERT INTO world_followed_artists (user_id, artist_owner_user_id, artist_name) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`,
+				[req.user.id, ownerUserId, artistName],
+			);
 			followed = true;
 			await createNotification(ownerUserId, {
-				actorUserId: req.user.id, kind: "artist_follow", entityType: "artist", entityId: `${ownerUserId}:${artistName}`,
-				title: `${await publicNameForUserId(req.user.id)} favorited ${artistName}`, body: "You have a new artist follower on YSong World.", href: "/app",
+				actorUserId: req.user.id,
+				kind: "artist_follow",
+				entityType: "artist",
+				entityId: `${ownerUserId}:${artistName}`,
+				title: `${await publicNameForUserId(req.user.id)} favorited ${artistName}`,
+				body: "You have a new artist follower on YSong World.",
+				href: "/app",
 			});
 		}
 		await syncAchievementsForUser(req.user.id).catch(() => {});
@@ -1967,18 +2860,29 @@ app.post("/api/world/artists/follow", requireAuth, async (req, res) => {
 
 function playlistRow(row) {
 	return {
-		id: String(row.id), ownerUserId: String(row.owner_user_id || ""), ownerName: publicNameFromRow(row, "owner_user_id", "owner_display_name"),
-		title: row.title, description: row.description || "", tags: Array.isArray(row.tags) ? row.tags : [], isPublic: !!row.is_public,
+		id: String(row.id),
+		ownerUserId: String(row.owner_user_id || ""),
+		ownerName: publicNameFromRow(row, "owner_user_id", "owner_display_name"),
+		title: row.title,
+		description: row.description || "",
+		tags: Array.isArray(row.tags) ? row.tags : [],
+		isPublic: !!row.is_public,
 		hasArtwork: !!row.artwork_object_key,
-		trackCount: Number(row.track_count || 0), saveCount: Number(row.save_count || 0), coverTrackId: row.cover_track_id ? String(row.cover_track_id) : null,
-		isSaved: !!row.is_saved, isOwner: !!row.is_owner, createdAt: row.created_at, updatedAt: row.updated_at,
+		trackCount: Number(row.track_count || 0),
+		saveCount: Number(row.save_count || 0),
+		coverTrackId: row.cover_track_id ? String(row.cover_track_id) : null,
+		isSaved: !!row.is_saved,
+		isOwner: !!row.is_owner,
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
 	};
 }
 
 app.get("/api/world/playlists", async (req, res) => {
 	try {
 		const user = verifyTokenString(authFromHeader(req));
-		const { rows } = await pool.query(`
+		const { rows } = await pool.query(
+			`
 			SELECT p.*, u.display_name AS owner_display_name,
 			       (SELECT count(*) FROM world_playlist_tracks pt WHERE pt.playlist_id = p.id) AS track_count,
 			       (SELECT count(*) FROM world_saved_playlists sp WHERE sp.playlist_id = p.id) AS save_count,
@@ -1987,7 +2891,9 @@ app.get("/api/world/playlists", async (req, res) => {
 			       COALESCE(p.owner_user_id = $1::uuid, false) AS is_owner
 			FROM world_playlists p JOIN users u ON u.id = p.owner_user_id
 			WHERE p.is_public = true
-			ORDER BY save_count DESC, p.updated_at DESC LIMIT 80`, [user?.id || null]);
+			ORDER BY save_count DESC, p.updated_at DESC LIMIT 80`,
+			[user?.id || null],
+		);
 		return res.json({ playlists: rows.map(playlistRow) });
 	} catch (e) {
 		console.error("GET /api/world/playlists ERROR", e);
@@ -1997,16 +2903,25 @@ app.get("/api/world/playlists", async (req, res) => {
 
 app.post("/api/world/playlists", requireAuth, async (req, res) => {
 	try {
-		const title = String(req.body?.title || "").trim().slice(0, 180);
-		const description = String(req.body?.description || "").trim().slice(0, 1000);
+		const title = String(req.body?.title || "")
+			.trim()
+			.slice(0, 180);
+		const description = String(req.body?.description || "")
+			.trim()
+			.slice(0, 1000);
 		const tags = Array.isArray(req.body?.tags)
-			? req.body.tags.map((x) => String(x).trim().slice(0, 48)).filter(Boolean).slice(0, 16)
+			? req.body.tags
+					.map((x) => String(x).trim().slice(0, 48))
+					.filter(Boolean)
+					.slice(0, 16)
 			: [];
 		const isPublic = req.body?.isPublic !== false;
 		let artworkObjectKey = null;
 		if (req.body?.artworkObjectKey) {
-			artworkObjectKey = assertOwnedObjectKey(req.user.id, String(req.body.artworkObjectKey), { uploadOnly: true });
-			await fs.promises.access(objectPath(artworkObjectKey), fs.constants.R_OK);
+			artworkObjectKey = assertOwnedObjectKey(req.user.id, String(req.body.artworkObjectKey), {
+				uploadOnly: true,
+			});
+			await assertObjectReadable(artworkObjectKey);
 			const meta = await readObjectMetadata(artworkObjectKey);
 			if (meta?.contentType && !String(meta.contentType).toLowerCase().startsWith("image/")) {
 				return res.status(400).json({ error: "playlist_artwork_must_be_image" });
@@ -2017,16 +2932,26 @@ app.post("/api/world/playlists", requireAuth, async (req, res) => {
 		await pool.query(
 			`INSERT INTO world_playlists (id, owner_user_id, title, description, artwork_object_key, tags, is_public)
 			 VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7)`,
-			[id, req.user.id, title, description, artworkObjectKey, JSON.stringify(tags), isPublic]
+			[id, req.user.id, title, description, artworkObjectKey, JSON.stringify(tags), isPublic],
 		);
 		await syncAchievementsForUser(req.user.id).catch(() => {});
 		return res.status(201).json({
 			ok: true,
 			playlist: {
-				id, ownerUserId: req.user.id, ownerName: await publicNameForUserId(req.user.id),
-				title, description, tags, hasArtwork: !!artworkObjectKey, isPublic,
-				trackCount: 0, saveCount: 0, coverTrackId: null, isSaved: false, isOwner: true
-			}
+				id,
+				ownerUserId: req.user.id,
+				ownerName: await publicNameForUserId(req.user.id),
+				title,
+				description,
+				tags,
+				hasArtwork: !!artworkObjectKey,
+				isPublic,
+				trackCount: 0,
+				saveCount: 0,
+				coverTrackId: null,
+				isSaved: false,
+				isOwner: true,
+			},
 		});
 	} catch (e) {
 		if (e?.statusCode === 403) return res.status(403).json({ error: "playlist_artwork_not_owned" });
@@ -2039,20 +2964,43 @@ app.post("/api/world/playlists", requireAuth, async (req, res) => {
 app.patch("/api/world/playlists/:id", requireAuth, async (req, res) => {
 	try {
 		const id = String(req.params.id || "");
-		const found = await pool.query(`SELECT * FROM world_playlists WHERE id = $1 AND owner_user_id = $2 LIMIT 1`, [id, req.user.id]);
+		const found = await pool.query(`SELECT * FROM world_playlists WHERE id = $1 AND owner_user_id = $2 LIMIT 1`, [
+			id,
+			req.user.id,
+		]);
 		if (!found.rows[0]) return res.status(404).json({ error: "playlist_not_found_or_not_owner" });
 		const cur = found.rows[0];
-		const title = req.body?.title === undefined ? cur.title : String(req.body.title || "").trim().slice(0, 180);
-		const description = req.body?.description === undefined ? cur.description : String(req.body.description || "").trim().slice(0, 1000);
-		const tags = req.body?.tags === undefined
-			? (Array.isArray(cur.tags) ? cur.tags : [])
-			: (Array.isArray(req.body.tags) ? req.body.tags.map((x) => String(x).trim().slice(0, 48)).filter(Boolean).slice(0, 16) : []);
+		const title =
+			req.body?.title === undefined
+				? cur.title
+				: String(req.body.title || "")
+						.trim()
+						.slice(0, 180);
+		const description =
+			req.body?.description === undefined
+				? cur.description
+				: String(req.body.description || "")
+						.trim()
+						.slice(0, 1000);
+		const tags =
+			req.body?.tags === undefined
+				? Array.isArray(cur.tags)
+					? cur.tags
+					: []
+				: Array.isArray(req.body.tags)
+					? req.body.tags
+							.map((x) => String(x).trim().slice(0, 48))
+							.filter(Boolean)
+							.slice(0, 16)
+					: [];
 		const isPublic = req.body?.isPublic === undefined ? cur.is_public : !!req.body.isPublic;
 		let artworkObjectKey = cur.artwork_object_key || null;
 		if (req.body?.artworkObjectKey === null) artworkObjectKey = null;
 		else if (req.body?.artworkObjectKey !== undefined) {
-			artworkObjectKey = assertOwnedObjectKey(req.user.id, String(req.body.artworkObjectKey), { uploadOnly: true });
-			await fs.promises.access(objectPath(artworkObjectKey), fs.constants.R_OK);
+			artworkObjectKey = assertOwnedObjectKey(req.user.id, String(req.body.artworkObjectKey), {
+				uploadOnly: true,
+			});
+			await assertObjectReadable(artworkObjectKey);
 			const meta = await readObjectMetadata(artworkObjectKey);
 			if (meta?.contentType && !String(meta.contentType).toLowerCase().startsWith("image/")) {
 				return res.status(400).json({ error: "playlist_artwork_must_be_image" });
@@ -2062,7 +3010,7 @@ app.patch("/api/world/playlists/:id", requireAuth, async (req, res) => {
 		await pool.query(
 			`UPDATE world_playlists SET title=$3, description=$4, artwork_object_key=$5, tags=$6::jsonb, is_public=$7, updated_at=now()
 			 WHERE id=$1 AND owner_user_id=$2`,
-			[id, req.user.id, title, description, artworkObjectKey, JSON.stringify(tags), isPublic]
+			[id, req.user.id, title, description, artworkObjectKey, JSON.stringify(tags), isPublic],
 		);
 		return res.json({ ok: true });
 	} catch (e) {
@@ -2075,7 +3023,10 @@ app.patch("/api/world/playlists/:id", requireAuth, async (req, res) => {
 
 app.delete("/api/world/playlists/:id", requireAuth, async (req, res) => {
 	try {
-		const deleted = await pool.query(`DELETE FROM world_playlists WHERE id = $1 AND owner_user_id = $2 RETURNING id`, [String(req.params.id || ""), req.user.id]);
+		const deleted = await pool.query(
+			`DELETE FROM world_playlists WHERE id = $1 AND owner_user_id = $2 RETURNING id`,
+			[String(req.params.id || ""), req.user.id],
+		);
 		if (!deleted.rows[0]) return res.status(404).json({ error: "playlist_not_found_or_not_owner" });
 		return res.json({ ok: true });
 	} catch (e) {
@@ -2088,7 +3039,8 @@ app.get("/api/world/playlists/:id", async (req, res) => {
 	try {
 		const user = verifyTokenString(authFromHeader(req));
 		const id = String(req.params.id || "");
-		const meta = await pool.query(`
+		const meta = await pool.query(
+			`
 			SELECT p.*, u.display_name AS owner_display_name,
 			       (SELECT count(*) FROM world_playlist_tracks pt WHERE pt.playlist_id = p.id) AS track_count,
 			       (SELECT count(*) FROM world_saved_playlists sp WHERE sp.playlist_id = p.id) AS save_count,
@@ -2096,10 +3048,13 @@ app.get("/api/world/playlists/:id", async (req, res) => {
 			       EXISTS(SELECT 1 FROM world_saved_playlists sp WHERE sp.playlist_id = p.id AND sp.user_id = $2::uuid) AS is_saved,
 			       COALESCE(p.owner_user_id = $2::uuid, false) AS is_owner
 			FROM world_playlists p JOIN users u ON u.id = p.owner_user_id
-			WHERE p.id = $1 AND (p.is_public = true OR p.owner_user_id = $2::uuid) LIMIT 1`, [id, user?.id || null]);
+			WHERE p.id = $1 AND (p.is_public = true OR p.owner_user_id = $2::uuid) LIMIT 1`,
+			[id, user?.id || null],
+		);
 		if (!meta.rows[0]) return res.status(404).json({ error: "playlist_not_found" });
-		const tracks = await pool.query(`
-			SELECT t.*, r.artist_name, r.title AS album_name, r.release_type, (r.artwork_object_key IS NOT NULL) AS has_artwork,
+		const tracks = await pool.query(
+			`
+			SELECT t.*, r.release_date::text AS release_date, r.record_label, r.artwork_object_key, r.artist_name, r.title AS album_name, r.release_type, (r.artwork_object_key IS NOT NULL) AS has_artwork,
 			       COALESCE(t.owner_user_id = $2::uuid, false) AS is_owner,
 			       (SELECT count(*) FROM world_track_reactions x WHERE x.track_id=t.id AND x.reaction=1) AS likes,
 			       (SELECT count(*) FROM world_track_reactions x WHERE x.track_id=t.id AND x.reaction=-1) AS dislikes,
@@ -2109,7 +3064,9 @@ app.get("/api/world/playlists/:id", async (req, res) => {
 			       EXISTS(SELECT 1 FROM world_followed_artists f WHERE f.user_id=$2::uuid AND f.artist_owner_user_id=t.owner_user_id AND f.artist_name=r.artist_name) AS is_artist_followed,
 			       (SELECT count(*) FROM world_track_comments c WHERE c.track_id=t.id AND c.is_deleted=false) AS comment_count
 			FROM world_playlist_tracks pt JOIN world_tracks t ON t.id=pt.track_id JOIN world_releases r ON r.id=t.release_id
-			WHERE pt.playlist_id=$1 AND t.status='published' ORDER BY pt.position, pt.created_at`, [id, user?.id || null]);
+			WHERE pt.playlist_id=$1 AND t.status='published' ORDER BY pt.position, pt.created_at`,
+			[id, user?.id || null],
+		);
 		return res.json({ playlist: playlistRow(meta.rows[0]), tracks: tracks.rows.map(worldRow) });
 	} catch (e) {
 		console.error("GET /api/world/playlists/:id ERROR", e);
@@ -2120,16 +3077,30 @@ app.get("/api/world/playlists/:id", async (req, res) => {
 app.post("/api/world/playlists/:id/save", requireAuth, async (req, res) => {
 	try {
 		const id = String(req.params.id || "");
-		const found = await pool.query(`SELECT id, owner_user_id, title FROM world_playlists WHERE id=$1 AND (is_public=true OR owner_user_id=$2) LIMIT 1`, [id, req.user.id]);
+		const found = await pool.query(
+			`SELECT id, owner_user_id, title FROM world_playlists WHERE id=$1 AND (is_public=true OR owner_user_id=$2) LIMIT 1`,
+			[id, req.user.id],
+		);
 		if (!found.rows[0]) return res.status(404).json({ error: "playlist_not_found" });
-		const removed = await pool.query(`DELETE FROM world_saved_playlists WHERE user_id=$1 AND playlist_id=$2 RETURNING playlist_id`, [req.user.id, id]);
+		const removed = await pool.query(
+			`DELETE FROM world_saved_playlists WHERE user_id=$1 AND playlist_id=$2 RETURNING playlist_id`,
+			[req.user.id, id],
+		);
 		let saved = false;
 		if (!removed.rows[0]) {
-			await pool.query(`INSERT INTO world_saved_playlists (user_id, playlist_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [req.user.id, id]);
+			await pool.query(
+				`INSERT INTO world_saved_playlists (user_id, playlist_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+				[req.user.id, id],
+			);
 			saved = true;
 			await createNotification(found.rows[0].owner_user_id, {
-				actorUserId: req.user.id, kind: "playlist_save", entityType: "playlist", entityId: id,
-				title: `${await publicNameForUserId(req.user.id)} saved your playlist`, body: found.rows[0].title, href: "/app",
+				actorUserId: req.user.id,
+				kind: "playlist_save",
+				entityType: "playlist",
+				entityId: id,
+				title: `${await publicNameForUserId(req.user.id)} saved your playlist`,
+				body: found.rows[0].title,
+				href: "/app",
 			});
 		}
 		return res.json({ ok: true, saved });
@@ -2143,17 +3114,34 @@ app.post("/api/world/playlists/:id/tracks", requireAuth, async (req, res) => {
 	try {
 		const playlistId = String(req.params.id || "");
 		const trackId = String(req.body?.trackId || "");
-		const playlist = await pool.query(`SELECT id, title FROM world_playlists WHERE id=$1 AND owner_user_id=$2 LIMIT 1`, [playlistId, req.user.id]);
+		const playlist = await pool.query(
+			`SELECT id, title FROM world_playlists WHERE id=$1 AND owner_user_id=$2 LIMIT 1`,
+			[playlistId, req.user.id],
+		);
 		if (!playlist.rows[0]) return res.status(404).json({ error: "playlist_not_found_or_not_owner" });
-		const track = await pool.query(`SELECT id, owner_user_id, title FROM world_tracks WHERE id=$1 AND status='published' LIMIT 1`, [trackId]);
+		const track = await pool.query(
+			`SELECT id, owner_user_id, title FROM world_tracks WHERE id=$1 AND status='published' LIMIT 1`,
+			[trackId],
+		);
 		if (!track.rows[0]) return res.status(404).json({ error: "track_not_found" });
-		const pos = await pool.query(`SELECT COALESCE(max(position), -1) + 1 AS next FROM world_playlist_tracks WHERE playlist_id=$1`, [playlistId]);
-		const inserted = await pool.query(`INSERT INTO world_playlist_tracks (playlist_id, track_id, added_by_user_id, position) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING track_id`, [playlistId, trackId, req.user.id, Number(pos.rows[0]?.next || 0)]);
+		const pos = await pool.query(
+			`SELECT COALESCE(max(position), -1) + 1 AS next FROM world_playlist_tracks WHERE playlist_id=$1`,
+			[playlistId],
+		);
+		const inserted = await pool.query(
+			`INSERT INTO world_playlist_tracks (playlist_id, track_id, added_by_user_id, position) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING track_id`,
+			[playlistId, trackId, req.user.id, Number(pos.rows[0]?.next || 0)],
+		);
 		if (inserted.rows[0]) {
 			await pool.query(`UPDATE world_playlists SET updated_at=now() WHERE id=$1`, [playlistId]);
 			await createNotification(track.rows[0].owner_user_id, {
-				actorUserId: req.user.id, kind: "track_playlisted", entityType: "track", entityId: trackId,
-				title: `${await publicNameForUserId(req.user.id)} added your song to a playlist`, body: `${track.rows[0].title} → ${playlist.rows[0].title}`, href: "/app",
+				actorUserId: req.user.id,
+				kind: "track_playlisted",
+				entityType: "track",
+				entityId: trackId,
+				title: `${await publicNameForUserId(req.user.id)} added your song to a playlist`,
+				body: `${track.rows[0].title} → ${playlist.rows[0].title}`,
+				href: "/app",
 			});
 			await syncAchievementsForUser(track.rows[0].owner_user_id).catch(() => {});
 		}
@@ -2167,9 +3155,15 @@ app.post("/api/world/playlists/:id/tracks", requireAuth, async (req, res) => {
 app.delete("/api/world/playlists/:id/tracks/:trackId", requireAuth, async (req, res) => {
 	try {
 		const playlistId = String(req.params.id || "");
-		const own = await pool.query(`SELECT 1 FROM world_playlists WHERE id=$1 AND owner_user_id=$2`, [playlistId, req.user.id]);
+		const own = await pool.query(`SELECT 1 FROM world_playlists WHERE id=$1 AND owner_user_id=$2`, [
+			playlistId,
+			req.user.id,
+		]);
 		if (!own.rows[0]) return res.status(404).json({ error: "playlist_not_found_or_not_owner" });
-		await pool.query(`DELETE FROM world_playlist_tracks WHERE playlist_id=$1 AND track_id=$2`, [playlistId, String(req.params.trackId || "")]);
+		await pool.query(`DELETE FROM world_playlist_tracks WHERE playlist_id=$1 AND track_id=$2`, [
+			playlistId,
+			String(req.params.trackId || ""),
+		]);
 		return res.json({ ok: true });
 	} catch (e) {
 		console.error("DELETE playlist track ERROR", e);
@@ -2182,10 +3176,18 @@ app.post("/api/world/playlists/:id/reorder", requireAuth, async (req, res) => {
 	try {
 		const playlistId = String(req.params.id || "");
 		const trackIds = Array.isArray(req.body?.trackIds) ? req.body.trackIds.map(String).slice(0, 500) : [];
-		const own = await client.query(`SELECT 1 FROM world_playlists WHERE id=$1 AND owner_user_id=$2`, [playlistId, req.user.id]);
+		const own = await client.query(`SELECT 1 FROM world_playlists WHERE id=$1 AND owner_user_id=$2`, [
+			playlistId,
+			req.user.id,
+		]);
 		if (!own.rows[0]) return res.status(404).json({ error: "playlist_not_found_or_not_owner" });
 		await client.query("BEGIN");
-		for (let i = 0; i < trackIds.length; i++) await client.query(`UPDATE world_playlist_tracks SET position=$3 WHERE playlist_id=$1 AND track_id=$2`, [playlistId, trackIds[i], i]);
+		for (let i = 0; i < trackIds.length; i++)
+			await client.query(`UPDATE world_playlist_tracks SET position=$3 WHERE playlist_id=$1 AND track_id=$2`, [
+				playlistId,
+				trackIds[i],
+				i,
+			]);
 		await client.query(`UPDATE world_playlists SET updated_at=now() WHERE id=$1`, [playlistId]);
 		await client.query("COMMIT");
 		return res.json({ ok: true });
@@ -2193,15 +3195,27 @@ app.post("/api/world/playlists/:id/reorder", requireAuth, async (req, res) => {
 		await client.query("ROLLBACK").catch(() => {});
 		console.error("POST playlist reorder ERROR", e);
 		return res.status(500).json({ error: "playlist_reorder_failed" });
-	} finally { client.release(); }
+	} finally {
+		client.release();
+	}
 });
 
 function commentRow(row, viewerId) {
 	return {
-		id: String(row.id), trackId: String(row.track_id), parentId: row.parent_comment_id ? String(row.parent_comment_id) : null,
-		userId: String(row.user_id), authorName: publicNameFromRow(row, "user_id", "display_name"), body: row.is_deleted ? "Comment deleted" : row.body,
-		isDeleted: !!row.is_deleted, isPinned: !!row.is_pinned, likes: Number(row.likes || 0), likedByMe: !!row.liked_by_me,
-		isMine: !!viewerId && String(viewerId) === String(row.user_id), canModerate: !!row.can_moderate, createdAt: row.created_at, updatedAt: row.updated_at,
+		id: String(row.id),
+		trackId: String(row.track_id),
+		parentId: row.parent_comment_id ? String(row.parent_comment_id) : null,
+		userId: String(row.user_id),
+		authorName: publicNameFromRow(row, "user_id", "display_name"),
+		body: row.is_deleted ? "Comment deleted" : row.body,
+		isDeleted: !!row.is_deleted,
+		isPinned: !!row.is_pinned,
+		likes: Number(row.likes || 0),
+		likedByMe: !!row.liked_by_me,
+		isMine: !!viewerId && String(viewerId) === String(row.user_id),
+		canModerate: !!row.can_moderate,
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
 	};
 }
 
@@ -2209,13 +3223,16 @@ app.get("/api/world/tracks/:id/comments", async (req, res) => {
 	try {
 		const user = verifyTokenString(authFromHeader(req));
 		const trackId = String(req.params.id || "");
-		const { rows } = await pool.query(`
+		const { rows } = await pool.query(
+			`
 			SELECT c.*, u.display_name,
 			       (SELECT count(*) FROM world_comment_likes l WHERE l.comment_id=c.id) AS likes,
 			       EXISTS(SELECT 1 FROM world_comment_likes l WHERE l.comment_id=c.id AND l.user_id=$2::uuid) AS liked_by_me,
 			       EXISTS(SELECT 1 FROM world_tracks t WHERE t.id=c.track_id AND t.owner_user_id=$2::uuid) AS can_moderate
 			FROM world_track_comments c JOIN users u ON u.id=c.user_id WHERE c.track_id=$1
-			ORDER BY c.is_pinned DESC, c.created_at ASC LIMIT 300`, [trackId, user?.id || null]);
+			ORDER BY c.is_pinned DESC, c.created_at ASC LIMIT 300`,
+			[trackId, user?.id || null],
+		);
 		return res.json({ comments: rows.map((r) => commentRow(r, user?.id)) });
 	} catch (e) {
 		console.error("GET track comments ERROR", e);
@@ -2226,34 +3243,61 @@ app.get("/api/world/tracks/:id/comments", async (req, res) => {
 app.post("/api/world/tracks/:id/comments", requireAuth, async (req, res) => {
 	try {
 		const trackId = String(req.params.id || "");
-		const body = String(req.body?.body || "").trim().slice(0, 2000);
+		const body = String(req.body?.body || "")
+			.trim()
+			.slice(0, 2000);
 		const parentId = req.body?.parentId ? String(req.body.parentId) : null;
 		if (!body) return res.status(400).json({ error: "comment_required" });
-		const tooFast = await pool.query(`SELECT 1 FROM world_track_comments WHERE user_id=$1 AND created_at > now() - interval '3 seconds' LIMIT 1`, [req.user.id]);
+		const tooFast = await pool.query(
+			`SELECT 1 FROM world_track_comments WHERE user_id=$1 AND created_at > now() - interval '3 seconds' LIMIT 1`,
+			[req.user.id],
+		);
 		if (tooFast.rows[0]) return res.status(429).json({ error: "comment_rate_limited" });
-		const track = await pool.query(`SELECT t.id, t.title, t.owner_user_id FROM world_tracks t WHERE t.id=$1 AND t.status='published' LIMIT 1`, [trackId]);
+		const track = await pool.query(
+			`SELECT t.id, t.title, t.owner_user_id FROM world_tracks t WHERE t.id=$1 AND t.status='published' LIMIT 1`,
+			[trackId],
+		);
 		if (!track.rows[0]) return res.status(404).json({ error: "track_not_found" });
 		let parent = null;
 		if (parentId) {
-			const p = await pool.query(`SELECT id, user_id FROM world_track_comments WHERE id=$1 AND track_id=$2 LIMIT 1`, [parentId, trackId]);
+			const p = await pool.query(
+				`SELECT id, user_id FROM world_track_comments WHERE id=$1 AND track_id=$2 LIMIT 1`,
+				[parentId, trackId],
+			);
 			if (!p.rows[0]) return res.status(400).json({ error: "invalid_parent_comment" });
 			parent = p.rows[0];
 		}
 		const id = crypto.randomUUID();
-		await pool.query(`INSERT INTO world_track_comments (id, track_id, user_id, parent_comment_id, body) VALUES ($1,$2,$3,$4,$5)`, [id, trackId, req.user.id, parentId, body]);
+		await pool.query(
+			`INSERT INTO world_track_comments (id, track_id, user_id, parent_comment_id, body) VALUES ($1,$2,$3,$4,$5)`,
+			[id, trackId, req.user.id, parentId, body],
+		);
 		const actor = await publicNameForUserId(req.user.id);
 		await createNotification(track.rows[0].owner_user_id, {
-			actorUserId: req.user.id, kind: parent ? "comment_reply" : "track_comment", entityType: "track", entityId: trackId,
-			title: `${actor} commented on your song`, body: body.slice(0, 180), href: "/app",
+			actorUserId: req.user.id,
+			kind: parent ? "comment_reply" : "track_comment",
+			entityType: "track",
+			entityId: trackId,
+			title: `${actor} commented on your song`,
+			body: body.slice(0, 180),
+			href: "/app",
 		});
 		if (parent && String(parent.user_id) !== String(track.rows[0].owner_user_id)) {
 			await createNotification(parent.user_id, {
-				actorUserId: req.user.id, kind: "comment_reply", entityType: "track", entityId: trackId,
-				title: `${actor} replied to your comment`, body: body.slice(0, 180), href: "/app",
+				actorUserId: req.user.id,
+				kind: "comment_reply",
+				entityType: "track",
+				entityId: trackId,
+				title: `${actor} replied to your comment`,
+				body: body.slice(0, 180),
+				href: "/app",
 			});
 		}
 		await syncAchievementsForUser(req.user.id).catch(() => {});
-		const row = await pool.query(`SELECT c.*, u.display_name, 0::bigint AS likes, false AS liked_by_me, EXISTS(SELECT 1 FROM world_tracks t WHERE t.id=c.track_id AND t.owner_user_id=$2) AS can_moderate FROM world_track_comments c JOIN users u ON u.id=c.user_id WHERE c.id=$1`, [id, req.user.id]);
+		const row = await pool.query(
+			`SELECT c.*, u.display_name, 0::bigint AS likes, false AS liked_by_me, EXISTS(SELECT 1 FROM world_tracks t WHERE t.id=c.track_id AND t.owner_user_id=$2) AS can_moderate FROM world_track_comments c JOIN users u ON u.id=c.user_id WHERE c.id=$1`,
+			[id, req.user.id],
+		);
 		return res.status(201).json({ ok: true, comment: commentRow(row.rows[0], req.user.id) });
 	} catch (e) {
 		console.error("POST track comment ERROR", e);
@@ -2264,62 +3308,111 @@ app.post("/api/world/tracks/:id/comments", requireAuth, async (req, res) => {
 app.post("/api/world/comments/:id/like", requireAuth, async (req, res) => {
 	try {
 		const id = String(req.params.id || "");
-		const comment = await pool.query(`SELECT c.id, c.user_id, c.track_id, c.body FROM world_track_comments c WHERE c.id=$1 LIMIT 1`, [id]);
+		const comment = await pool.query(
+			`SELECT c.id, c.user_id, c.track_id, c.body FROM world_track_comments c WHERE c.id=$1 LIMIT 1`,
+			[id],
+		);
 		if (!comment.rows[0]) return res.status(404).json({ error: "comment_not_found" });
-		const removed = await pool.query(`DELETE FROM world_comment_likes WHERE comment_id=$1 AND user_id=$2 RETURNING comment_id`, [id, req.user.id]);
+		const removed = await pool.query(
+			`DELETE FROM world_comment_likes WHERE comment_id=$1 AND user_id=$2 RETURNING comment_id`,
+			[id, req.user.id],
+		);
 		let liked = false;
 		if (!removed.rows[0]) {
-			await pool.query(`INSERT INTO world_comment_likes (comment_id,user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [id, req.user.id]);
+			await pool.query(
+				`INSERT INTO world_comment_likes (comment_id,user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+				[id, req.user.id],
+			);
 			liked = true;
 			await createNotification(comment.rows[0].user_id, {
-				actorUserId: req.user.id, kind: "comment_like", entityType: "track", entityId: String(comment.rows[0].track_id),
-				title: `${await publicNameForUserId(req.user.id)} liked your comment`, body: String(comment.rows[0].body || "").slice(0,180), href: "/app",
+				actorUserId: req.user.id,
+				kind: "comment_like",
+				entityType: "track",
+				entityId: String(comment.rows[0].track_id),
+				title: `${await publicNameForUserId(req.user.id)} liked your comment`,
+				body: String(comment.rows[0].body || "").slice(0, 180),
+				href: "/app",
 			});
 		}
 		const count = await pool.query(`SELECT count(*) FROM world_comment_likes WHERE comment_id=$1`, [id]);
 		return res.json({ ok: true, liked, likes: Number(count.rows[0]?.count || 0) });
-	} catch (e) { console.error("POST comment like ERROR", e); return res.status(500).json({ error: "comment_like_failed" }); }
+	} catch (e) {
+		console.error("POST comment like ERROR", e);
+		return res.status(500).json({ error: "comment_like_failed" });
+	}
 });
 
 app.post("/api/world/comments/:id/pin", requireAuth, async (req, res) => {
 	try {
 		const id = String(req.params.id || "");
-		const found = await pool.query(`SELECT c.id,c.track_id,c.is_pinned FROM world_track_comments c JOIN world_tracks t ON t.id=c.track_id WHERE c.id=$1 AND t.owner_user_id=$2 LIMIT 1`, [id, req.user.id]);
+		const found = await pool.query(
+			`SELECT c.id,c.track_id,c.is_pinned FROM world_track_comments c JOIN world_tracks t ON t.id=c.track_id WHERE c.id=$1 AND t.owner_user_id=$2 LIMIT 1`,
+			[id, req.user.id],
+		);
 		if (!found.rows[0]) return res.status(404).json({ error: "comment_not_found_or_not_moderator" });
 		const next = !found.rows[0].is_pinned;
-		if (next) await pool.query(`UPDATE world_track_comments SET is_pinned=false WHERE track_id=$1`, [found.rows[0].track_id]);
+		if (next)
+			await pool.query(`UPDATE world_track_comments SET is_pinned=false WHERE track_id=$1`, [
+				found.rows[0].track_id,
+			]);
 		await pool.query(`UPDATE world_track_comments SET is_pinned=$2, updated_at=now() WHERE id=$1`, [id, next]);
 		return res.json({ ok: true, pinned: next });
-	} catch (e) { console.error("POST comment pin ERROR", e); return res.status(500).json({ error: "comment_pin_failed" }); }
+	} catch (e) {
+		console.error("POST comment pin ERROR", e);
+		return res.status(500).json({ error: "comment_pin_failed" });
+	}
 });
 
 app.post("/api/world/comments/:id/report", requireAuth, async (req, res) => {
 	try {
 		const id = String(req.params.id || "");
-		const reason = String(req.body?.reason || "reported").trim().slice(0, 500) || "reported";
+		const reason =
+			String(req.body?.reason || "reported")
+				.trim()
+				.slice(0, 500) || "reported";
 		const found = await pool.query(`SELECT 1 FROM world_track_comments WHERE id=$1 LIMIT 1`, [id]);
-		if (!found.rows[0]) return res.status(404).json({ error:"comment_not_found" });
-		await pool.query(`INSERT INTO world_comment_reports (comment_id,user_id,reason) VALUES ($1,$2,$3) ON CONFLICT (comment_id,user_id) DO UPDATE SET reason=$3,created_at=now()`, [id, req.user.id, reason]);
-		return res.json({ ok:true });
-	} catch (e) { console.error("POST comment report ERROR", e); return res.status(500).json({ error:"comment_report_failed" }); }
+		if (!found.rows[0]) return res.status(404).json({ error: "comment_not_found" });
+		await pool.query(
+			`INSERT INTO world_comment_reports (comment_id,user_id,reason) VALUES ($1,$2,$3) ON CONFLICT (comment_id,user_id) DO UPDATE SET reason=$3,created_at=now()`,
+			[id, req.user.id, reason],
+		);
+		return res.json({ ok: true });
+	} catch (e) {
+		console.error("POST comment report ERROR", e);
+		return res.status(500).json({ error: "comment_report_failed" });
+	}
 });
 
 app.delete("/api/world/comments/:id", requireAuth, async (req, res) => {
 	try {
 		const id = String(req.params.id || "");
-		const found = await pool.query(`SELECT c.id,c.user_id,c.track_id,t.owner_user_id FROM world_track_comments c JOIN world_tracks t ON t.id=c.track_id WHERE c.id=$1 LIMIT 1`, [id]);
+		const found = await pool.query(
+			`SELECT c.id,c.user_id,c.track_id,t.owner_user_id FROM world_track_comments c JOIN world_tracks t ON t.id=c.track_id WHERE c.id=$1 LIMIT 1`,
+			[id],
+		);
 		if (!found.rows[0]) return res.status(404).json({ error: "comment_not_found" });
-		if (String(found.rows[0].user_id) !== String(req.user.id) && String(found.rows[0].owner_user_id) !== String(req.user.id)) return res.status(403).json({ error: "forbidden" });
-		await pool.query(`UPDATE world_track_comments SET body='', is_deleted=true, is_pinned=false, updated_at=now() WHERE id=$1`, [id]);
+		if (
+			String(found.rows[0].user_id) !== String(req.user.id) &&
+			String(found.rows[0].owner_user_id) !== String(req.user.id)
+		)
+			return res.status(403).json({ error: "forbidden" });
+		await pool.query(
+			`UPDATE world_track_comments SET body='', is_deleted=true, is_pinned=false, updated_at=now() WHERE id=$1`,
+			[id],
+		);
 		return res.json({ ok: true });
-	} catch (e) { console.error("DELETE comment ERROR", e); return res.status(500).json({ error: "comment_delete_failed" }); }
+	} catch (e) {
+		console.error("DELETE comment ERROR", e);
+		return res.status(500).json({ error: "comment_delete_failed" });
+	}
 });
 
 app.get("/api/library", requireAuth, async (req, res) => {
 	try {
 		const uid = req.user.id;
-		const savedTracks = await pool.query(`
-			SELECT t.*, r.artist_name, r.title AS album_name, r.release_type, (r.artwork_object_key IS NOT NULL) AS has_artwork,
+		const savedTracks = await pool.query(
+			`
+			SELECT t.*, r.release_date::text AS release_date, r.record_label, r.artwork_object_key, r.artist_name, r.title AS album_name, r.release_type, (r.artwork_object_key IS NOT NULL) AS has_artwork,
 			       COALESCE(t.owner_user_id=$1::uuid,false) AS is_owner,
 			       (SELECT count(*) FROM world_track_reactions x WHERE x.track_id=t.id AND x.reaction=1) AS likes,
 			       (SELECT count(*) FROM world_track_reactions x WHERE x.track_id=t.id AND x.reaction=-1) AS dislikes,
@@ -2329,71 +3422,169 @@ app.get("/api/library", requireAuth, async (req, res) => {
 			       EXISTS(SELECT 1 FROM world_followed_artists f WHERE f.user_id=$1::uuid AND f.artist_owner_user_id=t.owner_user_id AND f.artist_name=r.artist_name) AS is_artist_followed,
 			       (SELECT count(*) FROM world_track_comments c WHERE c.track_id=t.id AND c.is_deleted=false) AS comment_count
 			FROM world_saved_tracks s JOIN world_tracks t ON t.id=s.track_id JOIN world_releases r ON r.id=t.release_id
-			WHERE s.user_id=$1 AND t.status='published' ORDER BY s.created_at DESC`, [uid]);
-		const releases = await pool.query(`
-			SELECT r.*, (r.artwork_object_key IS NOT NULL) AS has_artwork,
+			WHERE s.user_id=$1 AND t.status='published' ORDER BY s.created_at DESC`,
+			[uid],
+		);
+		const releases = await pool.query(
+			`
+			SELECT r.*, r.release_date::text AS release_date, (r.artwork_object_key IS NOT NULL) AS has_artwork,
 			       (SELECT t.id FROM world_tracks t WHERE t.release_id=r.id AND t.status='published' ORDER BY t.track_number LIMIT 1) AS cover_track_id,
 			       (SELECT count(*) FROM world_tracks t WHERE t.release_id=r.id AND t.status='published') AS track_count
-			FROM world_saved_releases s JOIN world_releases r ON r.id=s.release_id WHERE s.user_id=$1 ORDER BY s.created_at DESC`, [uid]);
-		const artists = await pool.query(`SELECT artist_owner_user_id, artist_name, created_at FROM world_followed_artists WHERE user_id=$1 ORDER BY created_at DESC`, [uid]);
-		const ownPlaylists = await pool.query(`SELECT p.*, u.display_name AS owner_display_name, (SELECT count(*) FROM world_playlist_tracks pt WHERE pt.playlist_id=p.id) AS track_count, (SELECT count(*) FROM world_saved_playlists sp WHERE sp.playlist_id=p.id) AS save_count, (SELECT pt.track_id FROM world_playlist_tracks pt WHERE pt.playlist_id=p.id ORDER BY pt.position,pt.created_at LIMIT 1) AS cover_track_id, false AS is_saved, true AS is_owner FROM world_playlists p JOIN users u ON u.id=p.owner_user_id WHERE p.owner_user_id=$1 ORDER BY p.updated_at DESC`, [uid]);
-		const savedPlaylists = await pool.query(`SELECT p.*, u.display_name AS owner_display_name, (SELECT count(*) FROM world_playlist_tracks pt WHERE pt.playlist_id=p.id) AS track_count, (SELECT count(*) FROM world_saved_playlists sp2 WHERE sp2.playlist_id=p.id) AS save_count, (SELECT pt.track_id FROM world_playlist_tracks pt WHERE pt.playlist_id=p.id ORDER BY pt.position,pt.created_at LIMIT 1) AS cover_track_id, true AS is_saved, COALESCE(p.owner_user_id=$1,false) AS is_owner FROM world_saved_playlists sp JOIN world_playlists p ON p.id=sp.playlist_id JOIN users u ON u.id=p.owner_user_id WHERE sp.user_id=$1 ORDER BY sp.created_at DESC`, [uid]);
-		const uploads = await pool.query(`SELECT t.*, r.artist_name, r.title AS album_name, r.release_type, (r.artwork_object_key IS NOT NULL) AS has_artwork, true AS is_owner, (SELECT count(*) FROM world_track_reactions x WHERE x.track_id=t.id AND x.reaction=1) AS likes, (SELECT count(*) FROM world_track_reactions x WHERE x.track_id=t.id AND x.reaction=-1) AS dislikes, COALESCE((SELECT x.reaction FROM world_track_reactions x WHERE x.track_id=t.id AND x.user_id=$1),0) AS my_reaction, EXISTS(SELECT 1 FROM world_saved_tracks s WHERE s.track_id=t.id AND s.user_id=$1) AS is_saved, EXISTS(SELECT 1 FROM world_saved_releases s WHERE s.release_id=t.release_id AND s.user_id=$1) AS is_release_saved, EXISTS(SELECT 1 FROM world_followed_artists f WHERE f.user_id=$1 AND f.artist_owner_user_id=t.owner_user_id AND f.artist_name=r.artist_name) AS is_artist_followed, (SELECT count(*) FROM world_track_comments c WHERE c.track_id=t.id AND c.is_deleted=false) AS comment_count FROM world_tracks t JOIN world_releases r ON r.id=t.release_id WHERE t.owner_user_id=$1 AND t.status='published' ORDER BY t.published_at DESC`, [uid]);
+			FROM world_saved_releases s JOIN world_releases r ON r.id=s.release_id WHERE s.user_id=$1 ORDER BY s.created_at DESC`,
+			[uid],
+		);
+		const artists = await pool.query(
+			`SELECT artist_owner_user_id, artist_name, created_at FROM world_followed_artists WHERE user_id=$1 ORDER BY created_at DESC`,
+			[uid],
+		);
+		const ownPlaylists = await pool.query(
+			`SELECT p.*, u.display_name AS owner_display_name, (SELECT count(*) FROM world_playlist_tracks pt WHERE pt.playlist_id=p.id) AS track_count, (SELECT count(*) FROM world_saved_playlists sp WHERE sp.playlist_id=p.id) AS save_count, (SELECT pt.track_id FROM world_playlist_tracks pt WHERE pt.playlist_id=p.id ORDER BY pt.position,pt.created_at LIMIT 1) AS cover_track_id, false AS is_saved, true AS is_owner FROM world_playlists p JOIN users u ON u.id=p.owner_user_id WHERE p.owner_user_id=$1 ORDER BY p.updated_at DESC`,
+			[uid],
+		);
+		const savedPlaylists = await pool.query(
+			`SELECT p.*, u.display_name AS owner_display_name, (SELECT count(*) FROM world_playlist_tracks pt WHERE pt.playlist_id=p.id) AS track_count, (SELECT count(*) FROM world_saved_playlists sp2 WHERE sp2.playlist_id=p.id) AS save_count, (SELECT pt.track_id FROM world_playlist_tracks pt WHERE pt.playlist_id=p.id ORDER BY pt.position,pt.created_at LIMIT 1) AS cover_track_id, true AS is_saved, COALESCE(p.owner_user_id=$1,false) AS is_owner FROM world_saved_playlists sp JOIN world_playlists p ON p.id=sp.playlist_id JOIN users u ON u.id=p.owner_user_id WHERE sp.user_id=$1 ORDER BY sp.created_at DESC`,
+			[uid],
+		);
+		const uploads = await pool.query(
+			`SELECT t.*, r.release_date::text AS release_date, r.record_label, r.artwork_object_key, r.artist_name, r.title AS album_name, r.release_type, (r.artwork_object_key IS NOT NULL) AS has_artwork, true AS is_owner, (SELECT count(*) FROM world_track_reactions x WHERE x.track_id=t.id AND x.reaction=1) AS likes, (SELECT count(*) FROM world_track_reactions x WHERE x.track_id=t.id AND x.reaction=-1) AS dislikes, COALESCE((SELECT x.reaction FROM world_track_reactions x WHERE x.track_id=t.id AND x.user_id=$1),0) AS my_reaction, EXISTS(SELECT 1 FROM world_saved_tracks s WHERE s.track_id=t.id AND s.user_id=$1) AS is_saved, EXISTS(SELECT 1 FROM world_saved_releases s WHERE s.release_id=t.release_id AND s.user_id=$1) AS is_release_saved, EXISTS(SELECT 1 FROM world_followed_artists f WHERE f.user_id=$1 AND f.artist_owner_user_id=t.owner_user_id AND f.artist_name=r.artist_name) AS is_artist_followed, (SELECT count(*) FROM world_track_comments c WHERE c.track_id=t.id AND c.is_deleted=false) AS comment_count FROM world_tracks t JOIN world_releases r ON r.id=t.release_id WHERE t.owner_user_id=$1 AND t.status='published' ORDER BY t.published_at DESC`,
+			[uid],
+		);
 		return res.json({
 			tracks: savedTracks.rows.map(worldRow),
-			releases: releases.rows.map((r) => ({ id:String(r.id), ownerUserId:String(r.owner_user_id), artistId:r.artist_id?String(r.artist_id):"", artistName:r.artist_name, title:r.title, releaseType:r.release_type, genre:r.genre||"Other", publishedAt:r.published_at, hasArtwork:!!r.has_artwork, coverTrackId:r.cover_track_id?String(r.cover_track_id):null, trackCount:Number(r.track_count||0), isSaved:true })),
-			artists: artists.rows.map((r) => ({ ownerUserId:String(r.artist_owner_user_id), artistName:r.artist_name, followedAt:r.created_at })),
-			playlists: ownPlaylists.rows.map(playlistRow), savedPlaylists: savedPlaylists.rows.map(playlistRow), uploads: uploads.rows.map(worldRow),
+			releases: releases.rows.map((r) => ({
+				id: String(r.id),
+				ownerUserId: String(r.owner_user_id),
+				artistId: r.artist_id ? String(r.artist_id) : "",
+				artistName: r.artist_name,
+				title: r.title,
+				releaseType: r.release_type,
+				genre: r.genre || "Other",
+				publishedAt: r.published_at,
+				releaseDate: r.release_date || null,
+				recordLabel: r.record_label || "",
+				hasArtwork: !!r.has_artwork,
+				coverTrackId: r.cover_track_id ? String(r.cover_track_id) : null,
+				trackCount: Number(r.track_count || 0),
+				isSaved: true,
+			})),
+			artists: artists.rows.map((r) => ({
+				ownerUserId: String(r.artist_owner_user_id),
+				artistName: r.artist_name,
+				followedAt: r.created_at,
+			})),
+			playlists: ownPlaylists.rows.map(playlistRow),
+			savedPlaylists: savedPlaylists.rows.map(playlistRow),
+			uploads: uploads.rows.map(worldRow),
 		});
-	} catch (e) { console.error("GET /api/library ERROR", e); return res.status(500).json({ error: "library_load_failed" }); }
+	} catch (e) {
+		console.error("GET /api/library ERROR", e);
+		return res.status(500).json({ error: "library_load_failed" });
+	}
 });
 
 // -------------------- Notifications --------------------
 app.get("/api/notifications", requireAuth, async (req, res) => {
 	try {
 		const limit = Math.max(1, Math.min(100, Number(req.query.limit || 40)));
-		const { rows } = await pool.query(`SELECT id, kind, entity_type, entity_id, title, body, href, created_at, read_at FROM ysong_notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2`, [req.user.id, limit]);
-		const unread = await pool.query(`SELECT count(*) FROM ysong_notifications WHERE user_id=$1 AND read_at IS NULL`, [req.user.id]);
-		return res.json({ notifications: rows.map((r) => ({ id:String(r.id), kind:r.kind, entityType:r.entity_type, entityId:r.entity_id, title:r.title, body:r.body, href:r.href, createdAt:r.created_at, read:!!r.read_at })), unreadCount:Number(unread.rows[0]?.count||0) });
-	} catch (e) { console.error("GET notifications ERROR", e); return res.status(500).json({ error: "notifications_load_failed" }); }
+		const { rows } = await pool.query(
+			`SELECT id, kind, entity_type, entity_id, title, body, href, created_at, read_at FROM ysong_notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2`,
+			[req.user.id, limit],
+		);
+		const unread = await pool.query(
+			`SELECT count(*) FROM ysong_notifications WHERE user_id=$1 AND read_at IS NULL`,
+			[req.user.id],
+		);
+		return res.json({
+			notifications: rows.map((r) => ({
+				id: String(r.id),
+				kind: r.kind,
+				entityType: r.entity_type,
+				entityId: r.entity_id,
+				title: r.title,
+				body: r.body,
+				href: r.href,
+				createdAt: r.created_at,
+				read: !!r.read_at,
+			})),
+			unreadCount: Number(unread.rows[0]?.count || 0),
+		});
+	} catch (e) {
+		console.error("GET notifications ERROR", e);
+		return res.status(500).json({ error: "notifications_load_failed" });
+	}
 });
 
 app.post("/api/notifications/read", requireAuth, async (req, res) => {
 	try {
 		const id = req.body?.id ? String(req.body.id) : null;
-		if (id) await pool.query(`UPDATE ysong_notifications SET read_at=COALESCE(read_at,now()) WHERE id=$1 AND user_id=$2`, [id, req.user.id]);
-		else await pool.query(`UPDATE ysong_notifications SET read_at=COALESCE(read_at,now()) WHERE user_id=$1 AND read_at IS NULL`, [req.user.id]);
-		return res.json({ ok:true });
-	} catch (e) { return res.status(500).json({ error:"notification_read_failed" }); }
+		if (id)
+			await pool.query(
+				`UPDATE ysong_notifications SET read_at=COALESCE(read_at,now()) WHERE id=$1 AND user_id=$2`,
+				[id, req.user.id],
+			);
+		else
+			await pool.query(
+				`UPDATE ysong_notifications SET read_at=COALESCE(read_at,now()) WHERE user_id=$1 AND read_at IS NULL`,
+				[req.user.id],
+			);
+		return res.json({ ok: true });
+	} catch (e) {
+		return res.status(500).json({ error: "notification_read_failed" });
+	}
 });
 
 app.get("/api/notifications/preferences", requireAuth, async (req, res) => {
-	const { rows } = await pool.query(`SELECT email_enabled FROM ysong_notification_preferences WHERE user_id=$1`, [req.user.id]);
+	const { rows } = await pool.query(`SELECT email_enabled FROM ysong_notification_preferences WHERE user_id=$1`, [
+		req.user.id,
+	]);
 	return res.json({ emailEnabled: !!rows[0]?.email_enabled });
 });
 
 app.post("/api/notifications/preferences", requireAuth, async (req, res) => {
 	const emailEnabled = !!req.body?.emailEnabled;
-	await pool.query(`INSERT INTO ysong_notification_preferences (user_id,email_enabled) VALUES ($1,$2) ON CONFLICT (user_id) DO UPDATE SET email_enabled=$2,updated_at=now()`, [req.user.id, emailEnabled]);
-	return res.json({ ok:true, emailEnabled });
+	await pool.query(
+		`INSERT INTO ysong_notification_preferences (user_id,email_enabled) VALUES ($1,$2) ON CONFLICT (user_id) DO UPDATE SET email_enabled=$2,updated_at=now()`,
+		[req.user.id, emailEnabled],
+	);
+	return res.json({ ok: true, emailEnabled });
 });
 
 // -------------------- Achievements --------------------
 app.get("/api/achievements", requireAuth, async (req, res) => {
 	try {
 		const stats = await getAchievementStats(req.user.id);
-		const unlockedRows = await pool.query(`SELECT achievement_key, unlocked_at FROM user_achievements WHERE user_id=$1`, [req.user.id]);
+		const unlockedRows = await pool.query(
+			`SELECT achievement_key, unlocked_at FROM user_achievements WHERE user_id=$1`,
+			[req.user.id],
+		);
 		const unlocked = new Map(unlockedRows.rows.map((r) => [r.achievement_key, r.unlocked_at]));
 		const achievements = ACHIEVEMENT_DEFINITIONS.map((def) => {
 			const raw = Number(stats[def.metric] || 0);
-			return { ...def, progress: Math.min(raw, def.target), rawProgress: raw, unlocked: unlocked.has(def.key), unlockedAt: unlocked.get(def.key) || null };
+			return {
+				...def,
+				progress: Math.min(raw, def.target),
+				rawProgress: raw,
+				unlocked: unlocked.has(def.key),
+				unlockedAt: unlocked.get(def.key) || null,
+			};
 		});
-		const points = achievements.filter((a) => a.unlocked).reduce((sum,a) => sum + a.points, 0);
-		return res.json({ achievements, points, unlockedCount: achievements.filter((a)=>a.unlocked).length, totalCount: achievements.length, stats });
-	} catch (e) { console.error("GET achievements ERROR", e); return res.status(500).json({ error:"achievements_load_failed" }); }
+		const points = achievements.filter((a) => a.unlocked).reduce((sum, a) => sum + a.points, 0);
+		return res.json({
+			achievements,
+			points,
+			unlockedCount: achievements.filter((a) => a.unlocked).length,
+			totalCount: achievements.length,
+			stats,
+		});
+	} catch (e) {
+		console.error("GET achievements ERROR", e);
+		return res.status(500).json({ error: "achievements_load_failed" });
+	}
 });
 
 async function streamWorldObject(req, res, objectKey, { cache = "public, max-age=3600" } = {}) {
+    if(saasEnabled()&&cache.startsWith('public')){await governance.assertPublic(objectKey);cache='private, no-store';}
+	if (USE_R2) return streamR2Object(req, res, objectKey, { cache });
 	const filePath = objectPath(objectKey);
 	const stat = await fs.promises.stat(filePath);
 	if (!stat.isFile()) return res.status(404).end();
@@ -2431,13 +3622,14 @@ app.get("/api/world/playlists/:id/artwork", async (req, res) => {
 		const user = verifyTokenString(authFromHeader(req));
 		const { rows } = await pool.query(
 			`SELECT artwork_object_key, is_public, owner_user_id FROM world_playlists WHERE id=$1 LIMIT 1`,
-			[String(req.params.id || "")]
+			[String(req.params.id || "")],
 		);
 		const playlist = rows[0];
 		if (!playlist) return res.status(404).end();
-		if (!playlist.is_public && (!user?.id || String(user.id) !== String(playlist.owner_user_id))) return res.status(404).end();
+		if (!playlist.is_public && (!user?.id || String(user.id) !== String(playlist.owner_user_id)))
+			return res.status(404).end();
 		if (!playlist.artwork_object_key) return res.status(404).end();
-		return streamWorldObject(req, res, playlist.artwork_object_key, { cache: "private, max-age=3600" });
+		return await streamWorldObject(req, res, playlist.artwork_object_key, { cache: "private, max-age=3600" });
 	} catch (e) {
 		if (e?.code === "ENOENT") return res.status(404).end();
 		console.error("GET playlist artwork ERROR", e);
@@ -2453,19 +3645,21 @@ app.get("/api/world/media/:trackId/:kind", async (req, res) => {
 			`SELECT t.audio_object_key, r.artwork_object_key
 			 FROM world_tracks t JOIN world_releases r ON r.id = t.release_id
 			 WHERE t.id = $1 AND t.status = 'published' LIMIT 1`,
-			[String(req.params.trackId || "")]
+			[String(req.params.trackId || "")],
 		);
 		if (!rows[0]) return res.status(404).end();
 		const objectKey = kind === "audio" ? rows[0].audio_object_key : rows[0].artwork_object_key;
+        if(saasEnabled()){await governance.assertPublic(rows[0].audio_object_key);if(rows[0].artwork_object_key)await governance.assertPublic(rows[0].artwork_object_key);}
 		if (!objectKey) return res.status(404).end();
-		return streamWorldObject(req, res, objectKey, { cache: kind === "cover" ? "public, max-age=86400" : "public, max-age=3600" });
+		return await streamWorldObject(req, res, objectKey, {
+			cache: kind === "cover" ? "public, max-age=86400" : "public, max-age=3600",
+		});
 	} catch (e) {
 		if (e?.code === "ENOENT") return res.status(404).end();
 		console.error("GET /api/world/media ERROR", e);
 		return res.status(500).end();
 	}
 });
-
 
 // -------------------- MiniMax Music 3 generation provider --------------------
 // MiniMax is a replaceable generation provider, not YSong's permanent model identity.
@@ -2481,11 +3675,17 @@ function miniMaxMusicModel() {
 
 function defaultAudioCppPaths() {
 	const root = String(process.env.MINIMAX_AUDIOCPP_ROOT || (process.platform === "win32" ? "C:\\YSong" : ""));
-	const cudaExe = root ? path.join(root, "audio.cpp-main", "build", "windows-cuda-release", "bin", "audiocpp_cli.exe") : "";
-	const cpuExe = root ? path.join(root, "audio.cpp-main", "build", "windows-cpu-release", "bin", "audiocpp_cli.exe") : "";
+	const cudaExe = root
+		? path.join(root, "audio.cpp-main", "build", "windows-cuda-release", "bin", "audiocpp_cli.exe")
+		: "";
+	const cpuExe = root
+		? path.join(root, "audio.cpp-main", "build", "windows-cpu-release", "bin", "audiocpp_cli.exe")
+		: "";
 	const explicitExe = String(process.env.MINIMAX_AUDIOCPP_EXE || "").trim();
 	const exe = explicitExe || (cudaExe && fs.existsSync(cudaExe) ? cudaExe : cpuExe);
-	const modelDir = String(process.env.MINIMAX_AUDIOCPP_MODEL_DIR || (root ? path.join(root, "MiniMax-Music3-GGUF") : "")).trim();
+	const modelDir = String(
+		process.env.MINIMAX_AUDIOCPP_MODEL_DIR || (root ? path.join(root, "MiniMax-Music3-GGUF") : ""),
+	).trim();
 	const inferredBackend = exe && /windows-cuda-release/i.test(exe) ? "cuda" : "cpu";
 	return {
 		exe,
@@ -2497,11 +3697,16 @@ function defaultAudioCppPaths() {
 }
 
 function miniMaxProvider() {
-	const requested = String(process.env.MINIMAX_MUSIC_PROVIDER || "auto").trim().toLowerCase();
+	const requested = String(process.env.MINIMAX_MUSIC_PROVIDER || "auto")
+		.trim()
+		.toLowerCase();
 	if (requested === "http" || requested === "server") return "http";
+	if (requested === "cloudflare" || requested === "cf") return "cloudflare";
 	if (requested === "audio_cpp" || requested === "audiocpp") return "audio_cpp";
 	const local = defaultAudioCppPaths();
-	return local.exe && local.modelDir && fs.existsSync(local.exe) && fs.existsSync(local.modelDir) ? "audio_cpp" : "http";
+	return local.exe && local.modelDir && fs.existsSync(local.exe) && fs.existsSync(local.modelDir)
+		? "audio_cpp"
+		: "http";
 }
 
 function runCapturedProcess(exe, args, { timeoutMs = 10_000 } = {}) {
@@ -2512,14 +3717,26 @@ function runCapturedProcess(exe, args, { timeoutMs = 10_000 } = {}) {
 		const child = spawn(exe, args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
 		const timer = setTimeout(() => {
 			timedOut = true;
-			try { child.kill(); } catch {}
+			try {
+				child.kill();
+			} catch {}
 		}, timeoutMs);
-		child.stdout.on("data", (chunk) => { stdout += String(chunk); if (stdout.length > 2_000_000) stdout = stdout.slice(-2_000_000); });
-		child.stderr.on("data", (chunk) => { stderr += String(chunk); if (stderr.length > 2_000_000) stderr = stderr.slice(-2_000_000); });
-		child.on("error", (error) => { clearTimeout(timer); reject(error); });
+		child.stdout.on("data", (chunk) => {
+			stdout += String(chunk);
+			if (stdout.length > 2_000_000) stdout = stdout.slice(-2_000_000);
+		});
+		child.stderr.on("data", (chunk) => {
+			stderr += String(chunk);
+			if (stderr.length > 2_000_000) stderr = stderr.slice(-2_000_000);
+		});
+		child.on("error", (error) => {
+			clearTimeout(timer);
+			reject(error);
+		});
 		child.on("close", (code) => {
 			clearTimeout(timer);
-			if (timedOut) return reject(Object.assign(new Error("process_timeout"), { code: "PROCESS_TIMEOUT", stdout, stderr }));
+			if (timedOut)
+				return reject(Object.assign(new Error("process_timeout"), { code: "PROCESS_TIMEOUT", stdout, stderr }));
 			resolve({ code: Number(code ?? -1), stdout, stderr });
 		});
 	});
@@ -2527,15 +3744,28 @@ function runCapturedProcess(exe, args, { timeoutMs = 10_000 } = {}) {
 
 async function probeAudioCpp(timeoutMs = 8000) {
 	const local = defaultAudioCppPaths();
-	if (!local.exe || !fs.existsSync(local.exe)) return { reachable: false, message: `audio.cpp executable not found: ${local.exe || "not configured"}` };
-	if (!local.modelDir || !fs.existsSync(local.modelDir)) return { reachable: false, message: `MiniMax GGUF model directory not found: ${local.modelDir || "not configured"}` };
+	if (!local.exe || !fs.existsSync(local.exe))
+		return { reachable: false, message: `audio.cpp executable not found: ${local.exe || "not configured"}` };
+	if (!local.modelDir || !fs.existsSync(local.modelDir))
+		return {
+			reachable: false,
+			message: `MiniMax GGUF model directory not found: ${local.modelDir || "not configured"}`,
+		};
 	try {
 		const result = await runCapturedProcess(local.exe, ["--list-loaders", "--json"], { timeoutMs });
-		if (result.code !== 0) return { reachable: false, message: (result.stderr || result.stdout || `audio.cpp exited ${result.code}`).trim().slice(0, 1200) };
+		if (result.code !== 0)
+			return {
+				reachable: false,
+				message: (result.stderr || result.stdout || `audio.cpp exited ${result.code}`).trim().slice(0, 1200),
+			};
 		let parsed;
-		try { parsed = JSON.parse(result.stdout.trim()); } catch {}
+		try {
+			parsed = JSON.parse(result.stdout.trim());
+		} catch {}
 		const hasLoader = Boolean(parsed?.loaders?.minimax_music3) || /minimax_music3/i.test(result.stdout);
-		return hasLoader ? { reachable: true, httpStatus: 200, local } : { reachable: false, message: "This audio.cpp build does not include the MiniMax Music 3 loader." };
+		return hasLoader
+			? { reachable: true, httpStatus: 200, local }
+			: { reachable: false, message: "This audio.cpp build does not include the MiniMax Music 3 loader." };
 	} catch (error) {
 		return { reachable: false, message: String(error?.message || error) };
 	}
@@ -2549,9 +3779,51 @@ async function probeMiniMaxHttp(timeoutMs = 1400) {
 		const response = await fetch(`${baseUrl}/v1/models`, { signal: controller.signal });
 		return { reachable: true, httpStatus: response.status };
 	} catch (error) {
-		return { reachable: false, message: error?.name === "AbortError" ? "MiniMax Music server timed out." : String(error?.message || error) };
+		return {
+			reachable: false,
+			message: error?.name === "AbortError" ? "MiniMax Music server timed out." : String(error?.message || error),
+		};
 	} finally {
 		clearTimeout(timer);
+	}
+}
+
+function cloudflareMusicConfig() {
+	return {
+		accountId: String(process.env.CLOUDFLARE_ACCOUNT_ID || "").trim(),
+		token: String(process.env.CLOUDFLARE_AI_API_TOKEN || "").trim(),
+		model: String(process.env.CLOUDFLARE_MUSIC_MODEL || "").trim() || "minimax/music-2.6",
+	};
+}
+
+async function probeCloudflareMusic() {
+	const config = cloudflareMusicConfig();
+	const missing = [!config.accountId && "CLOUDFLARE_ACCOUNT_ID", !config.token && "CLOUDFLARE_AI_API_TOKEN"].filter(
+		Boolean,
+	);
+	if (missing.length)
+		return { configured: false, reachable: false, message: `Missing server configuration: ${missing.join(", ")}.` };
+	try {
+		const response = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
+			headers: { Authorization: `Bearer ${config.token}` },
+			signal: AbortSignal.timeout(8000),
+		});
+		const data = await response.json();
+		const reachable = response.ok && data.success === true && data.result?.status === "active";
+		return {
+			configured: true,
+			reachable,
+			message: reachable
+				? "Cloudflare token is active. Account/model access has not been tested; status does not generate music."
+				: `Cloudflare token verification failed (HTTP ${response.status}). Check the token's validity and permissions.`,
+		};
+	} catch {
+		return {
+			configured: true,
+			reachable: false,
+			message:
+				"Cloudflare token verification could not complete. Check network connectivity and token configuration.",
+		};
 	}
 }
 
@@ -2559,6 +3831,16 @@ let localMusicGenerationBusy = false;
 
 app.get("/api/music/status", async (_req, res) => {
 	const provider = miniMaxProvider();
+	if (provider === "cloudflare") {
+		const probe = await probeCloudflareMusic();
+		return res.json({
+			...probe,
+			provider,
+			model: cloudflareMusicConfig().model,
+			baseUrl: "https://api.cloudflare.com/client/v4",
+			busy: false,
+		});
+	}
 	if (provider === "audio_cpp") {
 		const local = defaultAudioCppPaths();
 		const probe = await probeAudioCpp();
@@ -2570,7 +3852,9 @@ app.get("/api/music/status", async (_req, res) => {
 			model: "minimax_music3",
 			backend: local.backend,
 			busy: localMusicGenerationBusy,
-			message: probe.reachable ? undefined : (probe.message || "Local audio.cpp MiniMax Music 3 runtime is not ready."),
+			message: probe.reachable
+				? undefined
+				: probe.message || "Local audio.cpp MiniMax Music 3 runtime is not ready.",
 		});
 	}
 	const baseUrl = miniMaxMusicBase();
@@ -2582,7 +3866,7 @@ app.get("/api/music/status", async (_req, res) => {
 		baseUrl,
 		model: miniMaxMusicModel(),
 		busy: false,
-		message: probe.reachable ? undefined : (probe.message || "MiniMax Music 3 is not running."),
+		message: probe.reachable ? undefined : probe.message || "MiniMax Music 3 is not running.",
 	});
 });
 
@@ -2610,33 +3894,55 @@ async function generateWithAudioCpp(body) {
 		throw error;
 	}
 	const local = defaultAudioCppPaths();
-	if (!local.exe || !fs.existsSync(local.exe)) throw new Error(`audio.cpp executable not found: ${local.exe || "not configured"}`);
-	if (!local.modelDir || !fs.existsSync(local.modelDir)) throw new Error(`MiniMax model directory not found: ${local.modelDir || "not configured"}`);
+	if (!local.exe || !fs.existsSync(local.exe))
+		throw new Error(`audio.cpp executable not found: ${local.exe || "not configured"}`);
+	if (!local.modelDir || !fs.existsSync(local.modelDir))
+		throw new Error(`MiniMax model directory not found: ${local.modelDir || "not configured"}`);
 
 	const outPath = path.join(os.tmpdir(), `ysong-minimax-${crypto.randomUUID()}.wav`);
-	const duration = Math.max(2, Math.min(600, Number(body.durationSeconds || process.env.MINIMAX_AUDIOCPP_DURATION_SECONDS || 20) || 20));
+	const duration = Math.max(
+		2,
+		Math.min(600, Number(body.durationSeconds || process.env.MINIMAX_AUDIOCPP_DURATION_SECONDS || 20) || 20),
+	);
 	const steps = audioCppSteps(body);
 	const guidance = Math.max(0.01, Number(process.env.MINIMAX_AUDIOCPP_GUIDANCE || 1.7) || 1.7);
 	const arGuidance = Math.max(0.01, Number(process.env.MINIMAX_AUDIOCPP_AR_GUIDANCE || 1.5) || 1.5);
 	const args = [
-		"--task", "gen",
-		"--family", "minimax_music3",
-		"--model", local.modelDir,
-		"--backend", local.backend,
+		"--task",
+		"gen",
+		"--family",
+		"minimax_music3",
+		"--model",
+		local.modelDir,
+		"--backend",
+		local.backend,
 		...(local.backend === "cuda" ? ["--device", String(local.device)] : []),
-		"--threads", String(local.threads),
-		"--text", body.instructions,
-		"--request-option", `lyrics=${body.lyrics || "[Instrumental]"}`,
-		"--request-option", `duration_sec=${duration}`,
-		"--request-option", `num_inference_steps=${steps}`,
-		"--request-option", `guidance_scale=${guidance}`,
-		"--request-option", `ar_guidance_scale=${arGuidance}`,
-		"--request-option", `seed=${body.seed ?? 7}`,
-		"--session-option", `minimax_music3.language_model_gguf=${process.env.MINIMAX_AUDIOCPP_LANGUAGE_MODEL || "language_model_q4_0.gguf"}`,
-		"--session-option", `minimax_music3.rvq_depth_decoder_gguf=${process.env.MINIMAX_AUDIOCPP_RVQ_MODEL || "rvq_depth_decoder_q8_0.gguf"}`,
-		"--session-option", `minimax_music3.flow_transformer_gguf=${process.env.MINIMAX_AUDIOCPP_TRANSFORMER || "transformer_q4_0.gguf"}`,
-		"--session-option", "minimax_music3.mem_saver=true",
-		"--out", outPath,
+		"--threads",
+		String(local.threads),
+		"--text",
+		body.instructions,
+		"--request-option",
+		`lyrics=${body.lyrics || "[Instrumental]"}`,
+		"--request-option",
+		`duration_sec=${duration}`,
+		"--request-option",
+		`num_inference_steps=${steps}`,
+		"--request-option",
+		`guidance_scale=${guidance}`,
+		"--request-option",
+		`ar_guidance_scale=${arGuidance}`,
+		"--request-option",
+		`seed=${body.seed ?? 7}`,
+		"--session-option",
+		`minimax_music3.language_model_gguf=${process.env.MINIMAX_AUDIOCPP_LANGUAGE_MODEL || "language_model_q4_0.gguf"}`,
+		"--session-option",
+		`minimax_music3.rvq_depth_decoder_gguf=${process.env.MINIMAX_AUDIOCPP_RVQ_MODEL || "rvq_depth_decoder_q8_0.gguf"}`,
+		"--session-option",
+		`minimax_music3.flow_transformer_gguf=${process.env.MINIMAX_AUDIOCPP_TRANSFORMER || "transformer_q4_0.gguf"}`,
+		"--session-option",
+		"minimax_music3.mem_saver=true",
+		"--out",
+		outPath,
 		"--metrics",
 	];
 
@@ -2649,17 +3955,80 @@ async function generateWithAudioCpp(body) {
 			// while real stderr remains available if the process actually fails.
 			const detail = String(result.stderr || result.stdout || `audio.cpp exited ${result.code}`)
 				.split(/\r?\n/)
-				.filter((line) => !/ggml_cuda_graph_set_enabled: disabling CUDA graphs due to GPU architecture/i.test(line))
+				.filter(
+					(line) => !/ggml_cuda_graph_set_enabled: disabling CUDA graphs due to GPU architecture/i.test(line),
+				)
 				.join("\n")
 				.trim();
 			throw new Error(detail.slice(-5000) || `audio.cpp exited ${result.code}`);
 		}
 		const audio = await fs.promises.readFile(outPath);
 		if (!audio.length) throw new Error("audio.cpp completed but produced an empty WAV file.");
-		return { audio, contentType: "audio/wav", provider: "audio_cpp", backend: local.backend, metrics: result.stdout.trim().slice(-4000) };
+		return {
+			audio,
+			contentType: "audio/wav",
+			provider: "audio_cpp",
+			backend: local.backend,
+			metrics: result.stdout.trim().slice(-4000),
+		};
 	} finally {
 		localMusicGenerationBusy = false;
 		await fs.promises.unlink(outPath).catch(() => {});
+	}
+}
+
+async function generateWithCloudflareMusic(body) {
+	const config = cloudflareMusicConfig();
+	if (!config.accountId || !config.token)
+		throw new Error("Cloudflare music requires CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_AI_API_TOKEN on the server.");
+	const controller = new AbortController();
+	const timer = setTimeout(
+		() => controller.abort(),
+		Math.max(60_000, Number(process.env.MINIMAX_MUSIC_TIMEOUT_MS || 20 * 60_000)),
+	);
+	try {
+		const instrumental = body.lyrics.trim() === "[Instrumental]";
+		const response = await fetch(
+			`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(config.accountId)}/ai/run`,
+			{
+				method: "POST",
+				headers: { Authorization: `Bearer ${config.token}`, "Content-Type": "application/json" },
+				signal: controller.signal,
+				body: JSON.stringify({
+					model: config.model,
+					input: {
+						prompt: body.instructions.slice(0, 2000),
+						...(!instrumental && { lyrics: body.lyrics.slice(0, 3500) }),
+						is_instrumental: instrumental,
+						lyrics_optimizer: false,
+						format: "wav",
+						sample_rate: 44100,
+					},
+				}),
+			},
+		);
+		if (!response.ok)
+			throw new Error(
+				`Cloudflare music generation failed (HTTP ${response.status}). Check account/model access and token permissions.`,
+			);
+		const data = await response.json();
+		if (data.success === false) throw new Error("Cloudflare music generation was unsuccessful.");
+		const audioUrl = new URL(data.result?.audio);
+		if (audioUrl.protocol !== "https:") throw new Error("Cloudflare returned an invalid audio URL.");
+		const audioResponse = await fetch(audioUrl, { signal: controller.signal });
+		if (!audioResponse.ok) throw new Error(`Cloudflare audio download failed (HTTP ${audioResponse.status}).`);
+		const audio = Buffer.from(await audioResponse.arrayBuffer());
+		if (!audio.length) throw new Error("Cloudflare returned an empty audio file.");
+		return { audio, contentType: audioResponse.headers.get("content-type") || "audio/wav", provider: "cloudflare" };
+	} catch (error) {
+		// Never propagate upstream response bodies, URLs, or fetch errors that could contain credentials.
+		if (error?.name === "AbortError")
+			throw Object.assign(new Error("Cloudflare music generation timed out."), { code: "PROCESS_TIMEOUT" });
+		if (error?.message?.startsWith("Cloudflare"))
+			throw new Error(error.message.split(config.token).join("[REDACTED]"));
+		throw new Error("Cloudflare music generation or audio download could not complete.");
+	} finally {
+		clearTimeout(timer);
 	}
 }
 
@@ -2697,24 +4066,95 @@ async function generateWithMiniMaxHttp(body) {
 	}
 }
 
-app.post("/api/music/generate", async (req, res) => {
-	try {
-		const body = MusicGenerateSchema.parse(req.body || {});
-		const provider = miniMaxProvider();
-		const generated = provider === "audio_cpp" ? await generateWithAudioCpp(body) : await generateWithMiniMaxHttp(body);
-		res.setHeader("Content-Type", generated.contentType || "audio/wav");
-		res.setHeader("Content-Length", String(generated.audio.length));
-		res.setHeader("Cache-Control", "no-store");
-		res.setHeader("X-YSong-Music-Provider", generated.provider || provider);
-		return res.status(200).send(generated.audio);
-	} catch (error) {
-		if (error?.name === "ZodError") return res.status(400).json({ error: "invalid_music_request", message: error.message });
-		if (error?.code === "MINIMAX_BUSY") return res.status(409).json({ error: "minimax_busy", message: error.message });
-		if (error?.code === "PROCESS_TIMEOUT" || error?.name === "AbortError") return res.status(504).json({ error: "minimax_timeout", message: "MiniMax Music 3 generation timed out." });
-		console.error("POST /api/music/generate ERROR", error);
-		return res.status(502).json({ error: "minimax_unreachable", message: error?.message || "Could not run MiniMax Music 3." });
+async function persistGenerationAudio(userId, versionId, generated) {
+    await governance.recordUpload(userId,`user-uploads/${userId}/generations/Generation-${versionId}.${(generated.contentType||'audio/wav').includes('mpeg')?'mp3':(generated.contentType||'').includes('ogg')?'ogg':'wav'}`,generated.audio,generated.contentType||'audio/wav');
+	const contentType = generated.contentType || "audio/wav";
+	const extension = contentType.includes("mpeg") ? "mp3" : contentType.includes("ogg") ? "ogg" : "wav";
+	const originalName = `Generation-${versionId}.${extension}`;
+	const objectKey = `user-uploads/${userId}/generations/${originalName}`;
+	const metadata = { userId, originalName, contentType, size: generated.audio.length, createdAt: new Date().toISOString(), generationId: versionId };
+	if (USE_R2) await putR2Object(objectKey, generated.audio, { contentType, metadata, contentLength: generated.audio.length });
+	else {
+		const target = objectPath(objectKey);
+		await fs.promises.mkdir(path.dirname(target), { recursive: true });
+		await fs.promises.writeFile(target, generated.audio);
+		await writeObjectMetadata(objectKey, metadata);
 	}
-});
+	return objectKey;
+}
+
+app.post(
+	"/api/music/generate",
+	(req, res, next) => (LOCAL_MODE ? next() : requireAuth(req, res, next)),
+	async (req, res) => {
+		let version;
+		let usableResult;
+        let releaseRender;
+        let submitted=false;
+		try {
+			const body = MusicGenerateSchema.parse(req.body || {});
+			const provider = miniMaxProvider();
+			if (saasEnabled()) {
+				if (req.body.quantity !== undefined && req.body.quantity !== 1) throw new AccessError("binary_music_endpoint_requires_quantity_one", 400);
+				await saas.providerEnabled(provider);
+				const reservation = await saas.reserve(req.user.id, {
+					quantity: 1, requestKey: req.get("idempotency-key") || crypto.randomUUID(), source: body,
+				});
+				if (reservation.replay) throw new AccessError("generation_request_already_recorded", 409);
+				version = reservation.versions[0];
+                releaseRender=await saas.acquireRender(version.id);
+				await saas.start(version.id, provider, provider === "cloudflare" ? cloudflareMusicConfig().model : miniMaxMusicModel());
+                await saas.transaction(c=>c.query("UPDATE ysong_generation_versions SET execution=$2 WHERE id=$1",[version.id,{parts:{audio:{state:'submitted',request:body}},saved:false}]));
+			}
+            submitted=true;
+			const generated =
+				provider === "audio_cpp"
+					? await generateWithAudioCpp(body)
+					: provider === "cloudflare"
+						? await generateWithCloudflareMusic(body)
+						: await generateWithMiniMaxHttp(body);
+			if (!Buffer.isBuffer(generated.audio) || generated.audio.length === 0) throw new AccessError("provider_empty_audio", 502);
+			if (version) {
+				const objectKey = await persistGenerationAudio(req.user.id, version.id, generated);
+				usableResult = { objectKey, audioHash: sha256(generated.audio), contentType: generated.contentType, bytes: generated.audio.length };
+				await saas.reconcile(version.id, "ready", usableResult, null, {parts:{audio:{state:'ready',objectKey,audioHash:usableResult.audioHash}},saved:false});
+				res.setHeader("X-YSong-Generation-Id", version.id);
+				res.setHeader("X-YSong-Object-Key", objectKey);
+			}
+			res.setHeader("Content-Type", generated.contentType || "audio/wav");
+			res.setHeader("Content-Length", String(generated.audio.length));
+			res.setHeader("Cache-Control", "no-store");
+			res.setHeader("X-YSong-Music-Provider", generated.provider || provider);
+			return res.status(200).send(generated.audio);
+		} catch (error) {
+			// A delivery/DB error after usable provider work must not refund that work.
+            if(version){
+              if(usableResult)await saas.reconcile(version.id,'ready',usableResult).catch(()=>{});
+              else if(submitted)await saas.transaction(async c=>{await c.query("UPDATE ysong_generation_versions SET state='failed',error_code='provider_outcome_uncertain',execution=$2 WHERE id=$1",[version.id,{parts:{audio:{state:'ambiguous',request:req.body,error:'provider_outcome_requires_review'}},saved:false}]);await notifySaas(c,req.user.id,`generation:${version.id}:review`,'Generation requires manual review','Your reservation is retained while the uncertain provider outcome is reviewed.','/app?view=createSong');}).catch(()=>{});
+              else await saas.reconcile(version.id,'failed',null,'pre_submission_failure').catch(()=>{});
+            }
+			if (error instanceof AccessError) return res.status(error.status).json({ error: error.code });
+			if (error?.name === "ZodError")
+				return res.status(400).json({ error: "invalid_music_request", message: error.message });
+			if (error?.code === "MINIMAX_BUSY")
+				return res.status(409).json({ error: "minimax_busy", message: error.message });
+			if (error?.code === "PROCESS_TIMEOUT" || error?.name === "AbortError")
+				return res
+					.status(504)
+					.json({
+						error: "minimax_timeout",
+						message:
+							error?.message === "Cloudflare music generation timed out."
+								? error.message
+								: "MiniMax Music 3 generation timed out.",
+					});
+			console.error("POST /api/music/generate ERROR", error);
+			return res
+				.status(502)
+				.json({ error: "minimax_unreachable", message: error?.message || "Could not run MiniMax Music 3." });
+		} finally { if(releaseRender)await releaseRender().catch(()=>{}); }
+	},
+);
 
 // Optional AI bridge. A configured OPENAI_API_KEY is enough to enable the local
 // assistant; AI_PROVIDER can still explicitly disable/override it. Secrets remain
@@ -2722,7 +4162,11 @@ app.post("/api/music/generate", async (req, res) => {
 app.get("/api/ai/status", (_req, res) => {
 	const configured = Boolean(process.env.OPENAI_API_KEY);
 	const provider = String(process.env.AI_PROVIDER || (configured ? "openai" : "none")).toLowerCase();
-	return res.json({ configured: configured && provider === "openai", provider, model: process.env.OPENAI_MODEL || "gpt-5.6" });
+	return res.json({
+		configured: configured && provider === "openai",
+		provider,
+		model: process.env.OPENAI_MODEL || "gpt-5.6",
+	});
 });
 
 const DEFAULT_PERSONA_ID = "persona_surfer_v1";
@@ -2759,7 +4203,7 @@ async function getPersonaRowForUser(userId, personaId) {
 		 WHERE id=$1 AND kind='persona' AND is_active=TRUE
 		   AND (owner_user_id IS NULL OR owner_user_id=$2)
 		 LIMIT 1`,
-		[id, userId]
+		[id, userId],
 	);
 	if (rows[0]) return rows[0];
 	if (id !== DEFAULT_PERSONA_ID) return getPersonaRowForUser(userId, DEFAULT_PERSONA_ID);
@@ -2771,7 +4215,7 @@ async function loadPersonaBundle(userId, personaId) {
 		pool.query(
 			`SELECT id, content FROM ysong_ai_rule_sets
 			 WHERE id=$1 AND kind='universal' AND is_active=TRUE LIMIT 1`,
-			[UNIVERSAL_RULE_ID]
+			[UNIVERSAL_RULE_ID],
 		),
 		getPersonaRowForUser(userId, personaId),
 	]);
@@ -2783,15 +4227,18 @@ async function loadPersonaBundle(userId, personaId) {
 }
 
 async function callOpenAI(input, { maxOutputTokens } = {}) {
+    if(saasEnabled())assertPaidBoundary();
 	const provider = String(process.env.AI_PROVIDER || (process.env.OPENAI_API_KEY ? "openai" : "none")).toLowerCase();
 	if (provider !== "openai") return { text: "YSong AI is not configured on this server yet.", local: true };
+	if (saasEnabled()) await saas.providerEnabled(provider);
 	if (!process.env.OPENAI_API_KEY) {
 		const err = new Error("openai_key_missing");
 		err.statusCode = 503;
 		throw err;
 	}
 	const body = { model: process.env.OPENAI_MODEL || "gpt-5.6", input };
-	if (Number.isFinite(Number(maxOutputTokens)) && Number(maxOutputTokens) > 0) body.max_output_tokens = Number(maxOutputTokens);
+	if (Number.isFinite(Number(maxOutputTokens)) && Number(maxOutputTokens) > 0)
+		body.max_output_tokens = Number(maxOutputTokens);
 	const response = await fetch("https://api.openai.com/v1/responses", {
 		method: "POST",
 		headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
@@ -2806,14 +4253,13 @@ async function callOpenAI(input, { maxOutputTokens } = {}) {
 	}
 	const text = Array.isArray(data?.output)
 		? data.output
-			.flatMap((item) => (item?.type === "message" && Array.isArray(item.content) ? item.content : []))
-			.filter((part) => part?.type === "output_text" && typeof part.text === "string")
-			.map((part) => part.text)
-			.join("")
+				.flatMap((item) => (item?.type === "message" && Array.isArray(item.content) ? item.content : []))
+				.filter((part) => part?.type === "output_text" && typeof part.text === "string")
+				.map((part) => part.text)
+				.join("")
 		: "";
 	return { text: text || "…", local: false };
 }
-
 
 function parseJsonObjectLoose(text) {
 	const raw = String(text || "").trim();
@@ -2821,7 +4267,10 @@ function parseJsonObjectLoose(text) {
 	const match = raw.match(/\{[\s\S]*\}/);
 	if (match) candidates.push(match[0]);
 	for (const candidate of candidates) {
-		try { const parsed = JSON.parse(candidate); if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed; } catch {}
+		try {
+			const parsed = JSON.parse(candidate);
+			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+		} catch {}
 	}
 	return null;
 }
@@ -2830,37 +4279,72 @@ app.post("/api/critique/ai-summary", requireAuth, async (req, res) => {
 	try {
 		const report = req.body?.report;
 		if (!report || typeof report !== "object") return res.status(400).json({ error: "critique_report_required" });
-		const findings = Array.isArray(report.findings) ? report.findings.slice(0, 24).map((row) => ({
-			severity: String(row?.severity || "info"), category: String(row?.category || ""), title: String(row?.title || ""),
-			detail: String(row?.detail || "").slice(0, 700), recommendation: String(row?.recommendation || "").slice(0, 700),
-			start_seconds: Number.isFinite(Number(row?.start_seconds)) ? Number(row.start_seconds) : null,
-			frequency_low_hz: Number.isFinite(Number(row?.frequency_low_hz)) ? Number(row.frequency_low_hz) : null,
-			frequency_high_hz: Number.isFinite(Number(row?.frequency_high_hz)) ? Number(row.frequency_high_hz) : null,
-			confidence: Number.isFinite(Number(row?.confidence)) ? Number(row.confidence) : null,
-		})) : [];
+		const findings = Array.isArray(report.findings)
+			? report.findings.slice(0, 24).map((row) => ({
+					severity: String(row?.severity || "info"),
+					category: String(row?.category || ""),
+					title: String(row?.title || ""),
+					detail: String(row?.detail || "").slice(0, 700),
+					recommendation: String(row?.recommendation || "").slice(0, 700),
+					start_seconds: Number.isFinite(Number(row?.start_seconds)) ? Number(row.start_seconds) : null,
+					frequency_low_hz: Number.isFinite(Number(row?.frequency_low_hz))
+						? Number(row.frequency_low_hz)
+						: null,
+					frequency_high_hz: Number.isFinite(Number(row?.frequency_high_hz))
+						? Number(row.frequency_high_hz)
+						: null,
+					confidence: Number.isFinite(Number(row?.confidence)) ? Number(row.confidence) : null,
+				}))
+			: [];
 		const evidence = {
-			engine: String(report.engine || "YSong Ears"), technical_score: Number(report.technical_score || 0), verdict: String(report.verdict || ""),
-			finding_counts: report.finding_counts || {}, category_scores: report.category_scores || {}, metrics: report.metrics || {}, findings,
-			limitations: Array.isArray(report.limitations) ? report.limitations.slice(0, 12).map((x) => String(x).slice(0, 500)) : [],
+			engine: String(report.engine || "YSong Ears"),
+			technical_score: Number(report.technical_score || 0),
+			verdict: String(report.verdict || ""),
+			finding_counts: report.finding_counts || {},
+			category_scores: report.category_scores || {},
+			metrics: report.metrics || {},
+			findings,
+			limitations: Array.isArray(report.limitations)
+				? report.limitations.slice(0, 12).map((x) => String(x).slice(0, 500))
+				: [],
 		};
-		const answer = await callOpenAI([
-			{ role: "developer", content: `You are YSong AI Critic, a candid but useful mix-review assistant. You are given deterministic technical evidence from YSong Ears. Interpret ONLY that evidence; never claim you literally heard the audio and never invent defects, instruments, genre, emotional quality, songwriting quality, or aesthetic judgments that the evidence does not support. Be direct and artist-friendly. If the technical evidence is clean, say so instead of manufacturing criticism. Tempo can be octave-ambiguous, so honor estimated_bpm, alternate_bpm, and interpretation when present. Return JSON only with exactly: {"headline":string,"summary":string,"readiness_score":number|null,"strengths":string[],"priorities":string[],"caveats":string[]}. readiness_score is a 0-100 technical/mix-readiness interpretation grounded in the supplied technical score and findings, not a songwriting score. strengths max 4, priorities max 5, caveats max 3.` },
-			{ role: "user", content: JSON.stringify(evidence) },
-		], { maxOutputTokens: 1100 });
+		const answer = await callOpenAI(
+			[
+				{
+					role: "developer",
+					content: `You are YSong AI Critic, a candid but useful mix-review assistant. You are given deterministic technical evidence from YSong Ears. Interpret ONLY that evidence; never claim you literally heard the audio and never invent defects, instruments, genre, emotional quality, songwriting quality, or aesthetic judgments that the evidence does not support. Be direct and artist-friendly. If the technical evidence is clean, say so instead of manufacturing criticism. Tempo can be octave-ambiguous, so honor estimated_bpm, alternate_bpm, and interpretation when present. Return JSON only with exactly: {"headline":string,"summary":string,"readiness_score":number|null,"strengths":string[],"priorities":string[],"caveats":string[]}. readiness_score is a 0-100 technical/mix-readiness interpretation grounded in the supplied technical score and findings, not a songwriting score. strengths max 4, priorities max 5, caveats max 3.`,
+				},
+				{ role: "user", content: JSON.stringify(evidence) },
+			],
+			{ maxOutputTokens: 1100 },
+		);
 		const parsed = parseJsonObjectLoose(answer.text);
 		if (!parsed) throw Object.assign(new Error("AI critic returned an unreadable response."), { statusCode: 502 });
-		const list = (value, max) => Array.isArray(value) ? value.map((x) => String(x || "").trim()).filter(Boolean).slice(0, max) : [];
+		const list = (value, max) =>
+			Array.isArray(value)
+				? value
+						.map((x) => String(x || "").trim())
+						.filter(Boolean)
+						.slice(0, max)
+				: [];
 		const scoreValue = Number(parsed.readiness_score);
 		return res.json({
 			headline: String(parsed.headline || "YSong AI Critic").slice(0, 180),
 			summary: String(parsed.summary || "No additional AI summary was returned.").slice(0, 2400),
 			readiness_score: Number.isFinite(scoreValue) ? Math.max(0, Math.min(100, scoreValue)) : null,
-			strengths: list(parsed.strengths, 4), priorities: list(parsed.priorities, 5), caveats: list(parsed.caveats, 3),
+			strengths: list(parsed.strengths, 4),
+			priorities: list(parsed.priorities, 5),
+			caveats: list(parsed.caveats, 3),
 			model: process.env.OPENAI_MODEL || "gpt-5.6",
 		});
 	} catch (e) {
 		console.error("POST /api/critique/ai-summary ERROR", e);
-		return res.status(e?.statusCode || 500).json({ error: e?.message === "openai_key_missing" ? "openai_key_missing" : "ai_critique_failed", message: e?.message || "AI critique failed." });
+		return res
+			.status(e?.statusCode || 500)
+			.json({
+				error: e?.message === "openai_key_missing" ? "openai_key_missing" : "ai_critique_failed",
+				message: e?.message || "AI critique failed.",
+			});
 	}
 });
 
@@ -2873,7 +4357,10 @@ function parsePersonaBubblePlan(text) {
 		try {
 			const parsed = JSON.parse(candidate);
 			const bubbles = Array.isArray(parsed?.bubbles)
-				? parsed.bubbles.map((x) => String(x || "").trim()).filter(Boolean).slice(0, 3)
+				? parsed.bubbles
+						.map((x) => String(x || "").trim())
+						.filter(Boolean)
+						.slice(0, 3)
 				: [];
 			if (bubbles.length) return bubbles;
 		} catch {}
@@ -2890,7 +4377,7 @@ app.get("/api/personas", requireAuth, async (req, res) => {
 			 WHERE kind='persona' AND is_active=TRUE
 			   AND (owner_user_id IS NULL OR owner_user_id=$1)
 			 ORDER BY COALESCE((metadata->>'sortOrder')::int, 999), lower(COALESCE(metadata->>'displayName', name))`,
-			[req.user.id]
+			[req.user.id],
 		);
 		return res.json({ personas: rows.map(publicPersona), defaultPersonaId: DEFAULT_PERSONA_ID });
 	} catch (e) {
@@ -2902,10 +4389,11 @@ app.get("/api/personas", requireAuth, async (req, res) => {
 app.get("/api/personas/:id/avatar", requireAuth, async (req, res) => {
 	try {
 		const persona = await getPersonaRowForUser(req.user.id, req.params.id);
-		if (!persona || String(persona.id) !== String(req.params.id)) return res.status(404).json({ error: "persona_not_found" });
+		if (!persona || String(persona.id) !== String(req.params.id))
+			return res.status(404).json({ error: "persona_not_found" });
 		if (!persona.avatar_object_key) return res.json({ url: publicPersona(persona).avatarPath || "" });
 		const key = assertOwnedObjectKey(req.user.id, String(persona.avatar_object_key));
-		await fs.promises.access(objectPath(key), fs.constants.R_OK);
+		await assertObjectReadable(key);
 		const expiresAt = Date.now() + 2 * 60 * 60 * 1000;
 		const sig = makeLocalFileSignature(key, "play", expiresAt);
 		const base = `${req.protocol}://${req.get("host")}`;
@@ -2921,26 +4409,46 @@ app.get("/api/personas/:id/avatar", requireAuth, async (req, res) => {
 
 app.post("/api/personas/custom", requireAuth, async (req, res) => {
 	try {
-		const name = String(req.body?.name || "").trim().slice(0, 80);
-		const description = String(req.body?.description || "").trim().slice(0, 500);
-		const specialty = String(req.body?.specialty || "").trim().slice(0, 500);
-		const humorStyle = String(req.body?.humorStyle || "").trim().slice(0, 300);
-		const instructions = String(req.body?.instructions || "").trim().slice(0, 8000);
+		const name = String(req.body?.name || "")
+			.trim()
+			.slice(0, 80);
+		const description = String(req.body?.description || "")
+			.trim()
+			.slice(0, 500);
+		const specialty = String(req.body?.specialty || "")
+			.trim()
+			.slice(0, 500);
+		const humorStyle = String(req.body?.humorStyle || "")
+			.trim()
+			.slice(0, 300);
+		const instructions = String(req.body?.instructions || "")
+			.trim()
+			.slice(0, 8000);
 		const socialEnergy = Math.max(0, Math.min(1, Number(req.body?.socialEnergy ?? 0.6) || 0.6));
 		const critiqueLevel = Math.max(0, Math.min(1, Number(req.body?.critiqueLevel ?? 0.6) || 0.6));
 		if (!name) return res.status(400).json({ error: "persona_name_required" });
 		if (!instructions) return res.status(400).json({ error: "persona_instructions_required" });
 		let avatarObjectKey = null;
-		if (req.body?.avatarObjectKey) avatarObjectKey = assertOwnedObjectKey(req.user.id, String(req.body.avatarObjectKey), { uploadOnly: true });
+		if (req.body?.avatarObjectKey)
+			avatarObjectKey = assertOwnedObjectKey(req.user.id, String(req.body.avatarObjectKey), { uploadOnly: true });
 		const id = `persona_custom_${crypto.randomUUID().replace(/-/g, "")}`;
 		const content = `\nIDENTITY & VIBE\n- You are ${name}.\n- Stay in character while obeying all universal YSong rules.\n${description ? `- Core vibe: ${description}\n` : ""}${specialty ? `- Musical specialty: ${specialty}\n` : ""}${humorStyle ? `- Humor style: ${humorStyle}\n` : ""}\nCREATOR NOTES\n${instructions}\n`;
-		const metadata = { displayName: name, description, specialty, humorStyle, socialEnergy, critiqueLevel, builtIn: false, sortOrder: 500 };
+		const metadata = {
+			displayName: name,
+			description,
+			specialty,
+			humorStyle,
+			socialEnergy,
+			critiqueLevel,
+			builtIn: false,
+			sortOrder: 500,
+		};
 		const { rows } = await pool.query(
 			`INSERT INTO ysong_ai_rule_sets
 			 (id, kind, name, version, is_active, content, owner_user_id, metadata, avatar_object_key, created_at, updated_at)
 			 VALUES ($1, 'persona', $2, 1, TRUE, $3, $4, $5::jsonb, $6, now(), now())
 			 RETURNING id, name, metadata, owner_user_id, avatar_object_key`,
-			[id, `${name} Persona`, content, req.user.id, JSON.stringify(metadata), avatarObjectKey]
+			[id, `${name} Persona`, content, req.user.id, JSON.stringify(metadata), avatarObjectKey],
 		);
 		return res.status(201).json({ persona: publicPersona(rows[0]) });
 	} catch (e) {
@@ -2953,7 +4461,7 @@ app.post("/api/personas/:id/delete", requireAuth, async (req, res) => {
 	try {
 		const result = await pool.query(
 			`DELETE FROM ysong_ai_rule_sets WHERE id=$1 AND kind='persona' AND owner_user_id=$2 RETURNING id`,
-			[String(req.params.id), req.user.id]
+			[String(req.params.id), req.user.id],
 		);
 		if (!result.rows[0]) return res.status(404).json({ error: "custom_persona_not_found" });
 		return res.json({ ok: true });
@@ -2965,10 +4473,16 @@ app.post("/api/personas/:id/delete", requireAuth, async (req, res) => {
 
 app.get("/api/chats/:id/persona", requireAuth, async (req, res) => {
 	try {
-		const { rows } = await pool.query(`SELECT persona_id FROM chats WHERE id=$1 AND user_id=$2 LIMIT 1`, [String(req.params.id), req.user.id]);
+		const { rows } = await pool.query(`SELECT persona_id FROM chats WHERE id=$1 AND user_id=$2 LIMIT 1`, [
+			String(req.params.id),
+			req.user.id,
+		]);
 		if (!rows[0]) return res.status(404).json({ error: "chat_not_found" });
 		const persona = await getPersonaRowForUser(req.user.id, rows[0].persona_id || DEFAULT_PERSONA_ID);
-		return res.json({ persona: persona ? publicPersona(persona) : null, personaId: persona?.id || DEFAULT_PERSONA_ID });
+		return res.json({
+			persona: persona ? publicPersona(persona) : null,
+			personaId: persona?.id || DEFAULT_PERSONA_ID,
+		});
 	} catch (e) {
 		console.error("GET /api/chats/:id/persona ERROR", e);
 		return res.status(500).json({ error: "chat_persona_failed" });
@@ -2981,11 +4495,14 @@ app.post("/api/chats/:id/persona", requireAuth, async (req, res) => {
 		const requested = String(req.body?.personaId || DEFAULT_PERSONA_ID);
 		const persona = await getPersonaRowForUser(req.user.id, requested);
 		if (!persona || String(persona.id) !== requested) return res.status(404).json({ error: "persona_not_found" });
-		const updated = await pool.query(`UPDATE chats SET persona_id=$3, updated_at=now() WHERE id=$1 AND user_id=$2 RETURNING id`, [chatId, req.user.id, requested]);
+		const updated = await pool.query(
+			`UPDATE chats SET persona_id=$3, updated_at=now() WHERE id=$1 AND user_id=$2 RETURNING id`,
+			[chatId, req.user.id, requested],
+		);
 		if (!updated.rows[0]) {
 			await pool.query(
 				`INSERT INTO chats (id, user_id, title, pinned, is_cloud_saved, persona_id) VALUES ($1,$2,'',FALSE,TRUE,$3)`,
-				[chatId, req.user.id, requested]
+				[chatId, req.user.id, requested],
 			);
 		}
 		return res.json({ ok: true, persona: publicPersona(persona) });
@@ -3009,7 +4526,7 @@ app.post("/chat", requireAuth, async (req, res) => {
 			...messages
 				.filter((m) => m && typeof m.content === "string")
 				.map((m) => ({
-					role: m.role === "system" ? "developer" : (m.role === "assistant" ? "assistant" : "user"),
+					role: m.role === "system" ? "developer" : m.role === "assistant" ? "assistant" : "user",
 					content: m.content,
 				})),
 		];
@@ -3018,7 +4535,12 @@ app.post("/chat", requireAuth, async (req, res) => {
 		return res.json({ reply: answer.text, local: !!answer.local, persona: publicPersona(bundle.persona) });
 	} catch (e) {
 		console.error("POST /chat ERROR", e);
-		return res.status(e?.statusCode || 500).json({ error: e?.message === "openai_key_missing" ? "openai_key_missing" : "ai_failed", message: e?.message });
+		return res
+			.status(e?.statusCode || 500)
+			.json({
+				error: e?.message === "openai_key_missing" ? "openai_key_missing" : "ai_failed",
+				message: e?.message,
+			});
 	}
 });
 
@@ -3029,7 +4551,7 @@ async function roomAccess(roomId, userId, { allowPublic = false } = {}) {
 		 FROM ysong_rooms r
 		 LEFT JOIN ysong_room_members rm ON rm.room_id=r.id AND rm.user_id=$2
 		 WHERE r.id=$1 LIMIT 1`,
-		[roomId, userId]
+		[roomId, userId],
 	);
 	const room = rows[0];
 	if (!room) return null;
@@ -3060,9 +4582,10 @@ function roomMessagePublic(row) {
 		senderKind: row.sender_kind,
 		senderUserId: row.sender_user_id,
 		senderPersonaId: row.sender_persona_id,
-		senderName: row.sender_kind === "persona"
-			? String(personaMeta.displayName || row.persona_name || "AI Persona")
-			: String(row.user_name || (row.sender_kind === "system" ? "YSong" : "Member")),
+		senderName:
+			row.sender_kind === "persona"
+				? String(personaMeta.displayName || row.persona_name || "AI Persona")
+				: String(row.user_name || (row.sender_kind === "system" ? "YSong" : "Member")),
 		personaAvatarPath: row.sender_kind === "persona" ? String(personaMeta.avatarPath || "") : "",
 		content: row.content,
 		replyToMessageId: row.reply_to_message_id,
@@ -3080,20 +4603,20 @@ async function fetchRoomMessages(roomId, limit = 100) {
 		 WHERE m.room_id=$1
 		 ORDER BY m.created_at DESC
 		 LIMIT $2`,
-		[roomId, Math.min(200, Math.max(1, Number(limit) || 100))]
+		[roomId, Math.min(200, Math.max(1, Number(limit) || 100))],
 	);
 	return rows.reverse().map(roomMessagePublic);
 }
 
-
 function roomVenuePublic(row) {
-	const transport = row?.transport && typeof row.transport === "object" && Object.keys(row.transport).length ? row.transport : null;
+	const transport =
+		row?.transport && typeof row.transport === "object" && Object.keys(row.transport).length ? row.transport : null;
 	return {
 		roomId: row.room_id,
 		active: !!row.active,
 		hostUserId: row.host_user_id || null,
 		hostName: String(row.host_name || ""),
-		mode: ["listening","radio","visual","performance"].includes(row.mode) ? row.mode : "listening",
+		mode: ["listening", "radio", "visual", "performance"].includes(row.mode) ? row.mode : "listening",
 		stageTitle: String(row.stage_title || ""),
 		stageSubtitle: String(row.stage_subtitle || ""),
 		streamMode: row.stream_mode === "embed" ? "embed" : "none",
@@ -3110,13 +4633,15 @@ function roomVenuePublic(row) {
 }
 
 async function ensureRoomVenueState(roomId) {
-	await pool.query(`INSERT INTO ysong_room_venue_state (room_id) VALUES ($1) ON CONFLICT (room_id) DO NOTHING`, [roomId]);
+	await pool.query(`INSERT INTO ysong_room_venue_state (room_id) VALUES ($1) ON CONFLICT (room_id) DO NOTHING`, [
+		roomId,
+	]);
 	const { rows } = await pool.query(
 		`SELECT v.*, u.display_name AS host_name
 		 FROM ysong_room_venue_state v
 		 LEFT JOIN users u ON u.id=v.host_user_id
 		 WHERE v.room_id=$1 LIMIT 1`,
-		[roomId]
+		[roomId],
 	);
 	return rows[0] || null;
 }
@@ -3136,7 +4661,10 @@ function roomAudienceEventPublic(row) {
 async function fetchRoomAudienceEvents(roomId, since) {
 	const params = [roomId];
 	let where = `e.room_id=$1`;
-	if (since) { params.push(since); where += ` AND e.created_at > $2::timestamptz`; }
+	if (since) {
+		params.push(since);
+		where += ` AND e.created_at > $2::timestamptz`;
+	}
 	const { rows } = await pool.query(
 		`SELECT e.*, u.display_name AS actor_name
 		 FROM ysong_room_audience_events e
@@ -3144,7 +4672,7 @@ async function fetchRoomAudienceEvents(roomId, since) {
 		 WHERE ${where}
 		 ORDER BY e.created_at DESC
 		 LIMIT 80`,
-		params
+		params,
 	);
 	return rows.reverse().map(roomAudienceEventPublic);
 }
@@ -3161,12 +4689,21 @@ async function fetchRoomTrackRequests(roomId, userId) {
 		 GROUP BY r.id,u.display_name
 		 ORDER BY CASE r.status WHEN 'approved' THEN 0 ELSE 1 END, count(v.user_id) DESC, r.created_at ASC
 		 LIMIT 100`,
-		[roomId,userId]
+		[roomId, userId],
 	);
 	return rows.map((r) => ({
-		id:r.id, roomId:r.room_id, requesterUserId:r.requester_user_id, requesterName:r.requester_name || "Member",
-		trackId:r.track_id || null, title:r.title, artist:r.artist || "", status:r.status,
-		votes:Number(r.votes||0), myVote:!!r.my_vote, createdAt:r.created_at, updatedAt:r.updated_at,
+		id: r.id,
+		roomId: r.room_id,
+		requesterUserId: r.requester_user_id,
+		requesterName: r.requester_name || "Member",
+		trackId: r.track_id || null,
+		title: r.title,
+		artist: r.artist || "",
+		status: r.status,
+		votes: Number(r.votes || 0),
+		myVote: !!r.my_vote,
+		createdAt: r.created_at,
+		updatedAt: r.updated_at,
 	}));
 }
 
@@ -3176,7 +4713,7 @@ async function fetchRoomOpenPoll(roomId, userId) {
 		 FROM ysong_room_polls p JOIN users u ON u.id=p.created_by_user_id
 		 WHERE p.room_id=$1 AND p.status='open'
 		 ORDER BY p.created_at DESC LIMIT 1`,
-		[roomId]
+		[roomId],
 	);
 	const poll = rows[0];
 	if (!poll) return null;
@@ -3184,15 +4721,31 @@ async function fetchRoomOpenPoll(roomId, userId) {
 		await pool.query(`UPDATE ysong_room_polls SET status='closed',updated_at=now() WHERE id=$1`, [poll.id]);
 		return null;
 	}
-	const voteRows = await pool.query(`SELECT option_id,count(*)::int AS votes FROM ysong_room_poll_votes WHERE poll_id=$1 GROUP BY option_id`, [poll.id]);
-	const mine = await pool.query(`SELECT option_id FROM ysong_room_poll_votes WHERE poll_id=$1 AND user_id=$2 LIMIT 1`, [poll.id,userId]);
-	const counts = new Map(voteRows.rows.map((r) => [String(r.option_id), Number(r.votes||0)]));
+	const voteRows = await pool.query(
+		`SELECT option_id,count(*)::int AS votes FROM ysong_room_poll_votes WHERE poll_id=$1 GROUP BY option_id`,
+		[poll.id],
+	);
+	const mine = await pool.query(
+		`SELECT option_id FROM ysong_room_poll_votes WHERE poll_id=$1 AND user_id=$2 LIMIT 1`,
+		[poll.id, userId],
+	);
+	const counts = new Map(voteRows.rows.map((r) => [String(r.option_id), Number(r.votes || 0)]));
 	const options = Array.isArray(poll.options) ? poll.options : [];
 	return {
-		id:poll.id, roomId:poll.room_id, question:poll.question,
-		options:options.map((o) => ({ id:String(o.id||""), label:String(o.label||""), votes:counts.get(String(o.id||""))||0 })),
-		myOptionId:mine.rows[0]?.option_id || null, status:"open", createdByUserId:poll.created_by_user_id,
-		createdByName:poll.created_by_name || "Host", closesAt:poll.closes_at || null, createdAt:poll.created_at,
+		id: poll.id,
+		roomId: poll.room_id,
+		question: poll.question,
+		options: options.map((o) => ({
+			id: String(o.id || ""),
+			label: String(o.label || ""),
+			votes: counts.get(String(o.id || "")) || 0,
+		})),
+		myOptionId: mine.rows[0]?.option_id || null,
+		status: "open",
+		createdByUserId: poll.created_by_user_id,
+		createdByName: poll.created_by_name || "Host",
+		closesAt: poll.closes_at || null,
+		createdAt: poll.created_at,
 	};
 }
 
@@ -3204,23 +4757,35 @@ async function insertRoomAudienceEvent(roomId, actorUserId, kind, payload) {
 		   VALUES ($1,$2,$3,$4,$5::jsonb) RETURNING *
 		 )
 		 SELECT inserted.*, u.display_name AS actor_name FROM inserted LEFT JOIN users u ON u.id=inserted.actor_user_id`,
-		[id,roomId,actorUserId,kind,JSON.stringify(payload||{})]
+		[id, roomId, actorUserId, kind, JSON.stringify(payload || {})],
 	);
 	return roomAudienceEventPublic(rows[0]);
 }
 
 function sanitizeVenueTransport(raw) {
-	const source = ["world","daw","none"].includes(raw?.source) ? raw.source : "none";
-	const kind = ["playlist","radio","ad-hoc"].includes(raw?.broadcastKind) ? raw.broadcastKind : undefined;
+	const source = ["world", "daw", "none"].includes(raw?.source) ? raw.source : "none";
+	const kind = ["playlist", "radio", "ad-hoc"].includes(raw?.broadcastKind) ? raw.broadcastKind : undefined;
 	const result = {
 		source,
-		playing:!!raw?.playing,
-		positionSeconds:Math.max(0,Number(raw?.positionSeconds)||0),
-		durationSeconds:Math.max(0,Number(raw?.durationSeconds)||0),
-		updatedAt:Number(raw?.updatedAt)||Date.now(),
+		playing: !!raw?.playing,
+		positionSeconds: Math.max(0, Number(raw?.positionSeconds) || 0),
+		durationSeconds: Math.max(0, Number(raw?.durationSeconds) || 0),
+		updatedAt: Number(raw?.updatedAt) || Date.now(),
 	};
-	for (const key of ["trackId","title","artist","album","broadcastProgramId","broadcastProgramName","visualSceneId","visualSceneName","nextTrackId","nextTitle","nextArtist"]) {
-		if (raw?.[key] != null) result[key] = String(raw[key]).slice(0,240);
+	for (const key of [
+		"trackId",
+		"title",
+		"artist",
+		"album",
+		"broadcastProgramId",
+		"broadcastProgramName",
+		"visualSceneId",
+		"visualSceneName",
+		"nextTrackId",
+		"nextTitle",
+		"nextArtist",
+	]) {
+		if (raw?.[key] != null) result[key] = String(raw[key]).slice(0, 240);
 	}
 	if (kind) result.broadcastKind = kind;
 	if (raw?.adBreakActive != null) result.adBreakActive = !!raw.adBreakActive;
@@ -3228,12 +4793,16 @@ function sanitizeVenueTransport(raw) {
 }
 
 function sanitizeEmbedUrl(value) {
-	const raw = String(value || "").trim().slice(0,2000);
+	const raw = String(value || "")
+		.trim()
+		.slice(0, 2000);
 	if (!raw) return "";
 	try {
 		const url = new URL(raw);
-		return ["http:","https:"].includes(url.protocol) ? url.toString() : "";
-	} catch { return ""; }
+		return ["http:", "https:"].includes(url.protocol) ? url.toString() : "";
+	} catch {
+		return "";
+	}
 }
 
 app.get("/api/rooms", requireAuth, async (req, res) => {
@@ -3245,7 +4814,7 @@ app.get("/api/rooms", requireAuth, async (req, res) => {
 			 LEFT JOIN ysong_room_venue_state v ON v.room_id=r.id
 			 WHERE rm.user_id=$1 OR r.visibility='public'
 			 ORDER BY (rm.user_id IS NOT NULL) DESC, r.updated_at DESC`,
-			[req.user.id]
+			[req.user.id],
 		);
 		return res.json({ rooms: rows.map(roomSummary) });
 	} catch (e) {
@@ -3257,8 +4826,12 @@ app.get("/api/rooms", requireAuth, async (req, res) => {
 app.post("/api/rooms", requireAuth, async (req, res) => {
 	const client = await pool.connect();
 	try {
-		const name = String(req.body?.name || "").trim().slice(0, 100);
-		const description = String(req.body?.description || "").trim().slice(0, 800);
+		const name = String(req.body?.name || "")
+			.trim()
+			.slice(0, 100);
+		const description = String(req.body?.description || "")
+			.trim()
+			.slice(0, 800);
 		const visibility = req.body?.visibility === "public" ? "public" : "private";
 		if (!name) return res.status(400).json({ error: "room_name_required" });
 		const id = crypto.randomUUID();
@@ -3266,16 +4839,21 @@ app.post("/api/rooms", requireAuth, async (req, res) => {
 		const { rows } = await client.query(
 			`INSERT INTO ysong_rooms (id, owner_user_id, name, description, visibility)
 			 VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-			[id, req.user.id, name, description, visibility]
+			[id, req.user.id, name, description, visibility],
 		);
-		await client.query(`INSERT INTO ysong_room_members (room_id,user_id,role) VALUES ($1,$2,'owner')`, [id, req.user.id]);
+		await client.query(`INSERT INTO ysong_room_members (room_id,user_id,role) VALUES ($1,$2,'owner')`, [
+			id,
+			req.user.id,
+		]);
 		await client.query("COMMIT");
 		return res.status(201).json({ room: roomSummary({ ...rows[0], member_role: "owner" }) });
 	} catch (e) {
 		await client.query("ROLLBACK").catch(() => {});
 		console.error("POST /api/rooms ERROR", e);
 		return res.status(500).json({ error: "room_create_failed" });
-	} finally { client.release(); }
+	} finally {
+		client.release();
+	}
 });
 
 app.get("/api/rooms/:id", requireAuth, async (req, res) => {
@@ -3287,20 +4865,29 @@ app.get("/api/rooms/:id", requireAuth, async (req, res) => {
 				`SELECT rm.user_id, rm.role, rm.joined_at, u.display_name
 				 FROM ysong_room_members rm JOIN users u ON u.id=rm.user_id
 				 WHERE rm.room_id=$1 ORDER BY CASE rm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, lower(u.display_name)`,
-				[room.id]
+				[room.id],
 			),
 			pool.query(
 				`SELECT rp.persona_id, rp.participation_mode, rp.added_at, p.name, p.metadata, p.owner_user_id, p.avatar_object_key
 				 FROM ysong_room_personas rp JOIN ysong_ai_rule_sets p ON p.id=rp.persona_id
 				 WHERE rp.room_id=$1 AND p.is_active=TRUE ORDER BY COALESCE((p.metadata->>'sortOrder')::int,999), lower(p.name)`,
-				[room.id]
+				[room.id],
 			),
 			fetchRoomMessages(room.id, 120),
 		]);
 		return res.json({
 			room: roomSummary(room),
-			members: memberRows.rows.map((m) => ({ userId: m.user_id, name: m.display_name || "Member", role: m.role, joinedAt: m.joined_at })),
-			personas: personaRows.rows.map((p) => ({ ...publicPersona(p), participationMode: p.participation_mode, addedAt: p.added_at })),
+			members: memberRows.rows.map((m) => ({
+				userId: m.user_id,
+				name: m.display_name || "Member",
+				role: m.role,
+				joinedAt: m.joined_at,
+			})),
+			personas: personaRows.rows.map((p) => ({
+				...publicPersona(p),
+				participationMode: p.participation_mode,
+				addedAt: p.added_at,
+			})),
 			messages,
 		});
 	} catch (e) {
@@ -3313,9 +4900,15 @@ app.post("/api/rooms/:id/join", requireAuth, async (req, res) => {
 	try {
 		const room = await roomAccess(String(req.params.id), req.user.id, { allowPublic: true });
 		if (!room || room.visibility !== "public") return res.status(404).json({ error: "public_room_not_found" });
-		await pool.query(`INSERT INTO ysong_room_members (room_id,user_id,role) VALUES ($1,$2,'member') ON CONFLICT DO NOTHING`, [room.id, req.user.id]);
+		await pool.query(
+			`INSERT INTO ysong_room_members (room_id,user_id,role) VALUES ($1,$2,'member') ON CONFLICT DO NOTHING`,
+			[room.id, req.user.id],
+		);
 		return res.json({ ok: true });
-	} catch (e) { console.error("POST /api/rooms/:id/join ERROR", e); return res.status(500).json({ error: "room_join_failed" }); }
+	} catch (e) {
+		console.error("POST /api/rooms/:id/join ERROR", e);
+		return res.status(500).json({ error: "room_join_failed" });
+	}
 });
 
 app.post("/api/rooms/:id/leave", requireAuth, async (req, res) => {
@@ -3325,20 +4918,32 @@ app.post("/api/rooms/:id/leave", requireAuth, async (req, res) => {
 		if (room.member_role === "owner") return res.status(400).json({ error: "owner_must_delete_room" });
 		await pool.query(`DELETE FROM ysong_room_members WHERE room_id=$1 AND user_id=$2`, [room.id, req.user.id]);
 		return res.json({ ok: true });
-	} catch (e) { console.error("POST /api/rooms/:id/leave ERROR", e); return res.status(500).json({ error: "room_leave_failed" }); }
+	} catch (e) {
+		console.error("POST /api/rooms/:id/leave ERROR", e);
+		return res.status(500).json({ error: "room_leave_failed" });
+	}
 });
 
 app.post("/api/rooms/:id/settings", requireAuth, async (req, res) => {
 	try {
 		const room = await roomAccess(String(req.params.id), req.user.id);
-		if (!room || !["owner","admin"].includes(room.member_role)) return res.status(403).json({ error: "room_admin_required" });
-		const name = req.body?.name == null ? room.name : String(req.body.name).trim().slice(0,100);
-		const description = req.body?.description == null ? room.description : String(req.body.description).trim().slice(0,800);
-		const visibility = req.body?.visibility == null ? room.visibility : (req.body.visibility === "public" ? "public" : "private");
+		if (!room || !["owner", "admin"].includes(room.member_role))
+			return res.status(403).json({ error: "room_admin_required" });
+		const name = req.body?.name == null ? room.name : String(req.body.name).trim().slice(0, 100);
+		const description =
+			req.body?.description == null ? room.description : String(req.body.description).trim().slice(0, 800);
+		const visibility =
+			req.body?.visibility == null ? room.visibility : req.body.visibility === "public" ? "public" : "private";
 		if (!name) return res.status(400).json({ error: "room_name_required" });
-		const { rows } = await pool.query(`UPDATE ysong_rooms SET name=$2,description=$3,visibility=$4,updated_at=now() WHERE id=$1 RETURNING *`, [room.id,name,description,visibility]);
+		const { rows } = await pool.query(
+			`UPDATE ysong_rooms SET name=$2,description=$3,visibility=$4,updated_at=now() WHERE id=$1 RETURNING *`,
+			[room.id, name, description, visibility],
+		);
 		return res.json({ room: roomSummary({ ...rows[0], member_role: room.member_role }) });
-	} catch (e) { console.error("POST /api/rooms/:id/settings ERROR", e); return res.status(500).json({ error: "room_update_failed" }); }
+	} catch (e) {
+		console.error("POST /api/rooms/:id/settings ERROR", e);
+		return res.status(500).json({ error: "room_update_failed" });
+	}
 });
 
 app.post("/api/rooms/:id/delete", requireAuth, async (req, res) => {
@@ -3347,20 +4952,35 @@ app.post("/api/rooms/:id/delete", requireAuth, async (req, res) => {
 		if (!room || room.member_role !== "owner") return res.status(403).json({ error: "room_owner_required" });
 		await pool.query(`DELETE FROM ysong_rooms WHERE id=$1`, [room.id]);
 		return res.json({ ok: true });
-	} catch (e) { console.error("POST /api/rooms/:id/delete ERROR", e); return res.status(500).json({ error: "room_delete_failed" }); }
+	} catch (e) {
+		console.error("POST /api/rooms/:id/delete ERROR", e);
+		return res.status(500).json({ error: "room_delete_failed" });
+	}
 });
 
 app.post("/api/rooms/:id/members/invite", requireAuth, async (req, res) => {
 	try {
 		const room = await roomAccess(String(req.params.id), req.user.id);
-		if (!room || !["owner","admin"].includes(room.member_role)) return res.status(403).json({ error: "room_admin_required" });
-		const displayName = String(req.body?.displayName || "").trim().slice(0,80);
+		if (!room || !["owner", "admin"].includes(room.member_role))
+			return res.status(403).json({ error: "room_admin_required" });
+		const displayName = String(req.body?.displayName || "")
+			.trim()
+			.slice(0, 80);
 		if (!displayName) return res.status(400).json({ error: "display_name_required" });
-		const { rows } = await pool.query(`SELECT id,display_name FROM users WHERE lower(display_name)=lower($1) LIMIT 1`, [displayName]);
+		const { rows } = await pool.query(
+			`SELECT id,display_name FROM users WHERE lower(display_name)=lower($1) LIMIT 1`,
+			[displayName],
+		);
 		if (!rows[0]) return res.status(404).json({ error: "user_not_found" });
-		await pool.query(`INSERT INTO ysong_room_members (room_id,user_id,role) VALUES ($1,$2,'member') ON CONFLICT DO NOTHING`, [room.id, rows[0].id]);
+		await pool.query(
+			`INSERT INTO ysong_room_members (room_id,user_id,role) VALUES ($1,$2,'member') ON CONFLICT DO NOTHING`,
+			[room.id, rows[0].id],
+		);
 		return res.json({ ok: true, member: { userId: rows[0].id, name: rows[0].display_name, role: "member" } });
-	} catch (e) { console.error("POST /api/rooms/:id/members/invite ERROR", e); return res.status(500).json({ error: "room_invite_failed" }); }
+	} catch (e) {
+		console.error("POST /api/rooms/:id/members/invite ERROR", e);
+		return res.status(500).json({ error: "room_invite_failed" });
+	}
 });
 
 app.post("/api/rooms/:id/personas", requireAuth, async (req, res) => {
@@ -3370,24 +4990,35 @@ app.post("/api/rooms/:id/personas", requireAuth, async (req, res) => {
 		const personaId = String(req.body?.personaId || "");
 		const persona = await getPersonaRowForUser(req.user.id, personaId);
 		if (!persona || String(persona.id) !== personaId) return res.status(404).json({ error: "persona_not_found" });
-		const mode = ["active","listening","mention_only","muted"].includes(req.body?.participationMode) ? req.body.participationMode : "active";
+		const mode = ["active", "listening", "mention_only", "muted"].includes(req.body?.participationMode)
+			? req.body.participationMode
+			: "active";
 		await pool.query(
 			`INSERT INTO ysong_room_personas (room_id,persona_id,added_by_user_id,participation_mode)
 			 VALUES ($1,$2,$3,$4)
 			 ON CONFLICT (room_id,persona_id) DO UPDATE SET participation_mode=EXCLUDED.participation_mode`,
-			[room.id, personaId, req.user.id, mode]
+			[room.id, personaId, req.user.id, mode],
 		);
 		return res.json({ ok: true, persona: { ...publicPersona(persona), participationMode: mode } });
-	} catch (e) { console.error("POST /api/rooms/:id/personas ERROR", e); return res.status(500).json({ error: "room_persona_add_failed" }); }
+	} catch (e) {
+		console.error("POST /api/rooms/:id/personas ERROR", e);
+		return res.status(500).json({ error: "room_persona_add_failed" });
+	}
 });
 
 app.post("/api/rooms/:id/personas/remove", requireAuth, async (req, res) => {
 	try {
 		const room = await roomAccess(String(req.params.id), req.user.id);
 		if (!room) return res.status(403).json({ error: "room_membership_required" });
-		await pool.query(`DELETE FROM ysong_room_personas WHERE room_id=$1 AND persona_id=$2`, [room.id, String(req.body?.personaId || "")]);
+		await pool.query(`DELETE FROM ysong_room_personas WHERE room_id=$1 AND persona_id=$2`, [
+			room.id,
+			String(req.body?.personaId || ""),
+		]);
 		return res.json({ ok: true });
-	} catch (e) { console.error("POST /api/rooms/:id/personas/remove ERROR", e); return res.status(500).json({ error: "room_persona_remove_failed" }); }
+	} catch (e) {
+		console.error("POST /api/rooms/:id/personas/remove ERROR", e);
+		return res.status(500).json({ error: "room_persona_remove_failed" });
+	}
 });
 
 app.post("/api/rooms/:id/personas/mode", requireAuth, async (req, res) => {
@@ -3395,32 +5026,47 @@ app.post("/api/rooms/:id/personas/mode", requireAuth, async (req, res) => {
 		const room = await roomAccess(String(req.params.id), req.user.id);
 		if (!room) return res.status(403).json({ error: "room_membership_required" });
 		const mode = String(req.body?.participationMode || "");
-		if (!["active","listening","mention_only","muted"].includes(mode)) return res.status(400).json({ error: "invalid_participation_mode" });
-		await pool.query(`UPDATE ysong_room_personas SET participation_mode=$3 WHERE room_id=$1 AND persona_id=$2`, [room.id, String(req.body?.personaId || ""), mode]);
+		if (!["active", "listening", "mention_only", "muted"].includes(mode))
+			return res.status(400).json({ error: "invalid_participation_mode" });
+		await pool.query(`UPDATE ysong_room_personas SET participation_mode=$3 WHERE room_id=$1 AND persona_id=$2`, [
+			room.id,
+			String(req.body?.personaId || ""),
+			mode,
+		]);
 		return res.json({ ok: true });
-	} catch (e) { console.error("POST /api/rooms/:id/personas/mode ERROR", e); return res.status(500).json({ error: "room_persona_mode_failed" }); }
+	} catch (e) {
+		console.error("POST /api/rooms/:id/personas/mode ERROR", e);
+		return res.status(500).json({ error: "room_persona_mode_failed" });
+	}
 });
 
 app.post("/api/rooms/:id/messages", requireAuth, async (req, res) => {
 	try {
 		const room = await roomAccess(String(req.params.id), req.user.id);
 		if (!room) return res.status(403).json({ error: "room_membership_required" });
-		const content = String(req.body?.content || "").trim().slice(0,8000);
+		const content = String(req.body?.content || "")
+			.trim()
+			.slice(0, 8000);
 		if (!content) return res.status(400).json({ error: "message_required" });
 		const id = crypto.randomUUID();
 		await pool.query(
 			`INSERT INTO ysong_room_messages (id,room_id,sender_kind,sender_user_id,content,reply_to_message_id)
 			 VALUES ($1,$2,'user',$3,$4,$5)`,
-			[id, room.id, req.user.id, content, req.body?.replyToMessageId || null]
+			[id, room.id, req.user.id, content, req.body?.replyToMessageId || null],
 		);
 		await pool.query(`UPDATE ysong_rooms SET updated_at=now() WHERE id=$1`, [room.id]);
 		const messages = await fetchRoomMessages(room.id, 1);
-		return res.status(201).json({ message: messages[messages.length-1] });
-	} catch (e) { console.error("POST /api/rooms/:id/messages ERROR", e); return res.status(500).json({ error: "room_message_failed" }); }
+		return res.status(201).json({ message: messages[messages.length - 1] });
+	} catch (e) {
+		console.error("POST /api/rooms/:id/messages ERROR", e);
+		return res.status(500).json({ error: "room_message_failed" });
+	}
 });
 
 function normalizeMentionName(name) {
-	return String(name || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+	return String(name || "")
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "");
 }
 
 function personaDisplayName(persona) {
@@ -3451,22 +5097,22 @@ function chooseRoomPersonas(personas, triggerText, preferredPersonaIds = []) {
 	const eligible = personas.filter((p) => p.participation_mode !== "muted");
 	const preferred = new Set((Array.isArray(preferredPersonaIds) ? preferredPersonaIds : []).map(String));
 	const selectedById = eligible.filter((p) => preferred.has(String(p.id)));
-	if (selectedById.length) return selectedById.slice(0,3);
+	if (selectedById.length) return selectedById.slice(0, 3);
 
 	const directlyMentioned = eligible.filter((p) => textDirectlyMentionsPersona(text, p));
-	if (directlyMentioned.length) return directlyMentioned.slice(0,3);
+	if (directlyMentioned.length) return directlyMentioned.slice(0, 3);
 
 	// A human should not have to know the exact @ token to wake a persona. Saying
 	// "Pop Princess in the house" is enough to put Pop Princess first in line.
 	const naturallyNamed = eligible.filter((p) => textNaturallyNamesPersona(text, p));
-	if (naturallyNamed.length) return naturallyNamed.slice(0,3);
+	if (naturallyNamed.length) return naturallyNamed.slice(0, 3);
 
 	const explicitAll = /@(band|room|everyone|all|personas)\b/i.test(text);
-	if (explicitAll) return eligible.filter((p) => ["active","listening"].includes(p.participation_mode)).slice(0,3);
+	if (explicitAll) return eligible.filter((p) => ["active", "listening"].includes(p.participation_mode)).slice(0, 3);
 
 	const active = personas.filter((p) => p.participation_mode === "active");
 	if (!active.length) return [];
-	const seed = Math.abs([...text].reduce((a,c) => a + c.charCodeAt(0), 0));
+	const seed = Math.abs([...text].reduce((a, c) => a + c.charCodeAt(0), 0));
 	const firstIndex = seed % active.length;
 	const first = active[firstIndex];
 	const picked = [first];
@@ -3488,198 +5134,427 @@ function discoverRoomPersonaFollowups(personas, generatedText, speakerId, spokeC
 	// Explicitly naming another persona is the strongest baton pass.
 	const named = eligible.filter((p) => textDirectlyMentionsPersona(text, p) || textNaturallyNamesPersona(text, p));
 	if (named.length) {
-		return named.filter((p) => (spokeCounts.get(String(p.id)) || 0) < 2 && !queuedIds.has(String(p.id))).slice(0,2);
+		return named
+			.filter((p) => (spokeCounts.get(String(p.id)) || 0) < 2 && !queuedIds.has(String(p.id)))
+			.slice(0, 2);
 	}
 
 	// Natural chat sometimes ends by handing the floor to somebody else without
 	// using their exact name. Permit one active, unspoken persona to answer, but
 	// keep a strict turn budget in the caller so the AIs cannot talk forever.
-	const invitesReply = /\?\s*$|\byour move\b|\bwhat do you think\b|\bthoughts\b|\bany thoughts\b|\bwhat say you\b/i.test(text);
+	const invitesReply =
+		/\?\s*$|\byour move\b|\bwhat do you think\b|\bthoughts\b|\bany thoughts\b|\bwhat say you\b/i.test(text);
 	if (!invitesReply) return [];
 	const candidates = eligible
-		.filter((p) => p.participation_mode === "active" && (spokeCounts.get(String(p.id)) || 0) === 0 && !queuedIds.has(String(p.id)))
-		.sort((a,b) => Number(b?.metadata?.socialEnergy ?? 0.5) - Number(a?.metadata?.socialEnergy ?? 0.5));
+		.filter(
+			(p) =>
+				p.participation_mode === "active" &&
+				(spokeCounts.get(String(p.id)) || 0) === 0 &&
+				!queuedIds.has(String(p.id)),
+		)
+		.sort((a, b) => Number(b?.metadata?.socialEnergy ?? 0.5) - Number(a?.metadata?.socialEnergy ?? 0.5));
 	if (!candidates.length) return [];
 	const candidate = candidates[0];
 	const energy = Number(candidate?.metadata?.socialEnergy ?? 0.6);
 	return Math.random() < Math.min(0.8, Math.max(0.35, energy * 0.8)) ? [candidate] : [];
 }
 
-
 // -------------------- Phase 14: live Room venues --------------------
 app.get("/api/rooms/:id/venue", requireAuth, async (req, res) => {
 	try {
-		const room = await roomAccess(String(req.params.id), req.user.id, { allowPublic:true });
-		if (!room) return res.status(404).json({ error:"room_not_found" });
+		const room = await roomAccess(String(req.params.id), req.user.id, { allowPublic: true });
+		if (!room) return res.status(404).json({ error: "room_not_found" });
 		const venueRow = await ensureRoomVenueState(room.id);
 		const since = String(req.query?.since || "").trim();
-		const [events,requests,poll] = await Promise.all([
+		const [events, requests, poll] = await Promise.all([
 			fetchRoomAudienceEvents(room.id, since || null),
 			room.member_role ? fetchRoomTrackRequests(room.id, req.user.id) : Promise.resolve([]),
 			room.member_role ? fetchRoomOpenPoll(room.id, req.user.id) : Promise.resolve(null),
 		]);
-		return res.json({ venue:roomVenuePublic(venueRow), events, requests, poll, serverNow:Date.now() });
-	} catch (e) { console.error("GET /api/rooms/:id/venue ERROR",e); return res.status(500).json({error:"room_venue_load_failed"}); }
+		return res.json({ venue: roomVenuePublic(venueRow), events, requests, poll, serverNow: Date.now() });
+	} catch (e) {
+		console.error("GET /api/rooms/:id/venue ERROR", e);
+		return res.status(500).json({ error: "room_venue_load_failed" });
+	}
 });
 
 app.post("/api/rooms/:id/venue/settings", requireAuth, async (req, res) => {
 	try {
 		const room = await roomAccess(String(req.params.id), req.user.id);
-		if (!room || !["owner","admin"].includes(room.member_role)) return res.status(403).json({error:"room_admin_required"});
+		if (!room || !["owner", "admin"].includes(room.member_role))
+			return res.status(403).json({ error: "room_admin_required" });
 		const previous = await ensureRoomVenueState(room.id);
 		const body = req.body || {};
 		const active = body.active == null ? !!previous.active : !!body.active;
-		const mode = ["listening","radio","visual","performance"].includes(body.mode) ? body.mode : previous.mode;
-		const stageTitle = body.stageTitle == null ? previous.stage_title : String(body.stageTitle||"").trim().slice(0,120);
-		const stageSubtitle = body.stageSubtitle == null ? previous.stage_subtitle : String(body.stageSubtitle||"").trim().slice(0,240);
-		const streamMode = body.streamMode == null ? previous.stream_mode : (body.streamMode === "embed" ? "embed" : "none");
+		const mode = ["listening", "radio", "visual", "performance"].includes(body.mode) ? body.mode : previous.mode;
+		const stageTitle =
+			body.stageTitle == null
+				? previous.stage_title
+				: String(body.stageTitle || "")
+						.trim()
+						.slice(0, 120);
+		const stageSubtitle =
+			body.stageSubtitle == null
+				? previous.stage_subtitle
+				: String(body.stageSubtitle || "")
+						.trim()
+						.slice(0, 240);
+		const streamMode =
+			body.streamMode == null ? previous.stream_mode : body.streamMode === "embed" ? "embed" : "none";
 		const streamUrl = body.streamUrl == null ? previous.stream_url : sanitizeEmbedUrl(body.streamUrl);
-		const streamLabel = body.streamLabel == null ? previous.stream_label : String(body.streamLabel||"").trim().slice(0,120);
-		const requestsEnabled = body.requestsEnabled == null ? previous.requests_enabled !== false : !!body.requestsEnabled;
+		const streamLabel =
+			body.streamLabel == null
+				? previous.stream_label
+				: String(body.streamLabel || "")
+						.trim()
+						.slice(0, 120);
+		const requestsEnabled =
+			body.requestsEnabled == null ? previous.requests_enabled !== false : !!body.requestsEnabled;
 		const votesEnabled = body.votesEnabled == null ? previous.votes_enabled !== false : !!body.votesEnabled;
-		const audienceEffectsEnabled = body.audienceEffectsEnabled == null ? previous.audience_effects_enabled !== false : !!body.audienceEffectsEnabled;
-		const effectCooldownSeconds = body.effectCooldownSeconds == null ? Number(previous.effect_cooldown_seconds)||12 : Math.max(1,Math.min(600,Math.round(Number(body.effectCooldownSeconds)||12)));
+		const audienceEffectsEnabled =
+			body.audienceEffectsEnabled == null
+				? previous.audience_effects_enabled !== false
+				: !!body.audienceEffectsEnabled;
+		const effectCooldownSeconds =
+			body.effectCooldownSeconds == null
+				? Number(previous.effect_cooldown_seconds) || 12
+				: Math.max(1, Math.min(600, Math.round(Number(body.effectCooldownSeconds) || 12)));
 		const startedNow = active && !previous.active;
 		const { rows } = await pool.query(
 			`UPDATE ysong_room_venue_state SET active=$2,host_user_id=CASE WHEN $2 THEN $3 ELSE host_user_id END,mode=$4,stage_title=$5,stage_subtitle=$6,
 			 stream_mode=$7,stream_url=$8,stream_label=$9,requests_enabled=$10,votes_enabled=$11,audience_effects_enabled=$12,effect_cooldown_seconds=$13,
 			 started_at=CASE WHEN $14 THEN now() WHEN NOT $2 THEN NULL ELSE started_at END,transport=CASE WHEN NOT $2 THEN '{}'::jsonb ELSE transport END,updated_at=now()
 			 WHERE room_id=$1 RETURNING *`,
-			[room.id,active,req.user.id,mode,stageTitle,stageSubtitle,streamMode,streamUrl,streamLabel,requestsEnabled,votesEnabled,audienceEffectsEnabled,effectCooldownSeconds,startedNow]
+			[
+				room.id,
+				active,
+				req.user.id,
+				mode,
+				stageTitle,
+				stageSubtitle,
+				streamMode,
+				streamUrl,
+				streamLabel,
+				requestsEnabled,
+				votesEnabled,
+				audienceEffectsEnabled,
+				effectCooldownSeconds,
+				startedNow,
+			],
 		);
-		if (startedNow) await insertRoomAudienceEvent(room.id,req.user.id,"system",{type:"venue-started",mode,stageTitle});
-		if (!active && previous.active) await insertRoomAudienceEvent(room.id,req.user.id,"system",{type:"venue-ended"});
-		const withHost = await pool.query(`SELECT v.*,u.display_name AS host_name FROM ysong_room_venue_state v LEFT JOIN users u ON u.id=v.host_user_id WHERE v.room_id=$1`,[room.id]);
-		return res.json({venue:roomVenuePublic(withHost.rows[0]||rows[0])});
-	} catch (e) { console.error("POST /api/rooms/:id/venue/settings ERROR",e); return res.status(500).json({error:"room_venue_update_failed"}); }
+		if (startedNow)
+			await insertRoomAudienceEvent(room.id, req.user.id, "system", { type: "venue-started", mode, stageTitle });
+		if (!active && previous.active)
+			await insertRoomAudienceEvent(room.id, req.user.id, "system", { type: "venue-ended" });
+		const withHost = await pool.query(
+			`SELECT v.*,u.display_name AS host_name FROM ysong_room_venue_state v LEFT JOIN users u ON u.id=v.host_user_id WHERE v.room_id=$1`,
+			[room.id],
+		);
+		return res.json({ venue: roomVenuePublic(withHost.rows[0] || rows[0]) });
+	} catch (e) {
+		console.error("POST /api/rooms/:id/venue/settings ERROR", e);
+		return res.status(500).json({ error: "room_venue_update_failed" });
+	}
 });
 
 app.post("/api/rooms/:id/venue/transport", requireAuth, async (req, res) => {
 	try {
 		const room = await roomAccess(String(req.params.id), req.user.id);
-		if (!room) return res.status(403).json({error:"room_membership_required"});
+		if (!room) return res.status(403).json({ error: "room_membership_required" });
 		const venue = await ensureRoomVenueState(room.id);
-		if (!venue.active) return res.status(409).json({error:"room_venue_not_live"});
-		const canPublish = String(venue.host_user_id||"") === String(req.user.id) || ["owner","admin"].includes(room.member_role);
-		if (!canPublish) return res.status(403).json({error:"room_host_required"});
+		if (!venue.active) return res.status(409).json({ error: "room_venue_not_live" });
+		const canPublish =
+			String(venue.host_user_id || "") === String(req.user.id) || ["owner", "admin"].includes(room.member_role);
+		if (!canPublish) return res.status(403).json({ error: "room_host_required" });
 		const transport = sanitizeVenueTransport(req.body?.transport || {});
-		await pool.query(`UPDATE ysong_room_venue_state SET transport=$2::jsonb,updated_at=now() WHERE room_id=$1`,[room.id,JSON.stringify(transport)]);
+		await pool.query(`UPDATE ysong_room_venue_state SET transport=$2::jsonb,updated_at=now() WHERE room_id=$1`, [
+			room.id,
+			JSON.stringify(transport),
+		]);
 		const next = await ensureRoomVenueState(room.id);
-		return res.json({ok:true,venue:roomVenuePublic(next)});
-	} catch (e) { console.error("POST /api/rooms/:id/venue/transport ERROR",e); return res.status(500).json({error:"room_transport_publish_failed"}); }
+		return res.json({ ok: true, venue: roomVenuePublic(next) });
+	} catch (e) {
+		console.error("POST /api/rooms/:id/venue/transport ERROR", e);
+		return res.status(500).json({ error: "room_transport_publish_failed" });
+	}
 });
 
 app.post("/api/rooms/:id/venue/reaction", requireAuth, async (req, res) => {
 	try {
 		const room = await roomAccess(String(req.params.id), req.user.id);
-		if (!room) return res.status(403).json({error:"room_membership_required"});
-		const venue = await ensureRoomVenueState(room.id); if (!venue.active) return res.status(409).json({error:"room_venue_not_live"});
-		const emoji = String(req.body?.emoji||"").trim().slice(0,16); if (!emoji) return res.status(400).json({error:"emoji_required"});
-		const event = await insertRoomAudienceEvent(room.id,req.user.id,"reaction",{emoji});
-		return res.json({event});
-	} catch (e) { console.error("POST /api/rooms/:id/venue/reaction ERROR",e); return res.status(500).json({error:"room_reaction_failed"}); }
+		if (!room) return res.status(403).json({ error: "room_membership_required" });
+		const venue = await ensureRoomVenueState(room.id);
+		if (!venue.active) return res.status(409).json({ error: "room_venue_not_live" });
+		const emoji = String(req.body?.emoji || "")
+			.trim()
+			.slice(0, 16);
+		if (!emoji) return res.status(400).json({ error: "emoji_required" });
+		const event = await insertRoomAudienceEvent(room.id, req.user.id, "reaction", { emoji });
+		return res.json({ event });
+	} catch (e) {
+		console.error("POST /api/rooms/:id/venue/reaction ERROR", e);
+		return res.status(500).json({ error: "room_reaction_failed" });
+	}
 });
 
 app.post("/api/rooms/:id/venue/effect", requireAuth, async (req, res) => {
 	try {
 		const room = await roomAccess(String(req.params.id), req.user.id);
-		if (!room) return res.status(403).json({error:"room_membership_required"});
-		const venue = await ensureRoomVenueState(room.id); if (!venue.active) return res.status(409).json({error:"room_venue_not_live"});
-		if (!venue.audience_effects_enabled) return res.status(403).json({error:"audience_effects_disabled"});
-		const allowed = new Set(["applause","hearts","confetti","lightning","fire","snow","camera-shake","strobe"]);
-		const effectId = String(req.body?.effectId||""); if (!allowed.has(effectId)) return res.status(400).json({error:"invalid_effect"});
-		const recent = await pool.query(`SELECT created_at FROM ysong_room_audience_events WHERE room_id=$1 AND actor_user_id=$2 AND kind='effect' ORDER BY created_at DESC LIMIT 1`,[room.id,req.user.id]);
+		if (!room) return res.status(403).json({ error: "room_membership_required" });
+		const venue = await ensureRoomVenueState(room.id);
+		if (!venue.active) return res.status(409).json({ error: "room_venue_not_live" });
+		if (!venue.audience_effects_enabled) return res.status(403).json({ error: "audience_effects_disabled" });
+		const allowed = new Set([
+			"applause",
+			"hearts",
+			"confetti",
+			"lightning",
+			"fire",
+			"snow",
+			"camera-shake",
+			"strobe",
+		]);
+		const effectId = String(req.body?.effectId || "");
+		if (!allowed.has(effectId)) return res.status(400).json({ error: "invalid_effect" });
+		const recent = await pool.query(
+			`SELECT created_at FROM ysong_room_audience_events WHERE room_id=$1 AND actor_user_id=$2 AND kind='effect' ORDER BY created_at DESC LIMIT 1`,
+			[room.id, req.user.id],
+		);
 		const lastMs = recent.rows[0]?.created_at ? new Date(recent.rows[0].created_at).getTime() : 0;
-		const cooldownMs = Math.max(1000,(Number(venue.effect_cooldown_seconds)||12)*1000);
-		const remaining = Math.max(0,cooldownMs-(Date.now()-lastMs));
-		if (remaining > 0) return res.status(429).json({error:"effect_cooldown",cooldownRemainingSeconds:Math.ceil(remaining/1000)});
-		const event = await insertRoomAudienceEvent(room.id,req.user.id,"effect",{effectId});
-		return res.json({event,cooldownRemainingSeconds:Number(venue.effect_cooldown_seconds)||12});
-	} catch (e) { console.error("POST /api/rooms/:id/venue/effect ERROR",e); return res.status(500).json({error:"room_effect_failed"}); }
+		const cooldownMs = Math.max(1000, (Number(venue.effect_cooldown_seconds) || 12) * 1000);
+		const remaining = Math.max(0, cooldownMs - (Date.now() - lastMs));
+		if (remaining > 0)
+			return res
+				.status(429)
+				.json({ error: "effect_cooldown", cooldownRemainingSeconds: Math.ceil(remaining / 1000) });
+		const event = await insertRoomAudienceEvent(room.id, req.user.id, "effect", { effectId });
+		return res.json({ event, cooldownRemainingSeconds: Number(venue.effect_cooldown_seconds) || 12 });
+	} catch (e) {
+		console.error("POST /api/rooms/:id/venue/effect ERROR", e);
+		return res.status(500).json({ error: "room_effect_failed" });
+	}
 });
 
 app.post("/api/rooms/:id/venue/requests", requireAuth, async (req, res) => {
 	try {
-		const room = await roomAccess(String(req.params.id), req.user.id); if (!room) return res.status(403).json({error:"room_membership_required"});
-		const venue = await ensureRoomVenueState(room.id); if (!venue.active || !venue.requests_enabled) return res.status(403).json({error:"room_requests_disabled"});
-		const title=String(req.body?.title||"").trim().slice(0,160); const artist=String(req.body?.artist||"").trim().slice(0,160); const trackId=req.body?.trackId?String(req.body.trackId).slice(0,160):null;
-		if (!title) return res.status(400).json({error:"request_title_required"});
-		const id=crypto.randomUUID();
-		const {rows}=await pool.query(`INSERT INTO ysong_room_track_requests (id,room_id,requester_user_id,track_id,title,artist) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,[id,room.id,req.user.id,trackId,title,artist]);
-		const requesterName=await publicNameForUserId(req.user.id);
-		const request={id,roomId:room.id,requesterUserId:req.user.id,requesterName:requesterName||"Member",trackId,title,artist,status:"pending",votes:0,myVote:false,createdAt:rows[0].created_at,updatedAt:rows[0].updated_at};
-		await insertRoomAudienceEvent(room.id,req.user.id,"system",{type:"track-request",requestId:id,title,artist});
-		return res.status(201).json({request});
-	} catch (e) { console.error("POST /api/rooms/:id/venue/requests ERROR",e); return res.status(500).json({error:"room_request_failed"}); }
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room) return res.status(403).json({ error: "room_membership_required" });
+		const venue = await ensureRoomVenueState(room.id);
+		if (!venue.active || !venue.requests_enabled) return res.status(403).json({ error: "room_requests_disabled" });
+		const title = String(req.body?.title || "")
+			.trim()
+			.slice(0, 160);
+		const artist = String(req.body?.artist || "")
+			.trim()
+			.slice(0, 160);
+		const trackId = req.body?.trackId ? String(req.body.trackId).slice(0, 160) : null;
+		if (!title) return res.status(400).json({ error: "request_title_required" });
+		const id = crypto.randomUUID();
+		const { rows } = await pool.query(
+			`INSERT INTO ysong_room_track_requests (id,room_id,requester_user_id,track_id,title,artist) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+			[id, room.id, req.user.id, trackId, title, artist],
+		);
+		const requesterName = await publicNameForUserId(req.user.id);
+		const request = {
+			id,
+			roomId: room.id,
+			requesterUserId: req.user.id,
+			requesterName: requesterName || "Member",
+			trackId,
+			title,
+			artist,
+			status: "pending",
+			votes: 0,
+			myVote: false,
+			createdAt: rows[0].created_at,
+			updatedAt: rows[0].updated_at,
+		};
+		await insertRoomAudienceEvent(room.id, req.user.id, "system", {
+			type: "track-request",
+			requestId: id,
+			title,
+			artist,
+		});
+		return res.status(201).json({ request });
+	} catch (e) {
+		console.error("POST /api/rooms/:id/venue/requests ERROR", e);
+		return res.status(500).json({ error: "room_request_failed" });
+	}
 });
 
 app.post("/api/rooms/:id/venue/requests/:requestId/vote", requireAuth, async (req, res) => {
 	try {
-		const room = await roomAccess(String(req.params.id), req.user.id); if (!room) return res.status(403).json({error:"room_membership_required"});
-		const venue = await ensureRoomVenueState(room.id); if (!venue.active || !venue.votes_enabled) return res.status(403).json({error:"room_votes_disabled"});
-		const requestId=String(req.params.requestId); const exists=await pool.query(`SELECT id FROM ysong_room_track_requests WHERE id=$1 AND room_id=$2 AND status IN ('pending','approved')`,[requestId,room.id]); if(!exists.rows[0])return res.status(404).json({error:"request_not_found"});
-		const mine=await pool.query(`SELECT 1 FROM ysong_room_request_votes WHERE request_id=$1 AND user_id=$2`,[requestId,req.user.id]);
-		if(mine.rows[0]) await pool.query(`DELETE FROM ysong_room_request_votes WHERE request_id=$1 AND user_id=$2`,[requestId,req.user.id]); else await pool.query(`INSERT INTO ysong_room_request_votes (request_id,user_id) VALUES ($1,$2)`,[requestId,req.user.id]);
-		const requests=await fetchRoomTrackRequests(room.id,req.user.id); const request=requests.find((r)=>r.id===requestId); return res.json({request});
-	} catch (e) { console.error("POST room request vote ERROR",e); return res.status(500).json({error:"room_request_vote_failed"}); }
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room) return res.status(403).json({ error: "room_membership_required" });
+		const venue = await ensureRoomVenueState(room.id);
+		if (!venue.active || !venue.votes_enabled) return res.status(403).json({ error: "room_votes_disabled" });
+		const requestId = String(req.params.requestId);
+		const exists = await pool.query(
+			`SELECT id FROM ysong_room_track_requests WHERE id=$1 AND room_id=$2 AND status IN ('pending','approved')`,
+			[requestId, room.id],
+		);
+		if (!exists.rows[0]) return res.status(404).json({ error: "request_not_found" });
+		const mine = await pool.query(`SELECT 1 FROM ysong_room_request_votes WHERE request_id=$1 AND user_id=$2`, [
+			requestId,
+			req.user.id,
+		]);
+		if (mine.rows[0])
+			await pool.query(`DELETE FROM ysong_room_request_votes WHERE request_id=$1 AND user_id=$2`, [
+				requestId,
+				req.user.id,
+			]);
+		else
+			await pool.query(`INSERT INTO ysong_room_request_votes (request_id,user_id) VALUES ($1,$2)`, [
+				requestId,
+				req.user.id,
+			]);
+		const requests = await fetchRoomTrackRequests(room.id, req.user.id);
+		const request = requests.find((r) => r.id === requestId);
+		return res.json({ request });
+	} catch (e) {
+		console.error("POST room request vote ERROR", e);
+		return res.status(500).json({ error: "room_request_vote_failed" });
+	}
 });
 
 app.post("/api/rooms/:id/venue/requests/:requestId/status", requireAuth, async (req, res) => {
 	try {
-		const room = await roomAccess(String(req.params.id), req.user.id); if(!room||!["owner","admin"].includes(room.member_role))return res.status(403).json({error:"room_admin_required"});
-		const status=["pending","approved","rejected","played"].includes(req.body?.status)?req.body.status:null; if(!status)return res.status(400).json({error:"invalid_request_status"});
-		const requestId=String(req.params.requestId); const updated=await pool.query(`UPDATE ysong_room_track_requests SET status=$3,updated_at=now() WHERE id=$1 AND room_id=$2 RETURNING *`,[requestId,room.id,status]); if(!updated.rows[0])return res.status(404).json({error:"request_not_found"});
-		const requests=await fetchRoomTrackRequests(room.id,req.user.id); const request=requests.find((r)=>r.id===requestId)||{...updated.rows[0],id:requestId,roomId:room.id}; return res.json({request});
-	} catch (e) { console.error("POST room request status ERROR",e); return res.status(500).json({error:"room_request_moderation_failed"}); }
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room || !["owner", "admin"].includes(room.member_role))
+			return res.status(403).json({ error: "room_admin_required" });
+		const status = ["pending", "approved", "rejected", "played"].includes(req.body?.status)
+			? req.body.status
+			: null;
+		if (!status) return res.status(400).json({ error: "invalid_request_status" });
+		const requestId = String(req.params.requestId);
+		const updated = await pool.query(
+			`UPDATE ysong_room_track_requests SET status=$3,updated_at=now() WHERE id=$1 AND room_id=$2 RETURNING *`,
+			[requestId, room.id, status],
+		);
+		if (!updated.rows[0]) return res.status(404).json({ error: "request_not_found" });
+		const requests = await fetchRoomTrackRequests(room.id, req.user.id);
+		const request = requests.find((r) => r.id === requestId) || {
+			...updated.rows[0],
+			id: requestId,
+			roomId: room.id,
+		};
+		return res.json({ request });
+	} catch (e) {
+		console.error("POST room request status ERROR", e);
+		return res.status(500).json({ error: "room_request_moderation_failed" });
+	}
 });
 
 app.post("/api/rooms/:id/venue/polls", requireAuth, async (req, res) => {
 	try {
-		const room=await roomAccess(String(req.params.id),req.user.id); if(!room||!["owner","admin"].includes(room.member_role))return res.status(403).json({error:"room_admin_required"});
-		const venue=await ensureRoomVenueState(room.id); if(!venue.active||!venue.votes_enabled)return res.status(403).json({error:"room_votes_disabled"});
-		const question=String(req.body?.question||"").trim().slice(0,240); const labels=(Array.isArray(req.body?.options)?req.body.options:[]).map((x)=>String(x||"").trim().slice(0,120)).filter(Boolean).slice(0,8); if(!question||labels.length<2)return res.status(400).json({error:"poll_question_and_options_required"});
-		await pool.query(`UPDATE ysong_room_polls SET status='closed',updated_at=now() WHERE room_id=$1 AND status='open'`,[room.id]);
-		const options=labels.map((label,index)=>({id:`option-${index+1}`,label})); const duration=Math.max(0,Math.min(86400,Number(req.body?.durationSeconds)||0)); const closesAt=duration>0?new Date(Date.now()+duration*1000):null; const id=crypto.randomUUID();
-		await pool.query(`INSERT INTO ysong_room_polls (id,room_id,created_by_user_id,question,options,closes_at) VALUES ($1,$2,$3,$4,$5::jsonb,$6)`,[id,room.id,req.user.id,question,JSON.stringify(options),closesAt]);
-		const poll=await fetchRoomOpenPoll(room.id,req.user.id); await insertRoomAudienceEvent(room.id,req.user.id,"system",{type:"poll-started",pollId:id,question}); return res.status(201).json({poll});
-	} catch (e) { console.error("POST room poll ERROR",e); return res.status(500).json({error:"room_poll_create_failed"}); }
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room || !["owner", "admin"].includes(room.member_role))
+			return res.status(403).json({ error: "room_admin_required" });
+		const venue = await ensureRoomVenueState(room.id);
+		if (!venue.active || !venue.votes_enabled) return res.status(403).json({ error: "room_votes_disabled" });
+		const question = String(req.body?.question || "")
+			.trim()
+			.slice(0, 240);
+		const labels = (Array.isArray(req.body?.options) ? req.body.options : [])
+			.map((x) =>
+				String(x || "")
+					.trim()
+					.slice(0, 120),
+			)
+			.filter(Boolean)
+			.slice(0, 8);
+		if (!question || labels.length < 2)
+			return res.status(400).json({ error: "poll_question_and_options_required" });
+		await pool.query(
+			`UPDATE ysong_room_polls SET status='closed',updated_at=now() WHERE room_id=$1 AND status='open'`,
+			[room.id],
+		);
+		const options = labels.map((label, index) => ({ id: `option-${index + 1}`, label }));
+		const duration = Math.max(0, Math.min(86400, Number(req.body?.durationSeconds) || 0));
+		const closesAt = duration > 0 ? new Date(Date.now() + duration * 1000) : null;
+		const id = crypto.randomUUID();
+		await pool.query(
+			`INSERT INTO ysong_room_polls (id,room_id,created_by_user_id,question,options,closes_at) VALUES ($1,$2,$3,$4,$5::jsonb,$6)`,
+			[id, room.id, req.user.id, question, JSON.stringify(options), closesAt],
+		);
+		const poll = await fetchRoomOpenPoll(room.id, req.user.id);
+		await insertRoomAudienceEvent(room.id, req.user.id, "system", { type: "poll-started", pollId: id, question });
+		return res.status(201).json({ poll });
+	} catch (e) {
+		console.error("POST room poll ERROR", e);
+		return res.status(500).json({ error: "room_poll_create_failed" });
+	}
 });
 
 app.post("/api/rooms/:id/venue/polls/:pollId/vote", requireAuth, async (req, res) => {
 	try {
-		const room=await roomAccess(String(req.params.id),req.user.id); if(!room)return res.status(403).json({error:"room_membership_required"}); const venue=await ensureRoomVenueState(room.id); if(!venue.active||!venue.votes_enabled)return res.status(403).json({error:"room_votes_disabled"});
-		const pollId=String(req.params.pollId); const poll=await pool.query(`SELECT * FROM ysong_room_polls WHERE id=$1 AND room_id=$2 AND status='open' LIMIT 1`,[pollId,room.id]); if(!poll.rows[0])return res.status(404).json({error:"poll_not_found"}); const options=Array.isArray(poll.rows[0].options)?poll.rows[0].options:[]; const optionId=String(req.body?.optionId||""); if(!options.some((o)=>String(o.id)===optionId))return res.status(400).json({error:"invalid_poll_option"});
-		await pool.query(`INSERT INTO ysong_room_poll_votes (poll_id,user_id,option_id) VALUES ($1,$2,$3) ON CONFLICT (poll_id,user_id) DO UPDATE SET option_id=EXCLUDED.option_id,created_at=now()`,[pollId,req.user.id,optionId]); return res.json({poll:await fetchRoomOpenPoll(room.id,req.user.id)});
-	} catch (e) { console.error("POST room poll vote ERROR",e); return res.status(500).json({error:"room_poll_vote_failed"}); }
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room) return res.status(403).json({ error: "room_membership_required" });
+		const venue = await ensureRoomVenueState(room.id);
+		if (!venue.active || !venue.votes_enabled) return res.status(403).json({ error: "room_votes_disabled" });
+		const pollId = String(req.params.pollId);
+		const poll = await pool.query(
+			`SELECT * FROM ysong_room_polls WHERE id=$1 AND room_id=$2 AND status='open' LIMIT 1`,
+			[pollId, room.id],
+		);
+		if (!poll.rows[0]) return res.status(404).json({ error: "poll_not_found" });
+		const options = Array.isArray(poll.rows[0].options) ? poll.rows[0].options : [];
+		const optionId = String(req.body?.optionId || "");
+		if (!options.some((o) => String(o.id) === optionId))
+			return res.status(400).json({ error: "invalid_poll_option" });
+		await pool.query(
+			`INSERT INTO ysong_room_poll_votes (poll_id,user_id,option_id) VALUES ($1,$2,$3) ON CONFLICT (poll_id,user_id) DO UPDATE SET option_id=EXCLUDED.option_id,created_at=now()`,
+			[pollId, req.user.id, optionId],
+		);
+		return res.json({ poll: await fetchRoomOpenPoll(room.id, req.user.id) });
+	} catch (e) {
+		console.error("POST room poll vote ERROR", e);
+		return res.status(500).json({ error: "room_poll_vote_failed" });
+	}
 });
 
 app.post("/api/rooms/:id/venue/polls/:pollId/close", requireAuth, async (req, res) => {
 	try {
-		const room=await roomAccess(String(req.params.id),req.user.id); if(!room||!["owner","admin"].includes(room.member_role))return res.status(403).json({error:"room_admin_required"}); const pollId=String(req.params.pollId); await pool.query(`UPDATE ysong_room_polls SET status='closed',updated_at=now() WHERE id=$1 AND room_id=$2`,[pollId,room.id]); await insertRoomAudienceEvent(room.id,req.user.id,"system",{type:"poll-closed",pollId}); return res.json({poll:null});
-	} catch (e) { console.error("POST room poll close ERROR",e); return res.status(500).json({error:"room_poll_close_failed"}); }
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room || !["owner", "admin"].includes(room.member_role))
+			return res.status(403).json({ error: "room_admin_required" });
+		const pollId = String(req.params.pollId);
+		await pool.query(`UPDATE ysong_room_polls SET status='closed',updated_at=now() WHERE id=$1 AND room_id=$2`, [
+			pollId,
+			room.id,
+		]);
+		await insertRoomAudienceEvent(room.id, req.user.id, "system", { type: "poll-closed", pollId });
+		return res.json({ poll: null });
+	} catch (e) {
+		console.error("POST room poll close ERROR", e);
+		return res.status(500).json({ error: "room_poll_close_failed" });
+	}
 });
 
 app.post("/api/rooms/:id/ai/respond", requireAuth, async (req, res) => {
 	try {
 		const room = await roomAccess(String(req.params.id), req.user.id);
 		if (!room) return res.status(403).json({ error: "room_membership_required" });
-		const latestHumanText = String(req.body?.triggerText || "").slice(0,8000);
+		const latestHumanText = String(req.body?.triggerText || "").slice(0, 8000);
 		const mentionedPersonaIds = Array.isArray(req.body?.mentionedPersonaIds)
-			? req.body.mentionedPersonaIds.map(String).filter(Boolean).slice(0,10)
+			? req.body.mentionedPersonaIds.map(String).filter(Boolean).slice(0, 10)
 			: [];
 		const { rows: personaRows } = await pool.query(
 			`SELECT p.id,p.name,p.content,p.metadata,p.owner_user_id,p.avatar_object_key,rp.participation_mode
 			 FROM ysong_room_personas rp JOIN ysong_ai_rule_sets p ON p.id=rp.persona_id
 			 WHERE rp.room_id=$1 AND p.is_active=TRUE
 			 ORDER BY COALESCE((p.metadata->>'sortOrder')::int,999), lower(p.name)`,
-			[room.id]
+			[room.id],
 		);
 		const selected = chooseRoomPersonas(personaRows, latestHumanText, mentionedPersonaIds);
 		if (!selected.length) return res.json({ messages: [], selectedPersonaIds: [] });
-		const universalResult = await pool.query(`SELECT content FROM ysong_ai_rule_sets WHERE id=$1 AND kind='universal' AND is_active=TRUE LIMIT 1`, [UNIVERSAL_RULE_ID]);
+		const universalResult = await pool.query(
+			`SELECT content FROM ysong_ai_rule_sets WHERE id=$1 AND kind='universal' AND is_active=TRUE LIMIT 1`,
+			[UNIVERSAL_RULE_ID],
+		);
 		const universal = renderRuleContent(universalResult.rows[0]?.content || UNIVERSAL_RULE_SEED.content);
 		const inserted = [];
-		const venueContextRow = await ensureRoomVenueState(room.id).catch(()=>null);
+		const venueContextRow = await ensureRoomVenueState(room.id).catch(() => null);
 		const venueContext = venueContextRow?.active ? roomVenuePublic(venueContextRow) : null;
 		const turnGroupId = crypto.randomUUID();
 		const queue = [...selected];
@@ -3709,30 +5584,51 @@ app.post("/api/rooms/:id/ai/respond", requireAuth, async (req, res) => {
 					content: mine ? m.content : `[${m.senderName}]: ${m.content}`,
 				};
 			});
-			const answer = await callOpenAI([
-				{ role: "developer", content: universal },
-				{ role: "developer", content: renderRuleContent(persona.content) },
-				{ role: "developer", content: roomGuide },
-				...transcript,
-			], { maxOutputTokens: 500 });
+			const answer = await callOpenAI(
+				[
+					{ role: "developer", content: universal },
+					{ role: "developer", content: renderRuleContent(persona.content) },
+					{ role: "developer", content: roomGuide },
+					...transcript,
+				],
+				{ maxOutputTokens: 500 },
+			);
 			const bubbles = parsePersonaBubblePlan(answer.text);
-			for (let i=0;i<bubbles.length;i++) {
+			for (let i = 0; i < bubbles.length; i++) {
 				const id = crypto.randomUUID();
 				await pool.query(
 					`INSERT INTO ysong_room_messages (id,room_id,sender_kind,sender_persona_id,content,metadata)
 					 VALUES ($1,$2,'persona',$3,$4,$5::jsonb)`,
-					[id, room.id, persona.id, bubbles[i], JSON.stringify({ turnGroupId, bubbleIndex:i, bubbleCount:bubbles.length, personaName, personaTurn:personaTurns })]
+					[
+						id,
+						room.id,
+						persona.id,
+						bubbles[i],
+						JSON.stringify({
+							turnGroupId,
+							bubbleIndex: i,
+							bubbleCount: bubbles.length,
+							personaName,
+							personaTurn: personaTurns,
+						}),
+					],
 				);
 				const current = await pool.query(
 					`SELECT m.*, NULL::text AS user_name, p.name AS persona_name, p.metadata AS persona_metadata
 					 FROM ysong_room_messages m LEFT JOIN ysong_ai_rule_sets p ON p.id=m.sender_persona_id WHERE m.id=$1`,
-					[id]
+					[id],
 				);
 				inserted.push(roomMessagePublic(current.rows[0]));
 			}
 
 			if (personaTurns < MAX_PERSONA_TURNS && bubbles.length) {
-				const followups = discoverRoomPersonaFollowups(personaRows, bubbles.join("\n"), persona.id, spokeCounts, queuedIds);
+				const followups = discoverRoomPersonaFollowups(
+					personaRows,
+					bubbles.join("\n"),
+					persona.id,
+					spokeCounts,
+					queuedIds,
+				);
 				for (const nextPersona of followups) {
 					if (personaTurns + queue.length >= MAX_PERSONA_TURNS) break;
 					queue.push(nextPersona);
@@ -3744,7 +5640,9 @@ app.post("/api/rooms/:id/ai/respond", requireAuth, async (req, res) => {
 		return res.json({ messages: inserted, selectedPersonaIds: participantIds });
 	} catch (e) {
 		console.error("POST /api/rooms/:id/ai/respond ERROR", e);
-		return res.status(e?.statusCode || 500).json({ error: "room_ai_failed", message: e?.message || "AI room reply failed" });
+		return res
+			.status(e?.statusCode || 500)
+			.json({ error: "room_ai_failed", message: e?.message || "AI room reply failed" });
 	}
 });
 
@@ -3759,7 +5657,7 @@ app.get("/api/chats", requireAuth, async (req, res) => {
 			WHERE user_id = $1
 			ORDER BY created_at DESC
 			LIMIT $2`,
-			[userId, limit]
+			[userId, limit],
 		);
 		const chats = rows.map((r) => ({
 			id: r.id,
@@ -3796,7 +5694,7 @@ app.get("/api/chats/:id/messages", requireAuth, async (req, res) => {
        FROM messages
        WHERE chat_id = $1
        ORDER BY created_at ASC`,
-			[chatId]
+			[chatId],
 		);
 
 		const messages = rows.map((r) => ({
@@ -3844,7 +5742,7 @@ app.post("/api/chats/:id/messages", requireAuth, async (req, res) => {
 					type: typeof a.type === "string" ? a.type.slice(0, 200) : "",
 					objectKey: typeof a.objectKey === "string" ? a.objectKey.slice(0, 2048) : "",
 					publicUrl: typeof a.publicUrl === "string" ? a.publicUrl.slice(0, 2048) : "",
-			  }))
+				}))
 			: null;
 
 		console.log("DEBUG -> normalizedAttachments param:", normalizedAttachments);
@@ -3862,7 +5760,7 @@ app.post("/api/chats/:id/messages", requireAuth, async (req, res) => {
 			await pool.query(
 				`INSERT INTO chats (id, user_id, title, pinned, is_cloud_saved, persona_id)
          VALUES ($1, $2, $3, FALSE, TRUE, $4)`,
-				[chatId, userId, "", String(personaId || DEFAULT_PERSONA_ID)]
+				[chatId, userId, "", String(personaId || DEFAULT_PERSONA_ID)],
 			);
 		}
 
@@ -3877,7 +5775,7 @@ app.post("/api/chats/:id/messages", requireAuth, async (req, res) => {
 			`INSERT INTO messages (chat_id, role, content, attachments_json, persona_id)
        VALUES ($1, $2, $3, $4, $5)
        RETURNING id, role, content, attachments_json, persona_id, created_at`,
-			[chatId, role, safeContent, attachmentsJson, safePersonaId]
+			[chatId, role, safeContent, attachmentsJson, safePersonaId],
 		);
 
 		const m = rows[0];
@@ -3967,7 +5865,7 @@ app.post("/api/chats/rename", requireAuth, async (req, res) => {
 			updated_at = now()
 		WHERE id = $2
 			AND user_id = $3`,
-			[safeTitle, chatId, userId]
+			[safeTitle, chatId, userId],
 		);
 
 		if (result.rowCount === 0) {
@@ -4052,14 +5950,17 @@ app.post("/auth/signup", async (req, res) => {
 		const { email, password, name, gender, country, region, city } = SignupSchema.parse(req.body);
 		const normalized = email.trim().toLowerCase();
 		if (name) {
-			const taken = await pool.query(`SELECT 1 FROM users WHERE lower(display_name)=lower($1) AND email<>$2 LIMIT 1`, [name, normalized]);
+			const taken = await pool.query(
+				`SELECT 1 FROM users WHERE lower(display_name)=lower($1) AND email<>$2 LIMIT 1`,
+				[name, normalized],
+			);
 			if (taken.rows[0]) return res.status(409).json({ error: "username_taken" });
 		}
 		const password_hash = await argon2.hash(password, { type: argon2.argon2id });
 
 		const { rows: existingRows } = await pool.query(
 			`SELECT id, email_verified_at FROM users WHERE email = $1 LIMIT 1`,
-			[normalized]
+			[normalized],
 		);
 
 		if (existingRows.length > 0) {
@@ -4068,7 +5969,7 @@ app.post("/auth/signup", async (req, res) => {
 			if (LOCAL_MODE) {
 				await pool.query(
 					`UPDATE users SET password_hash = $2, display_name = COALESCE(NULLIF($3,''), display_name), gender=$4, country=$5, region=$6, city=$7, email_verified_at = now(), updated_at = now() WHERE id = $1`,
-					[existing.id, password_hash, name || "", gender, country, region || "", city || ""]
+					[existing.id, password_hash, name || "", gender, country, region || "", city || ""],
 				);
 				return res.json({ message: "Local account ready. You can log in now.", local: true });
 			}
@@ -4076,13 +5977,14 @@ app.post("/auth/signup", async (req, res) => {
 			await pool.query(
 				`UPDATE email_verifications SET consumed_at = now()
 				 WHERE user_id = $1 AND consumed_at IS NULL AND expires_at > now()`,
-				[existing.id]
+				[existing.id],
 			);
 			const raw = crypto.randomBytes(32).toString("hex");
-			await pool.query(
-				`INSERT INTO email_verifications (user_id, token_hash, expires_at) VALUES ($1, $2, $3)`,
-				[existing.id, sha256(raw), minutesFromNow(30)]
-			);
+			await pool.query(`INSERT INTO email_verifications (user_id, token_hash, expires_at) VALUES ($1, $2, $3)`, [
+				existing.id,
+				sha256(raw),
+				minutesFromNow(30),
+			]);
 			await sendVerifyEmail(normalized, raw);
 			return res.json({ message: "If an account exists, check your email for a verification link." });
 		}
@@ -4091,20 +5993,23 @@ app.post("/auth/signup", async (req, res) => {
 			`INSERT INTO users (email, password_hash, display_name, gender, country, region, city, email_verified_at)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7, CASE WHEN $8::boolean THEN now() ELSE NULL END)
 			 RETURNING id, email, display_name`,
-			[normalized, password_hash, name || null, gender, country, region || "", city || "", LOCAL_MODE]
+			[normalized, password_hash, name || null, gender, country, region || "", city || "", LOCAL_MODE],
 		);
 		const user_id = newRows[0].id;
-		await pool.query(`INSERT INTO ysong_achievement_state (user_id) VALUES ($1) ON CONFLICT DO NOTHING`, [user_id]).catch(() => {});
+		await pool
+			.query(`INSERT INTO ysong_achievement_state (user_id) VALUES ($1) ON CONFLICT DO NOTHING`, [user_id])
+			.catch(() => {});
 
 		if (LOCAL_MODE) {
 			return res.json({ message: "Local account ready. You can log in now.", local: true });
 		}
 
 		const raw = crypto.randomBytes(32).toString("hex");
-		await pool.query(
-			`INSERT INTO email_verifications (user_id, token_hash, expires_at) VALUES ($1, $2, $3)`,
-			[user_id, sha256(raw), minutesFromNow(30)]
-		);
+		await pool.query(`INSERT INTO email_verifications (user_id, token_hash, expires_at) VALUES ($1, $2, $3)`, [
+			user_id,
+			sha256(raw),
+			minutesFromNow(30),
+		]);
 		await sendVerifyEmail(normalized, raw);
 		return res.json({ message: "If an account exists, check your email for a verification link." });
 	} catch (err) {
@@ -4122,7 +6027,7 @@ app.post("/auth/accept-tos", requireAuth, async (req, res) => {
 				tos_accepted_version = $2,
 				updated_at = now()
 			WHERE id = $1`,
-			[req.user.id, CURRENT_TOS_VERSION]
+			[req.user.id, CURRENT_TOS_VERSION],
 		);
 		res.json({ ok: true, version: CURRENT_TOS_VERSION });
 	} catch (e) {
@@ -4152,7 +6057,7 @@ app.get("/auth/verify", async (req, res) => {
 			AND ev.expires_at > now()
 			ORDER BY ev.created_at DESC
 			LIMIT 1`,
-			[email, token_hash]
+			[email, token_hash],
 		);
 
 		if (rows.length === 0) {
@@ -4191,7 +6096,7 @@ app.post("/auth/login", async (req, res) => {
 			FROM users
 			WHERE email = $1
 			LIMIT 1`,
-			[normalized]
+			[normalized],
 		);
 
 		const invalid = () => res.status(401).json({ error: "invalid_credentials" });
@@ -4251,7 +6156,7 @@ app.get("/auth/me", async (req, res) => {
 			FROM users
 			WHERE id = $1
 			LIMIT 1`,
-			[payload.uid]
+			[payload.uid],
 		);
 		if (rows.length === 0) return res.status(401).json({ error: "invalid_token" });
 
@@ -4280,22 +6185,57 @@ app.get("/auth/me", async (req, res) => {
 // ---------- Public profile identity ----------
 app.post("/api/profile", requireAuth, async (req, res) => {
 	try {
-		const displayName = String(req.body?.displayName || "").trim().replace(/\s+/g, " ").slice(0, 80);
+		const displayName = String(req.body?.displayName || "")
+			.trim()
+			.replace(/\s+/g, " ")
+			.slice(0, 80);
 		if (!displayName) return res.status(400).json({ error: "username_required" });
-		const gender = ["female","male","nonbinary","other","prefer_not_to_say"].includes(String(req.body?.gender)) ? String(req.body.gender) : "prefer_not_to_say";
-		const country = String(req.body?.country || "").trim().slice(0,80);
-		const region = String(req.body?.region || "").trim().slice(0,120);
-		const city = String(req.body?.city || "").trim().slice(0,120);
+		const gender = ["female", "male", "nonbinary", "other", "prefer_not_to_say"].includes(String(req.body?.gender))
+			? String(req.body.gender)
+			: "prefer_not_to_say";
+		const country = String(req.body?.country || "")
+			.trim()
+			.slice(0, 80);
+		const region = String(req.body?.region || "")
+			.trim()
+			.slice(0, 120);
+		const city = String(req.body?.city || "")
+			.trim()
+			.slice(0, 120);
 		let avatarObjectKey = req.body?.avatarObjectKey == null ? undefined : String(req.body.avatarObjectKey || "");
 		if (avatarObjectKey) {
 			avatarObjectKey = assertOwnedObjectKey(req.user.id, avatarObjectKey, { uploadOnly: true });
 			const meta = await readObjectMetadata(avatarObjectKey);
-			if (!String(meta.contentType || "").startsWith("image/")) return res.status(400).json({ error: "image_file_required" });
+			if (!String(meta.contentType || "").startsWith("image/"))
+				return res.status(400).json({ error: "image_file_required" });
 		}
-		const taken = await pool.query(`SELECT 1 FROM users WHERE lower(display_name)=lower($1) AND id<>$2 LIMIT 1`, [displayName, req.user.id]);
+		const taken = await pool.query(`SELECT 1 FROM users WHERE lower(display_name)=lower($1) AND id<>$2 LIMIT 1`, [
+			displayName,
+			req.user.id,
+		]);
 		if (taken.rows[0]) return res.status(409).json({ error: "username_taken" });
-		await pool.query(`UPDATE users SET display_name=$2, gender=$3, country=$4, region=$5, city=$6, avatar_object_key=CASE WHEN $7::boolean THEN $8 ELSE avatar_object_key END, updated_at=now() WHERE id=$1`, [req.user.id, displayName, gender, country, region, city, avatarObjectKey !== undefined, avatarObjectKey || null]);
-		return res.json({ ok: true, displayName, gender, country, region, city, avatarObjectKey: avatarObjectKey === undefined ? null : avatarObjectKey });
+		await pool.query(
+			`UPDATE users SET display_name=$2, gender=$3, country=$4, region=$5, city=$6, avatar_object_key=CASE WHEN $7::boolean THEN $8 ELSE avatar_object_key END, updated_at=now() WHERE id=$1`,
+			[
+				req.user.id,
+				displayName,
+				gender,
+				country,
+				region,
+				city,
+				avatarObjectKey !== undefined,
+				avatarObjectKey || null,
+			],
+		);
+		return res.json({
+			ok: true,
+			displayName,
+			gender,
+			country,
+			region,
+			city,
+			avatarObjectKey: avatarObjectKey === undefined ? null : avatarObjectKey,
+		});
 	} catch (e) {
 		if (e?.statusCode === 403) return res.status(403).json({ error: "forbidden" });
 		console.error("POST /api/profile ERROR", e);
@@ -4304,72 +6244,198 @@ app.post("/api/profile", requireAuth, async (req, res) => {
 });
 
 // Account-owned artist identities. World publishing must reference one of these IDs.
+registerReleaseLinking(app, { pool, requireAuth });
 app.get("/api/artists", requireAuth, async (req, res) => {
 	try {
-		const { rows } = await pool.query(`SELECT * FROM artists WHERE owner_user_id=$1 ORDER BY updated_at DESC`, [req.user.id]);
-		return res.json({ artists: rows.map((r) => ({ id:String(r.id), type:r.artist_type, name:r.name, genre:r.genre||"", bio:r.bio||"", members:r.members||"", symbol:r.symbol||"", primary:r.primary_color||"#171717", accent:r.accent_color||"#a78bfa", avatarObjectKey:r.avatar_object_key||"" })) });
-	} catch (e) { console.error("GET /api/artists ERROR", e); return res.status(500).json({ error:"artists_failed" }); }
+		const { rows } = await pool.query(`SELECT * FROM artists WHERE owner_user_id=$1 ORDER BY updated_at DESC`, [
+			req.user.id,
+		]);
+		return res.json({
+			artists: rows.map((r) => ({
+				id: String(r.id),
+				type: r.artist_type,
+				name: r.name,
+				genre: r.genre || "",
+				bio: r.bio || "",
+				members: r.members || "",
+				symbol: r.symbol || "",
+				primary: r.primary_color || "#171717",
+				accent: r.accent_color || "#a78bfa",
+				avatarObjectKey: r.avatar_object_key || "",
+			})),
+		});
+	} catch (e) {
+		console.error("GET /api/artists ERROR", e);
+		return res.status(500).json({ error: "artists_failed" });
+	}
 });
 
 app.post("/api/artists/upsert", requireAuth, async (req, res) => {
 	try {
 		const id = String(req.body?.id || "");
-		const name = String(req.body?.name || "").trim().slice(0,180);
+		const name = String(req.body?.name || "")
+			.trim()
+			.slice(0, 180);
 		const type = req.body?.type === "solo" ? "solo" : "band";
-		if (!/^[0-9a-f-]{36}$/i.test(id) || !name) return res.status(400).json({ error:"invalid_artist" });
+		if (!/^[0-9a-f-]{36}$/i.test(id) || !name) return res.status(400).json({ error: "invalid_artist" });
 		let avatarObjectKey = String(req.body?.avatarObjectKey || "");
 		if (avatarObjectKey) {
 			avatarObjectKey = assertOwnedObjectKey(req.user.id, avatarObjectKey, { uploadOnly: true });
 			const meta = await readObjectMetadata(avatarObjectKey);
-			if (!String(meta.contentType || "").startsWith("image/")) return res.status(400).json({ error:"image_file_required" });
+			if (!String(meta.contentType || "").startsWith("image/"))
+				return res.status(400).json({ error: "image_file_required" });
 		}
-		const before = await pool.query(`SELECT name FROM artists WHERE id=$1 AND owner_user_id=$2 LIMIT 1`, [id, req.user.id]);
+		const before = await pool.query(`SELECT name FROM artists WHERE id=$1 AND owner_user_id=$2 LIMIT 1`, [
+			id,
+			req.user.id,
+		]);
 		const oldName = String(before.rows[0]?.name || "");
-		const values=[id,req.user.id,type,name,String(req.body?.genre||"").trim().slice(0,120),String(req.body?.bio||"").trim().slice(0,4000),String(req.body?.members||"").trim().slice(0,4000),String(req.body?.symbol||"").trim().slice(0,1000),String(req.body?.primary||"#171717").slice(0,32),String(req.body?.accent||"#a78bfa").slice(0,32),avatarObjectKey||null];
-		const saved = await pool.query(`INSERT INTO artists (id,owner_user_id,artist_type,name,genre,bio,members,symbol,primary_color,accent_color,avatar_object_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO UPDATE SET artist_type=EXCLUDED.artist_type,name=EXCLUDED.name,genre=EXCLUDED.genre,bio=EXCLUDED.bio,members=EXCLUDED.members,symbol=EXCLUDED.symbol,primary_color=EXCLUDED.primary_color,accent_color=EXCLUDED.accent_color,avatar_object_key=COALESCE(EXCLUDED.avatar_object_key,artists.avatar_object_key),updated_at=now() WHERE artists.owner_user_id=$2 RETURNING id`, values);
-		if (!saved.rows[0]) return res.status(403).json({ error:"artist_not_owned" });
+		const values = [
+			id,
+			req.user.id,
+			type,
+			name,
+			String(req.body?.genre || "")
+				.trim()
+				.slice(0, 120),
+			String(req.body?.bio || "")
+				.trim()
+				.slice(0, 4000),
+			String(req.body?.members || "")
+				.trim()
+				.slice(0, 4000),
+			String(req.body?.symbol || "")
+				.trim()
+				.slice(0, 1000),
+			String(req.body?.primary || "#171717").slice(0, 32),
+			String(req.body?.accent || "#a78bfa").slice(0, 32),
+			avatarObjectKey || null,
+		];
+		const saved = await pool.query(
+			`INSERT INTO artists (id,owner_user_id,artist_type,name,genre,bio,members,symbol,primary_color,accent_color,avatar_object_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO UPDATE SET artist_type=EXCLUDED.artist_type,name=EXCLUDED.name,genre=EXCLUDED.genre,bio=EXCLUDED.bio,members=EXCLUDED.members,symbol=EXCLUDED.symbol,primary_color=EXCLUDED.primary_color,accent_color=EXCLUDED.accent_color,avatar_object_key=COALESCE(EXCLUDED.avatar_object_key,artists.avatar_object_key),updated_at=now() WHERE artists.owner_user_id=$2 RETURNING id`,
+			values,
+		);
+		if (!saved.rows[0]) return res.status(403).json({ error: "artist_not_owned" });
 		// Release metadata remains a cached display field for legacy compatibility, but
 		// the stable artist_id is authoritative. Keep the cache/follows in sync on rename.
-		await pool.query(`UPDATE world_releases SET artist_name=$3 WHERE artist_id=$1 AND owner_user_id=$2`, [id, req.user.id, name]);
-		if (oldName && oldName !== name) await pool.query(`UPDATE world_followed_artists SET artist_name=$3 WHERE artist_owner_user_id=$1 AND artist_name=$2`, [req.user.id, oldName, name]);
-		return res.json({ ok:true, id, avatarObjectKey });
+		await pool.query(`UPDATE world_releases SET artist_name=$3 WHERE artist_id=$1 AND owner_user_id=$2`, [
+			id,
+			req.user.id,
+			name,
+		]);
+		if (oldName && oldName !== name)
+			await pool.query(
+				`UPDATE world_followed_artists SET artist_name=$3 WHERE artist_owner_user_id=$1 AND artist_name=$2`,
+				[req.user.id, oldName, name],
+			);
+		return res.json({ ok: true, id, avatarObjectKey });
 	} catch (e) {
-		if (e?.statusCode === 403) return res.status(403).json({ error:"forbidden" });
-		if (e?.code === "23505") return res.status(409).json({ error:"artist_name_taken" });
-		console.error("POST /api/artists/upsert ERROR", e); return res.status(500).json({ error:"artist_save_failed" });
+		if (e?.statusCode === 403) return res.status(403).json({ error: "forbidden" });
+		if (e?.code === "23505") return res.status(409).json({ error: "artist_name_taken" });
+		console.error("POST /api/artists/upsert ERROR", e);
+		return res.status(500).json({ error: "artist_save_failed" });
 	}
 });
 
 app.post("/api/artists/delete", requireAuth, async (req, res) => {
 	try {
 		const id = String(req.body?.id || "");
-		if (!/^[0-9a-f-]{36}$/i.test(id)) return res.status(400).json({ error:"invalid_artist" });
-		const artist = await pool.query(`SELECT id FROM artists WHERE id=$1 AND owner_user_id=$2 LIMIT 1`, [id, req.user.id]);
-		if (!artist.rows[0]) return res.json({ ok:true, deleted:false });
+		if (!/^[0-9a-f-]{36}$/i.test(id)) return res.status(400).json({ error: "invalid_artist" });
+		const artist = await pool.query(`SELECT id FROM artists WHERE id=$1 AND owner_user_id=$2 LIMIT 1`, [
+			id,
+			req.user.id,
+		]);
+		if (!artist.rows[0]) return res.json({ ok: true, deleted: false });
 		const used = await pool.query(`SELECT 1 FROM world_releases WHERE artist_id=$1 LIMIT 1`, [id]);
-		if (used.rows[0]) return res.status(409).json({ error:"artist_has_releases" });
-		await pool.query(`UPDATE singer_profiles SET artist_ids = artist_ids - $1 WHERE owner_user_id=$2 AND artist_ids ? $1`, [id, req.user.id]);
+		if (used.rows[0]) return res.status(409).json({ error: "artist_has_releases" });
+		await pool.query(
+			`UPDATE singer_profiles SET artist_ids = artist_ids - $1 WHERE owner_user_id=$2 AND artist_ids ? $1`,
+			[id, req.user.id],
+		);
 		await pool.query(`DELETE FROM artists WHERE id=$1 AND owner_user_id=$2`, [id, req.user.id]);
-		return res.json({ ok:true, deleted:true });
-	} catch (e) { console.error("POST /api/artists/delete ERROR", e); return res.status(500).json({ error:"artist_delete_failed" }); }
+		return res.json({ ok: true, deleted: true });
+	} catch (e) {
+		console.error("POST /api/artists/delete ERROR", e);
+		return res.status(500).json({ error: "artist_delete_failed" });
+	}
 });
 
 app.get("/api/singers", requireAuth, async (req, res) => {
-	try { const {rows}=await pool.query(`SELECT * FROM singer_profiles WHERE owner_user_id=$1 ORDER BY updated_at DESC`,[req.user.id]); return res.json({singers:rows.map(r=>({id:String(r.id),name:r.name,description:r.description||"",voiceType:r.voice_type||"",artistIds:Array.isArray(r.artist_ids)?r.artist_ids:[],referenceAudioObjectKey:r.reference_audio_object_key||"",avatarObjectKey:r.avatar_object_key||""}))}); }
-	catch(e){ console.error("GET /api/singers ERROR",e); return res.status(500).json({error:"singers_failed"}); }
+	try {
+		const { rows } = await pool.query(
+			`SELECT * FROM singer_profiles WHERE owner_user_id=$1 ORDER BY updated_at DESC`,
+			[req.user.id],
+		);
+		return res.json({
+			singers: rows.map((r) => ({
+				id: String(r.id),
+				name: r.name,
+				description: r.description || "",
+				voiceType: r.voice_type || "",
+				artistIds: Array.isArray(r.artist_ids) ? r.artist_ids : [],
+				referenceAudioObjectKey: r.reference_audio_object_key || "",
+				avatarObjectKey: r.avatar_object_key || "",
+			})),
+		});
+	} catch (e) {
+		console.error("GET /api/singers ERROR", e);
+		return res.status(500).json({ error: "singers_failed" });
+	}
 });
 
-app.post("/api/singers/upsert", requireAuth, async (req,res)=>{
+app.post("/api/singers/upsert", requireAuth, async (req, res) => {
 	try {
-		const id=String(req.body?.id||""); const name=String(req.body?.name||"").trim().slice(0,180);
-		if(!/^[0-9a-f-]{36}$/i.test(id)||!name) return res.status(400).json({error:"invalid_singer"});
-		const artistIds=Array.isArray(req.body?.artistIds)?req.body.artistIds.map(String).filter(x=>/^[0-9a-f-]{36}$/i.test(x)).slice(0,50):[];
-		for(const artistId of artistIds){ const own=await pool.query(`SELECT 1 FROM artists WHERE id=$1 AND owner_user_id=$2`,[artistId,req.user.id]); if(!own.rows[0]) return res.status(403).json({error:"artist_not_owned"}); }
-		let ref=String(req.body?.referenceAudioObjectKey||""); if(ref){ ref=assertOwnedObjectKey(req.user.id,ref,{uploadOnly:true}); const meta=await readObjectMetadata(ref); if(!String(meta.contentType||"").startsWith("audio/")&&!/\.(wav|flac|mp3|m4a|aac|ogg)$/i.test(String(meta.originalName||ref))) return res.status(400).json({error:"audio_file_required"}); }
-		const saved=await pool.query(`INSERT INTO singer_profiles (id,owner_user_id,name,description,voice_type,artist_ids,reference_audio_object_key) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,description=EXCLUDED.description,voice_type=EXCLUDED.voice_type,artist_ids=EXCLUDED.artist_ids,reference_audio_object_key=EXCLUDED.reference_audio_object_key,updated_at=now() WHERE singer_profiles.owner_user_id=$2 RETURNING id`,[id,req.user.id,name,String(req.body?.description||"").trim().slice(0,4000),String(req.body?.voiceType||"").trim().slice(0,120),JSON.stringify(artistIds),ref||null]);
-		if(!saved.rows[0]) return res.status(403).json({error:"singer_not_owned"});
-		return res.json({ok:true,id});
-	} catch(e){ if(e?.statusCode===403)return res.status(403).json({error:"forbidden"}); console.error("POST /api/singers/upsert ERROR",e); return res.status(500).json({error:"singer_save_failed"}); }
+		const id = String(req.body?.id || "");
+		const name = String(req.body?.name || "")
+			.trim()
+			.slice(0, 180);
+		if (!/^[0-9a-f-]{36}$/i.test(id) || !name) return res.status(400).json({ error: "invalid_singer" });
+		const artistIds = Array.isArray(req.body?.artistIds)
+			? req.body.artistIds
+					.map(String)
+					.filter((x) => /^[0-9a-f-]{36}$/i.test(x))
+					.slice(0, 50)
+			: [];
+		for (const artistId of artistIds) {
+			const own = await pool.query(`SELECT 1 FROM artists WHERE id=$1 AND owner_user_id=$2`, [
+				artistId,
+				req.user.id,
+			]);
+			if (!own.rows[0]) return res.status(403).json({ error: "artist_not_owned" });
+		}
+		let ref = String(req.body?.referenceAudioObjectKey || "");
+		if (ref) {
+			ref = assertOwnedObjectKey(req.user.id, ref, { uploadOnly: true });
+			const meta = await readObjectMetadata(ref);
+			if (
+				!String(meta.contentType || "").startsWith("audio/") &&
+				!/\.(wav|flac|mp3|m4a|aac|ogg)$/i.test(String(meta.originalName || ref))
+			)
+				return res.status(400).json({ error: "audio_file_required" });
+		}
+		const saved = await pool.query(
+			`INSERT INTO singer_profiles (id,owner_user_id,name,description,voice_type,artist_ids,reference_audio_object_key) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,description=EXCLUDED.description,voice_type=EXCLUDED.voice_type,artist_ids=EXCLUDED.artist_ids,reference_audio_object_key=EXCLUDED.reference_audio_object_key,updated_at=now() WHERE singer_profiles.owner_user_id=$2 RETURNING id`,
+			[
+				id,
+				req.user.id,
+				name,
+				String(req.body?.description || "")
+					.trim()
+					.slice(0, 4000),
+				String(req.body?.voiceType || "")
+					.trim()
+					.slice(0, 120),
+				JSON.stringify(artistIds),
+				ref || null,
+			],
+		);
+		if (!saved.rows[0]) return res.status(403).json({ error: "singer_not_owned" });
+		return res.json({ ok: true, id });
+	} catch (e) {
+		if (e?.statusCode === 403) return res.status(403).json({ error: "forbidden" });
+		console.error("POST /api/singers/upsert ERROR", e);
+		return res.status(500).json({ error: "singer_save_failed" });
+	}
 });
 
 // ---------- Settings (GET) ----------
@@ -4381,7 +6447,7 @@ app.get("/api/settings", requireAuth, async (req, res) => {
 		`SELECT save_chats, theme, show_timestamps, compact_mode
          FROM user_settings
          WHERE user_id = $1`,
-		[userId]
+		[userId],
 	);
 
 	const row = rows[0] || {};
@@ -4456,7 +6522,7 @@ app.post("/api/settings", requireAuth, async (req, res) => {
             show_timestamps = COALESCE($4, user_settings.show_timestamps),
             compact_mode    = COALESCE($5, user_settings.compact_mode)
         `,
-		[userId, saveChats, theme, showTimestamps, compactMode]
+		[userId, saveChats, theme, showTimestamps, compactMode],
 	);
 
 	console.log("POST /api/settings completed for user", userId);
@@ -4494,7 +6560,7 @@ app.post("/api/ui/layout", requireAuth, async (req, res) => {
 			tabs      = EXCLUDED.tabs,
 			active_id = EXCLUDED.active_id,
 			updated_at = now()`,
-			[req.user.id, JSON.stringify(tabs), activeId || null]
+			[req.user.id, JSON.stringify(tabs), activeId || null],
 		);
 		res.json({ ok: true });
 	} catch (e) {
@@ -4522,6 +6588,7 @@ async function startServer() {
 	await ensureAiRuleSeeds();
 	await initializeAchievementBaselines();
 	app.listen(port, () => console.log(`YSong API listening on ${port}`));
+ sessionJobs.start();
 }
 
 startServer().catch((e) => {

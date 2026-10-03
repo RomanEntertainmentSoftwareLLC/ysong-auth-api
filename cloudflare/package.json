@@ -1,0 +1,11 @@
+{
+  "name": "ysong-auth-cloudflare",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "wrangler deploy --dry-run --outdir .wrangler/check",
+    "deploy": "node deploy.mjs"
+  },
+  "dependencies": { "@cloudflare/containers": "0.3.7" },
+  "devDependencies": { "wrangler": "4.146.0" }
+}

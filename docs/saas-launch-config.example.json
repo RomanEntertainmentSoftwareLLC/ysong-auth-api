@@ -1,0 +1,19 @@
+{
+  "mode": "test",
+  "databaseHost": null,
+  "superadminUserId": null,
+  "plans": [
+    {"id":"free","quota":null,"storageQuotaBytes":null,"capabilities":{},"assistantLimit":null,"available":false,"priceId":null,"productId":null},
+    {"id":"basic","quota":null,"storageQuotaBytes":null,"capabilities":{},"assistantLimit":null,"available":false,"priceId":null,"productId":null},
+    {"id":"pro","quota":null,"storageQuotaBytes":null,"capabilities":{},"assistantLimit":null,"available":false,"priceId":null,"productId":null},
+    {"id":"premium","quota":null,"storageQuotaBytes":null,"capabilities":{},"assistantLimit":null,"available":false,"priceId":null,"productId":null}
+  ],
+  "policies": [
+    {"id":"terms","version":null,"url":null,"approvalReference":null},
+    {"id":"privacy","version":null,"url":null,"approvalReference":null},
+    {"id":"upload-rights","version":null,"url":null,"approvalReference":null},
+    {"id":"billing","version":null,"url":null,"approvalReference":null},
+    {"id":"generated-output","version":null,"url":null,"approvalReference":null},
+    {"id":"bridge-license","version":null,"url":null,"approvalReference":null}
+  ]
+}

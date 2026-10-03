@@ -1,113 +1,11 @@
-name: Deploy ysong-auth-api to VM
-
+name: Retired VM deployment disabled
 on:
-  push:
-    branches: [ main ]
   workflow_dispatch: {}
-
+permissions:
+  contents: read
 jobs:
-  deploy:
+  retired:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # ---- Prepare SSH (robust) ----
-      - name: Prepare SSH
-        shell: bash
-        env:
-          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}   # raw OpenSSH private key (NOT base64)
-          VM_HOST:    ${{ secrets.VM_HOST }}      # 34.48.117.202
-        run: |
-          set -euo pipefail
-          mkdir -p "$HOME/.ssh"
-          KEY_FILE="$HOME/.ssh/ysong_ci"
-
-          # write the private key (strip CR just in case)
-          printf '%s\n' "$VM_SSH_KEY" | tr -d '\r' > "$KEY_FILE"
-          chmod 600 "$KEY_FILE"
-
-          # known_hosts
-          ssh-keyscan -H "$VM_HOST" >> "$HOME/.ssh/known_hosts"
-
-          # quick sanity print (does NOT leak key)
-          ls -l "$HOME/.ssh"
-          ssh -V
-
-      - name: Test SSH connectivity
-        shell: bash
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-        run: |
-          set -euo pipefail
-          KEY_FILE="$HOME/.ssh/ysong_ci"
-          SSH_OPTS="-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o HostbasedAuthentication=no -o PubkeyAuthentication=yes -o PubkeyAcceptedKeyTypes=+ssh-ed25519"
-          ssh -vvv -i "$KEY_FILE" $SSH_OPTS "$VM_USER@$VM_HOST" "echo OK on \$(hostname); whoami"
-
-      - name: Ensure remote dir & ownership
-        shell: bash
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-        run: |
-          set -euo pipefail
-          KEY_FILE="$HOME/.ssh/ysong_ci"
-          SSH_OPTS="-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o HostbasedAuthentication=no -o PubkeyAuthentication=yes -o PubkeyAcceptedKeyTypes=+ssh-ed25519"
-          ssh -i "$KEY_FILE" $SSH_OPTS "$VM_USER@$VM_HOST" \
-            "sudo mkdir -p /opt/ysong-auth && sudo chown -R \$(whoami):\$(whoami) /opt/ysong-auth"
-
-      # 1) Install rsync on the runner (Ubuntu)
-      - name: Install rsync on runner
-        run: sudo apt-get update && sudo apt-get install -y rsync
-      
-      # 2) Ensure dir, perms, and rsync on the Debian VM
-      - name: Ensure remote dir & ownership
-        shell: bash
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-        run: |
-          set -euo pipefail
-          KEY_FILE="$HOME/.ssh/ysong_ci"
-          SSH_OPTS="-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o HostbasedAuthentication=no -o PubkeyAuthentication=yes -o PubkeyAcceptedKeyTypes=+ssh-ed25519"
-          ssh -i "$KEY_FILE" $SSH_OPTS "$VM_USER@$VM_HOST" \
-            "sudo apt-get update &&
-             sudo apt-get install -y rsync ffmpeg &&
-             sudo mkdir -p /opt/ysong-auth &&
-             sudo chown -R \$(whoami):\$(whoami) /opt/ysong-auth"
-
-      - name: Rsync code to VM
-        shell: bash
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-        run: |
-          set -euo pipefail
-          KEY_FILE="$HOME/.ssh/ysong_ci"
-          SSH_OPTS="-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o HostbasedAuthentication=no -o PubkeyAuthentication=yes -o PubkeyAcceptedKeyTypes=+ssh-ed25519"
-          rsync -avz --delete \
-            --exclude '.env' \
-            --exclude 'node_modules' \
-            --exclude '.git' \
-            --exclude '*.log' \
-            -e "ssh -i $KEY_FILE $SSH_OPTS" \
-            ./ "$VM_USER@$VM_HOST:/opt/ysong-auth/"
-
-      - name: Install & restart on VM
-        shell: bash
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-        run: |
-          set -euo pipefail
-          KEY_FILE="$HOME/.ssh/ysong_ci"
-          SSH_OPTS="-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o HostbasedAuthentication=no -o PubkeyAuthentication=yes -o PubkeyAcceptedKeyTypes=+ssh-ed25519"
-          ssh -i "$KEY_FILE" $SSH_OPTS "$VM_USER@$VM_HOST" '
-            set -e
-            cd /opt/ysong-auth
-            npm ci
-            sudo systemctl restart ysong-auth
-            sudo systemctl status ysong-auth --no-pager -l | tail -n 30
-          '
+      - name: Explain disabled deployment
+        run: echo 'Retired VM deployment is disabled. Cloudflare releases require the reviewed manual release procedure.'

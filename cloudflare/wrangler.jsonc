@@ -1,0 +1,51 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "ysong-auth-api",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "keep_vars": true,
+  "routes": [
+    {
+      "pattern": "api.ysong.ai",
+      "custom_domain": true
+    }
+  ],
+  "containers": [
+    {
+      "class_name": "YSongApi",
+      "image": "../Dockerfile",
+      "max_instances": 1,
+      "instance_type": "standard-1"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "YSONG_API",
+        "class_name": "YSongApi"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "YSongApi"
+      ]
+    }
+  ],
+  "vars": {
+    "NODE_ENV": "production",
+    "LOCAL_MODE": "0",
+    "PORT": "8080",
+    "LOCAL_STORAGE_DIR": "/tmp/ysong-processing",
+    "MAX_UPLOAD_MB": "90",
+    "R2_BUCKET": "ysong-assets",
+    "APP_URL": "https://ysong.ai",
+    "FRONTEND_URL": "https://ysong.ai",
+    "MINIMAX_MUSIC_PROVIDER": "cloudflare",
+    "CLOUDFLARE_MUSIC_MODEL": "minimax/music-2.6",
+    "AI_PROVIDER": "none"
+  }
+}

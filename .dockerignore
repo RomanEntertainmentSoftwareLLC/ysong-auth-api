@@ -2,3 +2,13 @@ node_modules
 npm-debug.log
 .DS_Store
 .git
+.env
+.env.*
+.dev.vars*
+.wrangler
+.vercel
+*.log
+coverage
+test
+uploads-dev.json
+cloudflare/node_modules

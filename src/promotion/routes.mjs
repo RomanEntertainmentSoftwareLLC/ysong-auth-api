@@ -344,7 +344,7 @@ async function loadPaidAnalyticsEnvelope(ad,userId,query={}){
   return {range,capturedAt,stale,meta,ysong,derived,normalized,warnings};
 }
 
-export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMetadata,writeObjectMetadata,assertOwnedObjectKey}) {
+export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMetadata,writeObjectMetadata,assertOwnedObjectKey,materializeObject = async (key) => objectPath(key),streamWorldObject}) {
   const ROOT="/api/tools/promotion";
   let renderPumpRunning=false;
 
@@ -436,6 +436,7 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
           const userId=String(row.owner_user_id);
           const songKey=assertOwnedObjectKey(userId,String(row.source_object_key||""));
           const bgKey=assertOwnedObjectKey(userId,String(row.background_object_key||""));
+          await Promise.all([materializeObject(songKey),materializeObject(bgKey)]);
           const result=await renderPromotionCreative({
             userId,
             adCampaignId:String(row.ad_campaign_id),
@@ -636,7 +637,7 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
       let sourceKey=input.sourceObjectKey; let trackId=input.sourceTrackId||ad.source_track_id||null; let trackTitle="";
       if(trackId){ const {rows}=await pool.query(`SELECT id,title,audio_object_key FROM world_tracks WHERE id=$1 AND owner_user_id=$2 LIMIT 1`,[trackId,req.user.id]); if(!rows[0])return res.status(404).json({error:"source_track_not_found"}); sourceKey=sourceKey||rows[0].audio_object_key; trackTitle=rows[0].title; }
       if(!sourceKey)return res.status(400).json({error:"source_audio_required"});
-      sourceKey=assertOwnedObjectKey(req.user.id,sourceKey); const probe=await probeMedia(objectPath(sourceKey)); if(!probe.audio)return res.status(400).json({error:"audio_stream_required"});
+      sourceKey=assertOwnedObjectKey(req.user.id,sourceKey); const probe=await probeMedia(await materializeObject(sourceKey)); if(!probe.audio)return res.status(400).json({error:"audio_stream_required"});
       const total=Number(probe.audio.duration||probe.duration||0); if(total>0&&input.startSeconds+input.durationSeconds>total+0.05)return res.status(400).json({error:"snippet_out_of_range",durationSeconds:total});
       const {rows}=await pool.query(`INSERT INTO promotion_audio_snippets(id,ad_campaign_id,source_track_id,source_object_key,label,start_seconds,duration_seconds) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[crypto.randomUUID(),ad.id,trackId,sourceKey,input.label||trackTitle||`Clip ${Number(count.rows[0]?.n||0)+1}`,input.startSeconds,input.durationSeconds]);
       res.status(201).json({snippet:mapSnippet(rows[0]),sourceDurationSeconds:total||null});
@@ -649,7 +650,7 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
 
   app.post(`${ROOT}/background-videos`, requireAuth, async (req,res)=>{
     try{
-      const input=BackgroundSchema.parse(req.body||{}); const key=assertOwnedObjectKey(req.user.id,input.objectKey); const meta=await readObjectMetadata(key); const probe=await probeMedia(objectPath(key));
+      const input=BackgroundSchema.parse(req.body||{}); const key=assertOwnedObjectKey(req.user.id,input.objectKey); const meta=await readObjectMetadata(key); const probe=await probeMedia(await materializeObject(key));
       if(!probe.video)return res.status(400).json({error:"video_stream_required"});
       const duration=Number(probe.video.duration||probe.duration||0); if(duration>60.25)return res.status(400).json({error:"background_video_too_long",limitSeconds:60,durationSeconds:duration});
       if(input.libraryId){const own=await pool.query(`SELECT id FROM promotion_creative_libraries WHERE id=$1 AND owner_user_id=$2`,[input.libraryId,req.user.id]);if(!own.rows[0])return res.status(404).json({error:"library_not_found"});}
@@ -842,7 +843,7 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
       const smart=await campaignOwned(ad.campaign_id,req.user.id); if(!smart||!['active','draft'].includes(smart.status))throw new Error('smart_link_not_available');
       for(const c of preflight.creatives){
         const k916=assertOwnedObjectKey(req.user.id,String(c.object_key_916||'')); const k43=assertOwnedObjectKey(req.user.id,String(c.object_key_43||''));
-        const filePath916=objectPath(k916); const filePath43=objectPath(k43); await Promise.all([fs.promises.access(filePath916,fs.constants.R_OK),fs.promises.access(filePath43,fs.constants.R_OK)]);
+        const [filePath916,filePath43]=await Promise.all([materializeObject(k916),materializeObject(k43)]);
         creativeInputs.push({id:String(c.id),filePath916,filePath43,linkUrl:paidCreativeLink(smart,ad,String(c.id))});
       }
       // Claim the draft before any remote write. A timed-out Graph POST may have
@@ -966,7 +967,7 @@ export function registerPromotionRoutes(app,{requireAuth,objectPath,readObjectMe
   });
 
   app.get(`/api/promotion/public/:slug`, async (req,res)=>{ const row=await campaignPublic(String(req.params.slug||"")); if(!row)return res.status(404).json({error:"campaign_not_found"}); res.setHeader("Cache-Control","public, max-age=60"); res.json({campaign:mapCampaign(row,await campaignDestinations(row.id,true)),qrUrl:`${apiBase(req)}/api/promotion/public/${encodeURIComponent(row.slug)}/qr.svg`}); });
-  app.get(`/api/promotion/public/:slug/artwork`, async (req,res)=>{ try{const row=await campaignPublic(String(req.params.slug||"")); if(!row||!row.artwork_object_key)return res.status(404).end(); const file=objectPath(row.artwork_object_key); const meta=await readObjectMetadata(row.artwork_object_key); await fs.promises.access(file,fs.constants.R_OK); res.setHeader("Content-Type",meta.contentType||"application/octet-stream"); res.setHeader("Cache-Control","public, max-age=3600"); fs.createReadStream(file).pipe(res);}catch{return res.status(404).end();} });
+  app.get(`/api/promotion/public/:slug/artwork`, async (req,res)=>{ try{const row=await campaignPublic(String(req.params.slug||"")); if(!row||!row.artwork_object_key)return res.status(404).end(); if(streamWorldObject)return await streamWorldObject(req,res,row.artwork_object_key); const file=objectPath(row.artwork_object_key); const meta=await readObjectMetadata(row.artwork_object_key); await fs.promises.access(file,fs.constants.R_OK); res.setHeader("Content-Type",meta.contentType||"application/octet-stream"); res.setHeader("Cache-Control","public, max-age=3600"); fs.createReadStream(file).pipe(res);}catch{return res.status(404).end();} });
   app.get(`/api/promotion/public/:slug/qr.svg`, async (req,res)=>{ const row=await campaignPublic(String(req.params.slug||"")); if(!row)return res.status(404).end(); try{const svg=qrSvg(landingUrl(row.slug));res.setHeader("Content-Type","image/svg+xml; charset=utf-8");res.setHeader("Cache-Control","public, max-age=3600");res.send(svg);}catch(e){res.status(500).json({error:"qr_generation_failed",message:e.message});} });
   app.post(`/api/promotion/public/:slug/events`, async (req,res)=>{ try{const row=await campaignPublic(String(req.params.slug||"")); if(!row)return res.status(404).json({error:"campaign_not_found"}); const input=EventSchema.parse(req.body||{}); const attribution=await verifiedAttribution(pool.query.bind(pool),row.id,input.metadata); await recordEvent(row.id,input.eventType,req,{destinationId:input.destinationId||null,visitorId:input.visitorId,metadata:eventMetadataWithAttribution(input.metadata,attribution)}); res.status(202).json({ok:true});}catch(e){if(e instanceof z.ZodError)return res.status(400).json({error:"invalid_event"});res.status(500).json({error:"event_failed"});} });
   app.post(`/api/promotion/public/:slug/fans`, async (req,res)=>{ try{

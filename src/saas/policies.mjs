@@ -1,0 +1,1 @@
+export function approvedPolicy(p){return !!(p?.approved&&typeof p.approval_reference==='string'&&p.approval_reference.trim().length>=10&&typeof p.version==='string'&&!/draft|placeholder|attorney.review.required/i.test(p.version));}

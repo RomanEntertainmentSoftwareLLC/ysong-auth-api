@@ -293,6 +293,10 @@ const saasEnabled = () => process.env.SAAS_ENABLED === "1";
 const saas = createSaasService(pool);
 // Preserve raw signed bytes; this endpoint must precede the JSON parser.
 registerBillingWebhook(app, express, saas, saasEnabled);
+// Client-state values already have an 8,000,000-character route limit. JSON
+// escaping can use six bytes per character; keep the larger parser authenticated
+// and scoped here instead of increasing the limit for every API endpoint.
+app.use('/api/client-state', requireAuth, express.json({ limit: '50mb' }));
 app.use(express.json());
 app.use(createAccessGate({ service: saas, requireAuth, enabled: saasEnabled }));
 registerSaasRoutes(app, { pool, service: saas, requireAuth, enabled: saasEnabled });

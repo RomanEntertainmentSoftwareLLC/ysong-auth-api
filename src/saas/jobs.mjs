@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import {notifySaas} from './notifications.mjs';
 import { AccessError, assertCapability, assertRecoveryTarget, effectiveEntitlement, quantityOf } from './service.mjs';
+import {generationJobState} from './job-state.mjs';
 
 const terminal = new Set(['ready','partially_ready','failed','cancelled']);
 const uuid = /^[0-9a-f-]{36}$/i;
@@ -221,7 +222,7 @@ export function createSessionJobs({pool,service,enabled,provider,generate,persis
         source.lineageVersion=(parent.source.lineageVersion??1)+1;
       }
       const batch=await service.reserve(req.user.id,{quantity:req.body.quantity,source,requestKey:req.body.requestKey,parentId:req.body.parentId});
-      res.status(batch.replay?200:202).json(batch);
+      res.status(batch.replay?200:202).json({...batch,versions:batch.versions.map(version=>({...version,job:generationJobState(version)}))});
     }));
     app.get('/api/generations/:id/project',requireAuth,wrap(async(req,res)=>{
       if(!uuid.test(req.params.id))throw new AccessError('generation_not_found',404);

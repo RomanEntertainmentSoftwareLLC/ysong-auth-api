@@ -3,6 +3,7 @@ import { AccessError, assertCapability } from './service.mjs';
 import { stripeAdapter } from './billing.mjs';
 import { publicPlan } from './plans.mjs';
 import {approvedPolicy} from './policies.mjs';
+import {generationJobState} from './job-state.mjs';
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function registerSaasRoutes(app,{pool,service,requireAuth,enabled,env=process.env,billingAdapter=stripeAdapter}) {
   const wrap = fn => async(req,res)=>{
@@ -39,7 +40,7 @@ export function registerSaasRoutes(app,{pool,service,requireAuth,enabled,env=pro
   app.get('/api/generations/history',requireAuth,wrap(async(req,res)=>{
     const rows=(await pool.query(`SELECT b.id AS batch_id,b.quantity,b.source,b.parent_generation_id,v.* FROM ysong_generation_batches b
       JOIN ysong_generation_versions v ON v.batch_id=b.id WHERE b.user_id=$1 ORDER BY b.created_at DESC,v.version_index LIMIT 200`,[req.user.id])).rows;
-    res.json({generations:rows});
+    res.json({generations:rows.map(row=>({...row,job:generationJobState(row)}))});
   }));
   app.post('/api/generations/:id/feedback',requireAuth,wrap(async(req,res)=>{
     if (!uuid.test(req.params.id) || ![null,1,-1].includes(req.body?.feedback)) throw new AccessError('invalid_feedback',400);
@@ -58,7 +59,7 @@ export function registerSaasRoutes(app,{pool,service,requireAuth,enabled,env=pro
       const b=(await c.query('SELECT * FROM ysong_generation_batches WHERE id=$1',[v.batch_id])).rows[0];
       if (b.charged) await c.query('UPDATE ysong_quota_periods SET reserved=reserved-1 WHERE id=$1',[b.quota_period_id]);
       return (await c.query("UPDATE ysong_generation_versions SET state='cancelled',reconciliation='released',updated_at=now() WHERE id=$1 RETURNING *",[v.id])).rows[0];
-    }); res.json(result);
+    }); res.json({...result,job:generationJobState(result)});
   }));
   async function admin(req) {
     const a=await service.account(pool,req.user.id);

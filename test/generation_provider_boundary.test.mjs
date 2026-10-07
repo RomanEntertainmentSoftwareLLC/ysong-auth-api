@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {generationCapability, generationProvider, supportsGeneration, generationJob} from '../src/generation/provider-boundary.mjs';
+import {generationCapability, generationProvider, supportsGeneration, generationJob, generationRequest} from '../src/generation/provider-boundary.mjs';
+import {contentRightsEvidenceHash} from '../src/contentRights/gate.mjs';
 import {generationJobState} from '../src/saas/job-state.mjs';
 
 test('provider capabilities describe current and future audio paths without credentials', () => {
@@ -36,4 +37,28 @@ test('existing generation versions expose the common boundary', () => {
   assert.equal(job.provenance.sourceId,'b');
   assert.equal(job.artifacts[0].bytes,4);
   assert.equal(job.cost,null);
+});
+
+test('reference audio requires model support and current rights for the owned upload', () => {
+  const owner='11111111-1111-4111-8111-111111111111';
+  const objectKey=`user-uploads/${owner}/reference.wav`;
+  const at='2026-10-01T00:00:00.000Z';
+  const evidence={subject:{ownerUserId:owner,objectKey},claimedRelease:null,matches:[],identitySupport:[],
+    sources:[{provider:'ysong',source:'user_upload',referenceId:null,observedAt:at}],
+    attestation:{userId:owner,statementVersion:'v1',uses:['monetized'],assertedAt:at,revokedAt:null}};
+  const rights={evidence,review:{state:'approved',uses:['monetized'],evidenceHash:contentRightsEvidenceHash(evidence),reviewerId:'reviewer',decidedAt:at}};
+  const provider=generationProvider({id:'music',model:'reference-model',capabilities:[generationCapability({kind:'song',formats:['wav'],referenceAudio:true})],submit:async()=>{}});
+  const referenceAudio={objectKey,contentType:'audio/wav',rights};
+  const request=generationRequest({provider,kind:'song',format:'wav',input:{prompt:'music'},referenceAudio,userId:owner});
+  assert.deepEqual(request.referenceAudio,{objectKey,contentType:'audio/wav',provenance:{ownerUserId:owner,evidenceHash:rights.review.evidenceHash,use:'monetized'}});
+  assert.equal(JSON.stringify(request).includes('reviewer'),false);
+  assert.throws(()=>generationRequest({provider,kind:'song',format:'wav',input:{referenceAudio},userId:owner}),/invalid_generation_input/);
+  assert.throws(()=>generationRequest({provider,kind:'song',format:'mp3',referenceAudio,userId:owner}),/unsupported_generation/);
+  const textOnly=generationProvider({id:'text',model:'text-model',capabilities:[generationCapability({kind:'song',formats:['wav']})],submit:async()=>{}});
+  assert.throws(()=>generationRequest({provider:textOnly,kind:'song',format:'wav',referenceAudio,userId:owner}),/reference_audio_unsupported/);
+  assert.throws(()=>generationRequest({provider,kind:'song',format:'wav',referenceAudio:{...referenceAudio,objectKey:'https://stream.example/song'},userId:owner}),/invalid_reference_audio/);
+  assert.throws(()=>generationRequest({provider,kind:'song',format:'wav',referenceAudio:{...referenceAudio,objectKey:'user-uploads/another-user/reference.wav'},userId:owner}),/invalid_reference_audio/);
+  assert.throws(()=>generationRequest({provider,kind:'song',format:'wav',referenceAudio,userId:'22222222-2222-4222-8222-222222222222'}),/invalid_reference_audio/);
+  assert.throws(()=>generationRequest({provider,kind:'song',format:'wav',referenceAudio:{...referenceAudio,rights:{...rights,review:null}},userId:owner}),/reference_audio_rights_unverified/);
+  assert.throws(()=>generationRequest({provider,kind:'song',format:'wav',referenceAudio:{...referenceAudio,rights:{...rights,evidence:{...evidence,attestation:{...evidence.attestation,revokedAt:at}}}},userId:owner}),/reference_audio_rights_unverified/);
 });

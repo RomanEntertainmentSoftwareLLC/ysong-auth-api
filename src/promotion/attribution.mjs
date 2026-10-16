@@ -12,13 +12,9 @@ const fields = {
   utmContent: ["utmContent", "utm_content"],
   utmTerm: ["utmTerm", "utm_term"],
 };
-const inputKeys = new Set(Object.values(fields).flat());
-
 export function eventMetadataWithAttribution(metadata, attribution) {
-  return {
-    ...Object.fromEntries(Object.entries(metadata || {}).filter(([key]) => !inputKeys.has(key))),
-    ...attribution,
-  };
+  // Public event metadata is untrusted and may contain identifiers or URL fragments.
+  return { ...attribution };
 }
 
 export function parseAttribution(input = {}) {

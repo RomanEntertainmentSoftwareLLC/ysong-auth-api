@@ -29,8 +29,8 @@ test("paid identifiers must belong to this Smart Link and each other", async () 
   assert.equal(calls.length, 3);
 });
 
-test("public events retain custom metadata but discard unverified attribution aliases", () => {
+test("public events retain only verified attribution", () => {
   assert.deepEqual(eventMetadataWithAttribution({ customLabel: "release", ac: "secret", adCampaignId: "fake", utm_source: "https://secret.example" }, { utmSource: "meta" }), {
-    customLabel: "release", utmSource: "meta",
+    utmSource: "meta",
   });
 });

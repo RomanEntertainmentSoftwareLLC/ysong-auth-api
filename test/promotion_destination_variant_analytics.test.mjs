@@ -31,12 +31,39 @@ test("campaign attribution identifies destination and variant for shared creativ
   } finally { pool.query = original; }
 });
 
+test("campaign analytics reports coarse click dimensions and unavailable people counts", async () => {
+  const original = pool.query;
+  pool.query = async (sql) => {
+    if (sql.includes('AS device_class')) return { rows: [
+      { referrer: 'https://example.com', device_class: 'mobile', count: 2 },
+      { referrer: 'https://example.com', device_class: 'desktop', count: 1 },
+      { referrer: '', device_class: 'unknown', count: 1 },
+    ] };
+    if (sql.includes('GROUP BY event_type')) return { rows: [
+      { event_type: 'view', count: 5 }, { event_type: 'click', count: 4 },
+    ] };
+    return { rows: [] };
+  };
+  try {
+    const result = await analyticsFor(destinationId);
+    assert.equal(result.totals.uniqueVisitors, null);
+    assert.deepEqual(result.referrers, [
+      { referrer: 'https://example.com', clicks: 3 }, { referrer: 'unknown', clicks: 1 },
+    ]);
+    assert.deepEqual(result.deviceClasses, [
+      { deviceClass: 'mobile', clicks: 2 }, { deviceClass: 'desktop', clicks: 1 },
+      { deviceClass: 'unknown', clicks: 1 },
+    ]);
+    assert.deepEqual(result.regions, [{ region: 'unknown', clicks: 4 }]);
+  } finally { pool.query = original; }
+});
+
 test("paid analytics retains variant destination rows under one creative", async () => {
   const original = pool.query;
   pool.query = async (sql) => {
     if (sql.includes("JOIN promotion_destinations d")) {
       if (!sql.includes("destination_variant_id")) {
-        assert.match(sql, /count\(DISTINCT NULLIF\(e\.visitor_id,''\)\)/);
+        assert.match(sql, /NULL::int AS visitors/);
         return { rows: [{ id: destinationId, label: "Spotify", platform: "spotify", clicks: 5, visitors: 3 }] };
       }
       assert.match(sql, /destination_variant_id/);
@@ -66,7 +93,7 @@ test("paid analytics retains variant destination rows under one creative", async
       { id: destinationId, creativeId, destinationVariantId: "spotify_b", clicks: 2 },
     ]);
     assert.equal(result.destinations[0].clicks, 5);
-    assert.equal(result.destinations[0].visitors, 3);
+    assert.equal(result.destinations[0].visitors, null);
     assert.deepEqual(result.attribution.map(({ destinationId, destinationVariantId, clicks }) => ({ destinationId, destinationVariantId, clicks })), [
       { destinationId, destinationVariantId: "spotify_a", clicks: 3 },
       { destinationId, destinationVariantId: "spotify_b", clicks: 2 },

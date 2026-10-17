@@ -17,8 +17,8 @@ export function generationJobState(version) {
   const terminal = ['succeeded','failed','cancelled','partial'].includes(status);
   const reviewRequired = parts.some(part => part.state === 'ambiguous');
   const source = version.source;
-  const artifacts = parts.filter(part => part.state === 'ready' && typeof part.objectKey === 'string' && part.objectKey.startsWith('user-uploads/')).map(part => ({kind:part.contentType?.includes('midi') ? 'midi' : 'audio',objectKey:part.objectKey,contentType:part.contentType,bytes:part.bytes}));
-  if (version.result?.objectKey?.startsWith('user-uploads/') && !artifacts.some(a => a.objectKey === version.result.objectKey)) artifacts.push({kind:'audio',objectKey:version.result.objectKey,contentType:version.result.contentType,bytes:version.result.bytes});
+  const artifacts = Object.entries(version.execution?.parts ?? {}).filter(([,part]) => part.state === 'ready' && typeof part.objectKey === 'string' && part.objectKey.startsWith('user-uploads/')).map(([partId,part]) => ({id:`${version.id}:${partId}`,kind:part.contentType?.includes('midi') ? 'midi' : 'audio',objectKey:part.objectKey,contentType:part.contentType,bytes:part.bytes}));
+  if (version.result?.objectKey?.startsWith('user-uploads/') && !artifacts.some(a => a.objectKey === version.result.objectKey)) artifacts.push({id:`${version.id}:audio`,kind:'audio',objectKey:version.result.objectKey,contentType:version.result.contentType,bytes:version.result.bytes});
   const boundary = generationJob({id:version.id,kind:source?.kind === 'session' ? 'multitrack' : 'song',status,
     provider:version.provider,model:version.model,modelVersion:version.model_version,
     provenance:{kind:source?.kind === 'session' ? 'session' : 'user',sourceId:version.batch_id ?? null,parentJobId:version.parent_generation_id ?? null},

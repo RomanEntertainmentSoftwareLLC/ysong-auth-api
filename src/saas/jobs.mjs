@@ -5,6 +5,9 @@ import {generationJobState} from './job-state.mjs';
 
 const terminal = new Set(['ready','partially_ready','failed','cancelled']);
 const uuid = /^[0-9a-f-]{36}$/i;
+function artifactManifest(versionId, parts) {
+  return Object.entries(parts ?? {}).filter(([,part])=>part.state==='ready'&&part.objectKey).map(([id,part])=>({id:`${versionId}:${id}`,partId:id,objectKey:part.objectKey,contentType:part.contentType??null,bytes:part.bytes??null,hash:part.hash??null}));
+}
 export function sessionSource(body) {
   const p = body?.plan;
   const finite = (n,min,max) => Number.isFinite(n) && n >= min && n <= max;
@@ -72,6 +75,8 @@ export function projectFromJob(version, source, execution) {
 export function createSessionJobs({pool,service,enabled,provider,generate,persist,inspectArtifact}) {
   let running = false;
   async function save(v, execution, state) {
+    for (const part of Object.values(execution.parts ?? {})) delete part.request;
+    execution.artifacts=artifactManifest(v.id,execution.parts);
     await pool.query('UPDATE ysong_generation_versions SET execution=$2,state=$3,updated_at=now() WHERE id=$1',[v.id,execution,state]);
     // Notification failure must never invalidate a persisted render checkpoint.
     if(state==='failed')await notifySaas(pool,v.user_id,`generation:${v.id}:attention`,'Generation needs attention',execution.message||'Review the saved generation state before retrying.','/app?view=createSong').catch(()=>{});
@@ -92,16 +97,17 @@ export function createSessionJobs({pool,service,enabled,provider,generate,persis
       catch { part.state='failed'; part.error='generation_unavailable_before_submission'; continue; }
       e.message = `${t.mode === 'midi'?'Saving MIDI':'Rendering'} ${t.name}`;
       if (t.mode === 'midi') { part.state='ready'; await save(v,e,'generating'); continue; }
-      part.request={instructions:t.renderInstructions,lyrics:t.useLyrics?source.lyrics:'[Instrumental]',seed:(source.seed+v.version_index)%2000000000,
+      const request={instructions:t.renderInstructions,lyrics:t.useLyrics?source.lyrics:'[Instrumental]',seed:(source.seed+v.version_index)%2000000000,
         durationSeconds:source.plan.totalBars*source.plan.sigNum*(4/source.plan.sigDen)*60/source.plan.bpm,maxNewTokens:9000,quality:'standard'};
       part.state='submitted'; await save(v,e,'generating');
       try {
-        const audio = await generate(config.provider,part.request);
+        const audio = await generate(config.provider,request);
         if (!Buffer.isBuffer(audio.audio) || !audio.audio.length) throw new Error('empty_audio');
         part.state='processing'; await save(v,e,'processing');
         part.objectKey = await persist(v.user_id,`${v.id}-${t.id}`,audio);
         part.hash = crypto.createHash('sha256').update(audio.audio).digest('hex');
         part.contentType=audio.contentType; part.bytes=audio.audio.length; part.state='ready';
+        part.artifactId=`${v.id}:${t.id}`;
       } catch { part.state='ambiguous'; part.error='provider_or_storage_outcome_requires_review'; }
       await save(v,e,'generating');
     }
@@ -142,6 +148,7 @@ export function createSessionJobs({pool,service,enabled,provider,generate,persis
     }
     const outcome=Object.values(e.parts).every(p=>p.state==='ready')?'ready':'partially_ready';
     e.saved=true; e.message=outcome==='ready'?'Ready':'Partial project saved; review failed parts';
+    e.artifacts=artifactManifest(v.id,e.parts);
     // A durable project must exist before quota is consumed and 100% is reported.
     await service.reconcile(v.id,outcome,{projectId:v.project_id,parts:e.parts},uncertain?'provider_outcome_requires_review':null,e);
   }
@@ -198,6 +205,7 @@ export function createSessionJobs({pool,service,enabled,provider,generate,persis
           Object.assign(part,await inspectArtifact(key));part.objectKey=key;part.state='ready';delete part.error;
         }else {part.state='failed';part.error='provider_confirmed_failure';}
         part.resolution={outcome:req.body.outcome,reason:req.body.reason,actorId:req.user.id,at:new Date().toISOString(),providerReference:String(req.body.providerReference??'').slice(0,200)};
+        v.execution.artifacts=artifactManifest(v.id,v.execution.parts);
         v.execution.saved=false;v.execution.message='Reconciliation confirmed; finalizing retained results';
         if(batch.source.kind==='session'){
           for(const p of Object.values(v.execution.parts))if(p.state==='queued'){p.state='failed';p.error='unsubmitted_part_requires_explicit_retry';}
@@ -240,11 +248,14 @@ export function createSessionJobs({pool,service,enabled,provider,generate,persis
     }));
     app.post('/api/generations/:id/retry',requireAuth,wrap(async(req,res)=>{
       if(!uuid.test(req.params.id))throw new AccessError('generation_not_found',404);
+      const retryKey=req.body?.requestKey;
+      if(retryKey!==undefined&&(typeof retryKey!=='string'||!/^[A-Za-z0-9_-]{8,128}$/.test(retryKey)))throw new AccessError('invalid_retry_key',400);
       assertCapability(await service.access(req.user.id,req.user.issuedAt),'generation');
       const result=await service.transaction(async c=>{
         const account=await service.account(c,req.user.id,true);
         const ent=effectiveEntitlement(account,(await c.query('SELECT * FROM ysong_plans')).rows);assertCapability(ent,'generation');
         const v=(await c.query('SELECT * FROM ysong_generation_versions WHERE id=$1 AND user_id=$2 FOR UPDATE',[req.params.id,req.user.id])).rows[0];
+        if(retryKey&&v?.execution&&(v.execution.retryKey===retryKey||v.execution.retryKeys?.includes(retryKey)))return {id:v.id,replay:true};
         if(!v?.execution || !['failed','partially_ready'].includes(v.state) || Object.values(v.execution.parts).some(p=>p.state==='ambiguous'))throw new AccessError('retry_not_eligible',409);
         const parts=Object.values(v.execution.parts);
         if(!parts.some(p=>p.state==='failed'))throw new AccessError('retry_not_eligible',409);
@@ -255,6 +266,7 @@ export function createSessionJobs({pool,service,enabled,provider,generate,persis
           if(!updated.rows.length)throw new AccessError('retry_quota_unavailable_create_variation',409);
         }
         for(const part of parts)if(part.state==='failed'){part.state='queued';delete part.error;}
+        if(retryKey)v.execution.retryKeys=[...new Set([...(v.execution.retryKeys??[]),...(v.execution.retryKey?[v.execution.retryKey]:[]),retryKey])];
         v.execution.saved=false;v.execution.message='Retry queued; retained parts will not render again';
         return (await c.query("UPDATE ysong_generation_versions SET state='queued',execution=$2,reconciliation=$3,updated_at=now() WHERE id=$1 RETURNING id",[v.id,v.execution,v.reconciliation==='released'?'reserved':v.reconciliation])).rows[0];
       });res.status(202).json(result);

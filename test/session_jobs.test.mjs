@@ -60,6 +60,9 @@ test('durable server batch lifecycle on isolated PostgreSQL with mocked paid pro
     for(let i=0;i<5;i++)await Promise.all([jobs.tick(),competing.tick()]);
     assert.equal(calls,4);assert.equal((await service.summary(user)).used,4);assert.equal((await service.summary(user)).reserved,0);
     for(const v of batch.versions){const r=await get(`/api/generations/${v.id}/project`);assert.equal(r.status,200);assert.equal(r.data.projectId,v.project_id);assert.equal(r.data.project.tracks.length,2);assert.equal(r.data.project.clips.length,3);}
+    const persisted=(await pool.query('SELECT execution FROM ysong_generation_versions WHERE id=$1',[batch.versions[0].id])).rows[0].execution;
+    assert.equal(persisted.artifacts[0].id,`${batch.versions[0].id}:voice`);
+    assert.equal(JSON.stringify(persisted).includes('Isolated vocal'),false);
     assert.equal((await get(`/api/generations/${batch.versions[0].id}/project`,other)).status,409);
   });
   await t.test('partial success retains MIDI, charges once, blocks ambiguous paid retry',async()=>{
@@ -79,8 +82,9 @@ test('durable server batch lifecycle on isolated PostgreSQL with mocked paid pro
     const r=await post('/api/generations/batches',{...body,requestKey:'safe-failure'});await jobs.tick();const id=r.data.versions[0].id;
     assert.equal((await pool.query('SELECT reconciliation FROM ysong_generation_versions WHERE id=$1',[id])).rows[0].reconciliation,'released');
     await pool.query("UPDATE ysong_provider_controls SET enabled=true WHERE id='global'");
-    const used=(await service.summary(user)).used;assert.equal((await post(`/api/generations/${id}/retry`,{})).status,202);
-    assert.equal((await post(`/api/generations/${id}/retry`,{})).status,409);await jobs.tick();assert.equal((await service.summary(user)).used,used+1);
+    const used=(await service.summary(user)).used;assert.equal((await post(`/api/generations/${id}/retry`,{requestKey:'safe-retry-1'})).status,202);
+    const replay=await post(`/api/generations/${id}/retry`,{requestKey:'safe-retry-1'});assert.equal(replay.status,202);assert.equal(replay.data.replay,true);
+    assert.equal((await post(`/api/generations/${id}/retry`,{requestKey:'different-retry'})).status,409);await jobs.tick();assert.equal((await service.summary(user)).used,used+1);
     const rr=await post('/api/generations/batches',{...body,requestKey:'safe-partial'});const vid=rr.data.versions[0].id;
     await pool.query('UPDATE ysong_generation_versions SET execution=$2 WHERE id=$1',[vid,{parts:{bass:{state:'ready'},voice:{state:'failed',error:'generation_unavailable_before_submission'}}}]);await jobs.tick();
     const saved=(await get(`/api/generations/${vid}/project`)).data;

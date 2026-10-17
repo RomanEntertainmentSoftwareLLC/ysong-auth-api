@@ -23,3 +23,11 @@ test('progress and retryability reflect durable parts while errors stay redacted
   assert.equal(generationJobState({...base,state:'failed',execution:{parts:{a:{state:'ambiguous'}}}}).retryable,false);
   assert.throws(()=>generationJobState({...base,state:'unknown'}));
 });
+
+test('artifact identity is stable across lifecycle projections',()=>{
+  const execution={saved:true,parts:{voice:{state:'ready',objectKey:'user-uploads/owner/voice.wav',contentType:'audio/wav',bytes:42}}};
+  const running=generationJobState({...base,state:'generating',execution});
+  const done=generationJobState({...base,state:'ready',execution});
+  assert.deepEqual(running.artifacts,done.artifacts);
+  assert.equal(done.artifacts[0].id,`${base.id}:voice`);
+});

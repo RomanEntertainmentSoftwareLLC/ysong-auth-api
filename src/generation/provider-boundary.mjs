@@ -57,12 +57,12 @@ export function generationRequest({provider, kind, format, input = {}, reference
 export function generationJob({id, kind, status, provider, model, modelVersion = null, provenance,
   artifacts = [], cost = null, cancellation = null, error = null}) {
   if (!id || !kinds.has(kind) || !statuses.has(status) || !provenance || !['user', 'session', 'revision'].includes(provenance.kind)) throw new TypeError('invalid_generation_job');
-  if (!Array.isArray(artifacts) || artifacts.some(a => !artifactKinds.has(a.kind) || typeof a.objectKey !== 'string' || !/^user-uploads\/[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_.-]+)+$/.test(a.objectKey) || a.objectKey.split('/').includes('..') || (a.bytes != null && (!Number.isSafeInteger(a.bytes) || a.bytes < 0)))) throw new TypeError('invalid_generation_artifact');
+  if (!Array.isArray(artifacts) || artifacts.some(a => (a.id != null && (typeof a.id !== 'string' || !/^[a-zA-Z0-9:_-]{1,160}$/.test(a.id))) || !artifactKinds.has(a.kind) || typeof a.objectKey !== 'string' || !/^user-uploads\/[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_.-]+)+$/.test(a.objectKey) || a.objectKey.split('/').includes('..') || (a.bytes != null && (!Number.isSafeInteger(a.bytes) || a.bytes < 0)))) throw new TypeError('invalid_generation_artifact');
   if (cost && (!['reported', 'estimated'].includes(cost.basis) || !Number.isFinite(cost.amount) || cost.amount < 0 || !/^[A-Z]{3}$/.test(cost.currency))) throw new TypeError('invalid_generation_cost');
   return {
     id, kind, status, provider:provider ?? null, model:model ?? null, modelVersion,
     provenance:{kind:provenance.kind, sourceId:provenance.sourceId ?? null, parentJobId:provenance.parentJobId ?? null},
-    artifacts:artifacts.map(a => ({kind:a.kind, objectKey:a.objectKey, contentType:a.contentType ?? null, bytes:a.bytes ?? null})),
+    artifacts:artifacts.map(a => ({id:a.id ?? null, kind:a.kind, objectKey:a.objectKey, contentType:a.contentType ?? null, bytes:a.bytes ?? null})),
     cost:cost ? {basis:cost.basis, amount:cost.amount, currency:cost.currency} : null,
     cancellation:{supported:!!cancellation?.supported, requested:!!cancellation?.requested},
     error:['failed', 'partial'].includes(status) ? {code:errorCodes.has(error?.code) ? error.code : 'generation_failed'} : null

@@ -1440,6 +1440,11 @@ async function ensureWorldSchema() {
 			PRIMARY KEY (room_id, user_id)
 		);
 		CREATE INDEX IF NOT EXISTS ysong_room_members_user_idx ON ysong_room_members(user_id, joined_at DESC);
+		ALTER TABLE ysong_room_members ADD COLUMN IF NOT EXISTS recording_consent boolean NOT NULL DEFAULT false;
+		ALTER TABLE ysong_room_members ADD COLUMN IF NOT EXISTS muted boolean NOT NULL DEFAULT false;
+		ALTER TABLE ysong_room_members ADD COLUMN IF NOT EXISTS mute_requested boolean NOT NULL DEFAULT false;
+		ALTER TABLE ysong_room_members ADD COLUMN IF NOT EXISTS invited_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL;
+		ALTER TABLE ysong_rooms ADD COLUMN IF NOT EXISTS recording_enabled boolean NOT NULL DEFAULT false;
 
 		CREATE TABLE IF NOT EXISTS ysong_room_personas (
 			room_id uuid NOT NULL REFERENCES ysong_rooms(id) ON DELETE CASCADE,
@@ -4559,6 +4564,22 @@ app.post("/chat", requireAuth, async (req, res) => {
 });
 
 // -------------------- API: Rooms --------------------
+async function withRoomRecordingLock(roomId, operation) {
+	const client = await pool.connect();
+	try {
+		await client.query("BEGIN");
+		await client.query(`SELECT id FROM ysong_rooms WHERE id=$1 FOR UPDATE`, [roomId]);
+		const result = await operation(client);
+		await client.query("COMMIT");
+		return result;
+	} catch (error) {
+		await client.query("ROLLBACK").catch(() => {});
+		throw error;
+	} finally {
+		client.release();
+	}
+}
+
 async function roomAccess(roomId, userId, { allowPublic = false } = {}) {
 	const { rows } = await pool.query(
 		`SELECT r.*, rm.role AS member_role
@@ -4582,6 +4603,7 @@ function roomSummary(row) {
 		ownerUserId: row.owner_user_id,
 		role: row.member_role || null,
 		joined: !!row.member_role,
+		recordingEnabled: !!row.recording_enabled,
 		createdAt: row.created_at,
 		updatedAt: row.updated_at,
 		liveActive: !!row.live_active,
@@ -4876,7 +4898,7 @@ app.get("/api/rooms/:id", requireAuth, async (req, res) => {
 		if (!room) return res.status(404).json({ error: "room_not_found" });
 		const [memberRows, personaRows, messages] = await Promise.all([
 			pool.query(
-				`SELECT rm.user_id, rm.role, rm.joined_at, u.display_name
+				`SELECT rm.user_id, rm.role, rm.joined_at, rm.muted, rm.mute_requested, rm.recording_consent, u.display_name
 				 FROM ysong_room_members rm JOIN users u ON u.id=rm.user_id
 				 WHERE rm.room_id=$1 ORDER BY CASE rm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, lower(u.display_name)`,
 				[room.id],
@@ -4895,6 +4917,9 @@ app.get("/api/rooms/:id", requireAuth, async (req, res) => {
 				userId: m.user_id,
 				name: m.display_name || "Member",
 				role: m.role,
+				muted: !!m.muted,
+				muteRequested: !!m.mute_requested,
+				recordingConsent: !!m.recording_consent,
 				joinedAt: m.joined_at,
 			})),
 			personas: personaRows.rows.map((p) => ({
@@ -4914,10 +4939,14 @@ app.post("/api/rooms/:id/join", requireAuth, async (req, res) => {
 	try {
 		const room = await roomAccess(String(req.params.id), req.user.id, { allowPublic: true });
 		if (!room || room.visibility !== "public") return res.status(404).json({ error: "public_room_not_found" });
-		await pool.query(
-			`INSERT INTO ysong_room_members (room_id,user_id,role) VALUES ($1,$2,'member') ON CONFLICT DO NOTHING`,
+		if (room.member_role) return res.json({ ok: true });
+		await withRoomRecordingLock(room.id, async (client) => {
+		await client.query(
+			`INSERT INTO ysong_room_members (room_id,user_id,role) VALUES ($1,$2,'member') ON CONFLICT DO NOTHING RETURNING user_id`,
 			[room.id, req.user.id],
 		);
+		await client.query(`UPDATE ysong_rooms SET recording_enabled=false WHERE id=$1`, [room.id]);
+		});
 		return res.json({ ok: true });
 	} catch (e) {
 		console.error("POST /api/rooms/:id/join ERROR", e);
@@ -4931,6 +4960,7 @@ app.post("/api/rooms/:id/leave", requireAuth, async (req, res) => {
 		if (!room) return res.status(404).json({ error: "room_not_found" });
 		if (room.member_role === "owner") return res.status(400).json({ error: "owner_must_delete_room" });
 		await pool.query(`DELETE FROM ysong_room_members WHERE room_id=$1 AND user_id=$2`, [room.id, req.user.id]);
+		await pool.query(`UPDATE ysong_room_venue_state SET host_user_id=NULL WHERE room_id=$1 AND host_user_id=$2`, [room.id, req.user.id]);
 		return res.json({ ok: true });
 	} catch (e) {
 		console.error("POST /api/rooms/:id/leave ERROR", e);
@@ -4986,10 +5016,13 @@ app.post("/api/rooms/:id/members/invite", requireAuth, async (req, res) => {
 			[displayName],
 		);
 		if (!rows[0]) return res.status(404).json({ error: "user_not_found" });
-		await pool.query(
-			`INSERT INTO ysong_room_members (room_id,user_id,role) VALUES ($1,$2,'member') ON CONFLICT DO NOTHING`,
-			[room.id, rows[0].id],
+		await withRoomRecordingLock(room.id, async (client) => {
+		await client.query(
+			`INSERT INTO ysong_room_members (room_id,user_id,role,invited_by_user_id) VALUES ($1,$2,'member',$3) ON CONFLICT DO NOTHING`,
+			[room.id, rows[0].id, req.user.id],
 		);
+		await client.query(`UPDATE ysong_rooms SET recording_enabled=false WHERE id=$1`, [room.id]);
+		});
 		return res.json({ ok: true, member: { userId: rows[0].id, name: rows[0].display_name, role: "member" } });
 	} catch (e) {
 		console.error("POST /api/rooms/:id/members/invite ERROR", e);
@@ -4997,10 +5030,98 @@ app.post("/api/rooms/:id/members/invite", requireAuth, async (req, res) => {
 	}
 });
 
-app.post("/api/rooms/:id/personas", requireAuth, async (req, res) => {
+app.post("/api/rooms/:id/members/:userId/role", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room || room.member_role !== "owner") return res.status(403).json({ error: "room_owner_required" });
+		const role = req.body?.role;
+		if (!["admin", "member"].includes(role)) return res.status(400).json({ error: "invalid_room_role" });
+		const result = await pool.query(`UPDATE ysong_room_members SET role=$3,muted=CASE WHEN $3='admin' THEN false ELSE muted END WHERE room_id=$1 AND user_id=$2 AND role<>'owner' RETURNING user_id`, [room.id, String(req.params.userId), role]);
+		if (!result.rows[0]) return res.status(404).json({ error: "member_not_found" });
+		return res.json({ ok: true, role });
+	} catch (e) {
+		console.error("POST room member role ERROR", e);
+		return res.status(500).json({ error: "room_role_failed" });
+	}
+});
+
+app.post("/api/rooms/:id/members/:userId/remove", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room || !["owner", "admin"].includes(room.member_role)) return res.status(403).json({ error: "room_host_required" });
+		const target = await pool.query(`SELECT role FROM ysong_room_members WHERE room_id=$1 AND user_id=$2`, [room.id, String(req.params.userId)]);
+		if (!target.rows[0]) return res.status(404).json({ error: "member_not_found" });
+		if (target.rows[0].role === "owner" || (room.member_role === "admin" && target.rows[0].role !== "member")) return res.status(403).json({ error: "room_owner_required" });
+		const removed = await pool.query(`DELETE FROM ysong_room_members WHERE room_id=$1 AND user_id=$2 AND role<>'owner' AND ($3='owner' OR role='member') RETURNING user_id`, [room.id, String(req.params.userId), room.member_role]);
+		if (!removed.rows[0]) return res.status(403).json({ error: "room_owner_required" });
+		await pool.query(`UPDATE ysong_room_venue_state SET host_user_id=NULL WHERE room_id=$1 AND host_user_id=$2`, [room.id, String(req.params.userId)]);
+		return res.json({ ok: true });
+	} catch (e) {
+		console.error("POST room member remove ERROR", e);
+		return res.status(500).json({ error: "room_member_remove_failed" });
+	}
+});
+
+app.post("/api/rooms/:id/members/:userId/mute", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room || !["owner", "admin"].includes(room.member_role)) return res.status(403).json({ error: "room_host_required" });
+		if (typeof req.body?.muted !== "boolean") return res.status(400).json({ error: "muted_boolean_required" });
+		const result = await pool.query(`UPDATE ysong_room_members SET muted=$3,mute_requested=false WHERE room_id=$1 AND user_id=$2 AND role='member' RETURNING user_id`, [room.id, String(req.params.userId), req.body.muted]);
+		if (!result.rows[0]) return res.status(404).json({ error: "participant_not_found" });
+		return res.json({ ok: true, muted: req.body.muted });
+	} catch (e) {
+		console.error("POST room mute ERROR", e);
+		return res.status(500).json({ error: "room_mute_failed" });
+	}
+});
+
+app.post("/api/rooms/:id/mute-request", requireAuth, async (req, res) => {
 	try {
 		const room = await roomAccess(String(req.params.id), req.user.id);
 		if (!room) return res.status(403).json({ error: "room_membership_required" });
+		await pool.query(`UPDATE ysong_room_members SET mute_requested=true WHERE room_id=$1 AND user_id=$2`, [room.id, req.user.id]);
+		return res.json({ ok: true });
+	} catch (e) {
+		console.error("POST room mute request ERROR", e);
+		return res.status(500).json({ error: "room_mute_request_failed" });
+	}
+});
+
+app.post("/api/rooms/:id/recording-consent", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room) return res.status(403).json({ error: "room_membership_required" });
+		if (typeof req.body?.consent !== "boolean") return res.status(400).json({ error: "consent_boolean_required" });
+		await withRoomRecordingLock(room.id, async (client) => {
+			await client.query(`UPDATE ysong_room_members SET recording_consent=$3 WHERE room_id=$1 AND user_id=$2`, [room.id, req.user.id, req.body.consent]);
+			if (!req.body.consent) await client.query(`UPDATE ysong_rooms SET recording_enabled=false WHERE id=$1`, [room.id]);
+		});
+		return res.json({ ok: true, consent: req.body.consent });
+	} catch (e) {
+		console.error("POST room recording consent ERROR", e);
+		return res.status(500).json({ error: "room_recording_consent_failed" });
+	}
+});
+
+app.post("/api/rooms/:id/recording", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room || !["owner", "admin"].includes(room.member_role)) return res.status(403).json({ error: "room_host_required" });
+		if (typeof req.body?.enabled !== "boolean") return res.status(400).json({ error: "enabled_boolean_required" });
+		const result = await withRoomRecordingLock(room.id, (client) => client.query(`UPDATE ysong_rooms SET recording_enabled=$2 WHERE id=$1 AND ($2=false OR NOT EXISTS (SELECT 1 FROM ysong_room_members WHERE room_id=$1 AND recording_consent=false)) RETURNING id`, [room.id, req.body.enabled]));
+		if (!result.rows[0]) return res.status(409).json({ error: "recording_consent_required" });
+		return res.json({ ok: true, enabled: req.body.enabled });
+	} catch (e) {
+		console.error("POST room recording ERROR", e);
+		return res.status(500).json({ error: "room_recording_failed" });
+	}
+});
+
+app.post("/api/rooms/:id/personas", requireAuth, async (req, res) => {
+	try {
+		const room = await roomAccess(String(req.params.id), req.user.id);
+		if (!room || !["owner", "admin"].includes(room.member_role)) return res.status(403).json({ error: "room_host_required" });
 		const personaId = String(req.body?.personaId || "");
 		const persona = await getPersonaRowForUser(req.user.id, personaId);
 		if (!persona || String(persona.id) !== personaId) return res.status(404).json({ error: "persona_not_found" });
@@ -5023,7 +5144,7 @@ app.post("/api/rooms/:id/personas", requireAuth, async (req, res) => {
 app.post("/api/rooms/:id/personas/remove", requireAuth, async (req, res) => {
 	try {
 		const room = await roomAccess(String(req.params.id), req.user.id);
-		if (!room) return res.status(403).json({ error: "room_membership_required" });
+		if (!room || !["owner", "admin"].includes(room.member_role)) return res.status(403).json({ error: "room_host_required" });
 		await pool.query(`DELETE FROM ysong_room_personas WHERE room_id=$1 AND persona_id=$2`, [
 			room.id,
 			String(req.body?.personaId || ""),
@@ -5038,7 +5159,7 @@ app.post("/api/rooms/:id/personas/remove", requireAuth, async (req, res) => {
 app.post("/api/rooms/:id/personas/mode", requireAuth, async (req, res) => {
 	try {
 		const room = await roomAccess(String(req.params.id), req.user.id);
-		if (!room) return res.status(403).json({ error: "room_membership_required" });
+		if (!room || !["owner", "admin"].includes(room.member_role)) return res.status(403).json({ error: "room_host_required" });
 		const mode = String(req.body?.participationMode || "");
 		if (!["active", "listening", "mention_only", "muted"].includes(mode))
 			return res.status(400).json({ error: "invalid_participation_mode" });
@@ -5058,6 +5179,8 @@ app.post("/api/rooms/:id/messages", requireAuth, async (req, res) => {
 	try {
 		const room = await roomAccess(String(req.params.id), req.user.id);
 		if (!room) return res.status(403).json({ error: "room_membership_required" });
+		const muteState = await pool.query(`SELECT muted FROM ysong_room_members WHERE room_id=$1 AND user_id=$2`, [room.id, req.user.id]);
+		if (muteState.rows[0]?.muted) return res.status(403).json({ error: "room_participant_muted" });
 		const content = String(req.body?.content || "")
 			.trim()
 			.slice(0, 8000);
